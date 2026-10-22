@@ -1,4 +1,4 @@
-import type { CityMap, Point } from '../domain/types'
+import type { Building, CityMap, Point } from '../domain/types'
 
 export type LayerSettings = {
   buildings: boolean
@@ -54,6 +54,11 @@ export const FACILITY_SYMBOLS: Record<string, string> = {
 }
 
 export const MAP_FONT = '"Noto Sans JP", "Yu Gothic", "Hiragino Kaku Gothic ProN", sans-serif'
+
+export function buildingColor(building: Building, style: MapStyle): string {
+  if (building.kind === 'residential' && building.height >= 3) return style === 'standard' ? '#9fa9a8' : style === 'mono' ? '#ababab' : '#62736b'
+  return PALETTES[style][building.kind]
+}
 
 export function tracePath(ctx: CanvasRenderingContext2D, points: Point[], close = false) {
   if (!points.length) return
@@ -122,11 +127,20 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
     }
   }
 
+  if (layers.buildings && scale > .38 && map.parcels) {
+    ctx.strokeStyle = colors.roadEdge
+    ctx.lineWidth = .4 / scale
+    for (const parcel of map.parcels) {
+      if (!parcel.developedYear) continue
+      tracePath(ctx, parcel.polygon, true)
+      ctx.stroke()
+    }
+  }
   if (layers.buildings) {
     ctx.lineWidth = Math.min(.6 / scale, 1.1)
     for (const building of map.buildings) {
       tracePath(ctx, building.polygon, true)
-      ctx.fillStyle = colors[building.kind]
+      ctx.fillStyle = buildingColor(building, style)
       ctx.fill()
       if (scale > .3) {
         ctx.strokeStyle = colors.buildingEdge

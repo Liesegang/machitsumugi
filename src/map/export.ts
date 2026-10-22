@@ -1,5 +1,5 @@
 import type { CityMap, Point } from '../domain/types'
-import { FACILITY_SYMBOLS, MAP_FONT, PALETTES, renderMap } from './render'
+import { buildingColor, FACILITY_SYMBOLS, MAP_FONT, PALETTES, renderMap } from './render'
 import type { RenderOptions } from './render'
 
 function filename(map: CityMap, extension: string) {
@@ -89,7 +89,8 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
       if (area.kind === 'forest') parts.push(`<path d="${path(area.polygon, true)}" fill="url(#forest)"/>`)
     }
   }
-  if (layers.buildings) for (const b of map.buildings) parts.push(`<path d="${path(b.polygon, true)}" fill="${c[b.kind]}"/>`)
+  if (layers.buildings && map.parcels) for (const p of map.parcels.filter(p => p.developedYear)) parts.push(`<path d="${path(p.polygon, true)}" fill="none" stroke="${c.roadEdge}" stroke-width=".6"/>`)
+  if (layers.buildings) for (const b of map.buildings) parts.push(`<path d="${path(b.polygon, true)}" fill="${buildingColor(b, options.style)}"/>`)
   if (layers.roads) {
     for (const kind of ['local', 'arterial'] as const) {
       for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.arteryEdge : c.roadEdge}" stroke-width="${road.width + 2.5}"/>`)

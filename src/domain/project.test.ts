@@ -1,9 +1,10 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { loadProject, parseProject, persistProject, STORAGE_KEY, validateProject } from './project'
+import { LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, STORAGE_KEY, validateProject } from './project'
 import type { Project } from './project'
+import type { CityMap } from './types'
 
 const sample = (): Project => ({
-  version: 1,
+  version: 2,
   config: {
     name: '水杜市', seed: 'minato-2026', type: 'castle', terrain: 'river', density: 65, forest: 30,
     railway: true, stations: 3, arterial: true, facilities: ['school', 'hospital', 'park'],
@@ -13,7 +14,25 @@ const sample = (): Project => ({
   style: 'standard',
 })
 
-afterEach(() => vi.unstubAllGlobals())
+const geometry = (): CityMap => ({
+  width: 4000, height: 3000, config: sample().config, description: '道路・敷地と都市の履歴', generatorVersion: '2.0.0', year: 1930,
+  roads: [{ id: 'road-1', points: [{ x: 0, y: 50 }, { x: 100, y: 50 }], kind: 'local', width: 5, builtYear: 1790, role: 'lane', reason: '街道沿いの集落', bridge: false }],
+  buildings: [{ id: 'house-1', polygon: [{ x: 10, y: 10 }, { x: 20, y: 10 }, { x: 20, y: 30 }, { x: 10, y: 30 }], kind: 'residential', height: 2, parcelId: 'parcel-1', builtYear: 1800 }],
+  areas: [{ id: 'field-1', polygon: [{ x: 200, y: 10 }, { x: 300, y: 10 }, { x: 250, y: 100 }], kind: 'field', name: '北の畑' }],
+  railways: [{ id: 'rail-1', points: [{ x: 1000, y: 0 }, { x: 1000, y: 3000 }], name: '水杜線', elevations: [20, 21], structures: [{ kind: 'bridge', from: { x: 1000, y: 1200 }, to: { x: 1000, y: 1400 }, maxHeight: 6 }] }],
+  stations: [{ id: 'station-1', point: { x: 1000, y: 1500 }, name: '水杜駅' }],
+  facilities: [{ id: 'school-1', point: { x: 500, y: 600 }, kind: 'school', name: '第一小学校' }],
+  districts: [{ id: 'district-1', point: { x: 2000, y: 1400 }, name: '本町' }],
+  growthLog: [{ phase: 'oldtown', roadsAdded: 1, year: 1800, reason: '街道への接続' }],
+  parcels: [{ id: 'parcel-1', polygon: [{ x: 5, y: 5 }, { x: 25, y: 5 }, { x: 25, y: 50 }, { x: 5, y: 50 }], entrance: { x: 15, y: 50 }, roadId: 'road-1', createdYear: 1790, developedYear: 1800, use: 'residential' }],
+  events: [{ id: 'event-1', year: 1800, kind: 'construction', entityId: 'house-1', reason: '空き地への入居' }],
+  snapshots: [{ year: 1800, households: 1, capacity: 2, vacant: 1, unmet: 0, roads: 1, buildings: 1 }],
+  blocks: [{ id: 'block-1', polygon: [{ x: 10, y: 10 }, { x: 100, y: 10 }, { x: 100, y: 100 }, { x: 10, y: 100 }] }],
+})
+
+const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
+
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
   it('roundtrips Japanese names, multiline notes and secrets without DOM APIs', () => {
@@ -28,7 +47,7 @@ describe('saved projects', () => {
     expect(output.annotations[0].point).not.toBe(input.annotations[0].point)
   })
 
-  it.each([null, [], 'text', 1, {}, { version: 2 }])('rejects an invalid root or version: %j', (value) => {
+  it.each([null, [], 'text', 1, {}, { version: 3 }])('rejects an invalid root or version: %j', (value) => {
     expect(() => validateProject(value)).toThrow()
   })
 
@@ -56,7 +75,7 @@ describe('saved projects', () => {
 
   it('provides useful errors for invalid JSON and oversized files', () => {
     expect(() => parseProject('{')).toThrow('JSONを読み取れません')
-    expect(() => parseProject(' '.repeat(5_000_001))).toThrow('大きすぎます')
+    expect(() => parseProject(' '.repeat(MAX_PROJECT_JSON_LENGTH + 1))).toThrow('大きすぎます')
   })
 
   it('uses a versioned storage key and validates data on restore', () => {
@@ -80,5 +99,179 @@ describe('saved projects', () => {
     })
     expect(loadProject()).toBeNull()
     expect(persistProject(sample())).toBe(false)
+  })
+
+  it('migrates a v1 file without fabricating geometry or changing its pins', () => {
+    const legacy = { ...sample(), version: 1 }
+    const migrated = parseProject(JSON.stringify(legacy))
+    expect(migrated).toEqual(sample())
+    expect(migrated.snapshot).toBeUndefined()
+  })
+
+  it('restores the legacy storage key until a completed v2 project is saved', () => {
+    const memory = new Map([[LEGACY_STORAGE_KEY, JSON.stringify({ ...sample(), version: 1 })]])
+    vi.stubGlobal('localStorage', { getItem: (key: string) => memory.get(key) ?? null, setItem: (key: string, value: string) => memory.set(key, value) })
+    expect(loadProject()).toEqual(sample())
+    expect(persistProject(withSnapshot())).toBe(true)
+    expect(loadProject()).toEqual(withSnapshot())
+    expect(memory.has(LEGACY_STORAGE_KEY)).toBe(true)
+    memory.set(STORAGE_KEY, '{broken')
+    expect(loadProject()).toEqual(sample())
+  })
+
+  it('preserves complete geometry, historic dates, parcels and growth history byte for byte as values', () => {
+    const input = withSnapshot()
+    input.snapshot!.generatorVersion = 'future-engine-9.2'
+    Object.assign(input.snapshot!.roads[0], { phase: 'oldtown', constructionCost: 12345.6 })
+    Object.assign(input.snapshot!.growthLog![0], { households: 1300, unmetHouseholds: 300, constructionCost: 24680.1 })
+    const restored = parseProject(JSON.stringify(input))
+    expect(restored).toEqual(input)
+    expect(restored.snapshot!.buildings[0].polygon).not.toBe(input.snapshot!.buildings[0].polygon)
+    expect(restored.snapshot!.parcels![0].entrance).not.toBe(input.snapshot!.parcels![0].entrance)
+  })
+
+  it('restores historic snapshots without requiring modern railways or a minimum building count', () => {
+    const input = withSnapshot()
+    input.config.era = 'historic'; input.snapshot!.config.era = 'historic'
+    input.snapshot!.year = 1800; input.snapshot!.railways = []; input.snapshot!.stations = []
+    expect(validateProject(input)).toEqual(input)
+  })
+
+  it('rejects a saved map belonging to a different seed, era or configuration', () => {
+    for (const change of [{ seed: 'other-city' }, { era: 'historic' }, { density: 64 }]) {
+      const input = withSnapshot()
+      Object.assign(input.snapshot!.config, change)
+      expect(() => validateProject(input)).toThrow('一致しません')
+    }
+  })
+
+  it('accepts the legacy omitted era as the present stage', () => {
+    const input = withSnapshot()
+    input.snapshot!.config.era = 'present'
+    expect(validateProject(input).snapshot!.config.era).toBe('present')
+  })
+
+  it('strips unknown nested snapshot properties rather than passing imported objects to rendering', () => {
+    const input = withSnapshot()
+    Object.assign(input.snapshot!, { unexpected: { value: 'ignored' } })
+    Object.assign(input.snapshot!.roads[0], { unexpected: 'ignored' })
+    const output = validateProject(input)
+    expect(output.snapshot).not.toHaveProperty('unexpected')
+    expect(output.snapshot!.roads[0]).not.toHaveProperty('unexpected')
+  })
+
+  it.each([
+    (map: CityMap) => { map.width = Infinity },
+    (map: CityMap) => { map.height = 0 },
+    (map: CityMap) => { map.buildings[0].polygon[0].x = Number.NaN },
+    (map: CityMap) => { map.roads[0].points[0].y = 1e12 },
+    (map: CityMap) => { map.buildings[0].polygon = [{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 2, y: 2 }] },
+    (map: CityMap) => { map.roads[0].points = [{ x: 0, y: 0 }] },
+    (map: CityMap) => { map.buildings[0].height = 0 },
+    (map: CityMap) => { map.roads[0].width = -1 },
+    (map: CityMap) => { map.roads.push({ ...map.roads[0] }) },
+    (map: CityMap) => { map.year = 2025.5 },
+    (map: CityMap) => { map.parcels![0].roadId = 'missing-road' },
+    (map: CityMap) => { map.buildings[0].parcelId = 'missing-parcel' },
+    (map: CityMap) => { map.parcels![0].developedYear = 1700 },
+    (map: CityMap) => { map.events![0].kind = 'invalid' as 'road' },
+    (map: CityMap) => { map.snapshots![0].households = -1 },
+    (map: CityMap) => { map.railways[0].elevations = [10] },
+    (map: CityMap) => { map.railways[0].elevations![0] = Infinity },
+    (map: CityMap) => { map.railways[0].structures![0].kind = 'invalid' as 'bridge' },
+  ])('rejects malformed geometry or chronology %#', change => {
+    const input = withSnapshot()
+    change(input.snapshot!)
+    expect(() => validateProject(input)).toThrow()
+  })
+
+  it('bounds both geometry arrays and individual paths before reconstructing them', () => {
+    const input = withSnapshot()
+    input.snapshot!.buildings = Array.from({ length: 60_001 }, () => input.snapshot!.buildings[0])
+    expect(() => validateProject(input)).toThrow('建物')
+    input.snapshot = geometry()
+    input.snapshot.roads[0].points = Array.from({ length: 20_001 }, () => ({ x: 0, y: 1 }))
+    expect(() => validateProject(input)).toThrow('道路の形')
+  })
+
+  it('bounds the combined vertex count even when every individual road is within its limit', () => {
+    const input = withSnapshot()
+    const points = Array.from({ length: 20_000 }, (_, i) => ({ x: i % 2, y: 50 }))
+    input.snapshot!.roads = Array.from({ length: 38 }, (_, i) => ({ ...input.snapshot!.roads[0], id: `road-${i}`, points }))
+    expect(() => validateProject(input)).toThrow('頂点数')
+  })
+
+  it('preserves six-point footprints instead of reducing them to rectangular buildings', () => {
+    const input = withSnapshot()
+    input.snapshot!.buildings[0].polygon = [{ x: 10, y: 10 }, { x: 20, y: 10 }, { x: 20, y: 20 }, { x: 15, y: 20 }, { x: 15, y: 30 }, { x: 10, y: 30 }]
+    expect(parseProject(JSON.stringify(input))).toEqual(input)
+  })
+
+  it('rejects pins outside the saved map extent', () => {
+    const input = withSnapshot()
+    input.annotations[0].point.x = input.snapshot!.width + 1
+    expect(() => validateProject(input)).toThrow('横位置')
+  })
+
+  it('does not replace the last good save when the next map exceeds the local storage budget', () => {
+    const memory = new Map([[STORAGE_KEY, JSON.stringify(withSnapshot())]])
+    const setItem = vi.fn((key: string, value: string) => memory.set(key, value))
+    vi.stubGlobal('localStorage', { getItem: (key: string) => memory.get(key) ?? null, setItem })
+    const large = withSnapshot()
+    large.annotations = Array.from({ length: 600 }, (_, i) => ({ ...large.annotations[0], id: `pin-${i}`, note: '物'.repeat(3500) }))
+    expect(persistProject(large)).toBe(false)
+    expect(setItem).not.toHaveBeenCalled()
+    expect(loadProject()).toEqual(withSnapshot())
+  })
+
+  it('does not replace the last good save when the browser rejects a write', () => {
+    const previous = JSON.stringify(withSnapshot())
+    vi.stubGlobal('localStorage', { getItem: () => previous, setItem: () => { throw new Error('QuotaExceededError') } })
+    expect(persistProject(sample())).toBe(false)
+    expect(loadProject()).toEqual(withSnapshot())
+  })
+
+  it('falls back to small and legacy saves when IndexedDB is unavailable', async () => {
+    const memory = new Map([[LEGACY_STORAGE_KEY, JSON.stringify({ ...sample(), version: 1 })]])
+    vi.stubGlobal('indexedDB', undefined)
+    vi.stubGlobal('localStorage', { getItem: (key: string) => memory.get(key) ?? null, setItem: (key: string, value: string) => memory.set(key, value) })
+    expect(await loadProjectArchive()).toEqual(sample())
+    expect(await persistProjectArchive(withSnapshot())).toBe(true)
+    expect(await loadProjectArchive()).toEqual(withSnapshot())
+  })
+
+  it('reports an archive failure when neither complete-map storage method is available', async () => {
+    vi.stubGlobal('indexedDB', { open: () => { throw new Error('SecurityError') } })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => { throw new Error('QuotaExceededError') } })
+    expect(await loadProjectArchive()).toBeNull()
+    expect(await persistProjectArchive(withSnapshot())).toBe(false)
+  })
+
+  it('bounds an unresponsive archive probe and closes a late connection', async () => {
+    vi.useFakeTimers()
+    const request: { onsuccess?: () => void; onerror?: () => void; onblocked?: () => void; result?: { close: () => void } } = {}
+    vi.stubGlobal('indexedDB', { open: () => request })
+    vi.stubGlobal('localStorage', { getItem: () => JSON.stringify(withSnapshot()) })
+    const loading = loadProjectArchive()
+    await vi.advanceTimersByTimeAsync(2501)
+    expect(await loading).toEqual(withSnapshot())
+    const close = vi.fn()
+    request.result = { close }; request.onsuccess!()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('rejects malformed maps before attempting either asynchronous storage method', async () => {
+    const open = vi.fn(), setItem = vi.fn()
+    vi.stubGlobal('indexedDB', { open }); vi.stubGlobal('localStorage', { setItem })
+    const project = withSnapshot(); project.snapshot!.buildings[0].polygon[0].x = Infinity
+    expect(await persistProjectArchive(project)).toBe(false)
+    expect(open).not.toHaveBeenCalled(); expect(setItem).not.toHaveBeenCalled()
+  })
+
+  it('cannot replace a complete archive with an unfinished generation', async () => {
+    const open = vi.fn(), setItem = vi.fn()
+    vi.stubGlobal('indexedDB', { open }); vi.stubGlobal('localStorage', { setItem })
+    expect(await persistProjectArchive(sample())).toBe(false)
+    expect(open).not.toHaveBeenCalled(); expect(setItem).not.toHaveBeenCalled()
   })
 })
