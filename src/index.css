@@ -1,0 +1,39 @@
+:root {
+  font-family: 'Noto Sans JP', 'Yu Gothic', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+  color: #233f3a;
+  background: #fff;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --color-accent: #15574e;
+  --color-accent-hover: #206e61;
+  --color-text: #233f3a;
+  --color-muted: #667671;
+  --color-border: #dbe2df;
+  --color-tint: #eaf3f0;
+  --color-paper: #fff;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; }
+body { min-width: 320px; overflow: hidden; }
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+button { color: inherit; }
+button:disabled { cursor: default; opacity: .55; }
+button, a, input, select, textarea, summary { outline-offset: 4px; }
+:focus-visible { outline: 2px solid #21796a; }
+button { transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease; }
+a { color: var(--color-accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+svg { flex-shrink: 0; }
+button svg { pointer-events: none; }
+input[type='checkbox'] { accent-color: var(--color-accent); }
+::selection { background: #d8ebe3; }
+* { scrollbar-width: thin; scrollbar-color: #c5d2cc transparent; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-thumb { background: #c5d2cc; border-radius: 6px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
