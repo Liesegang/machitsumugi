@@ -22,6 +22,7 @@ export interface UrbanGrowthInput {
   era?: 'historic' | 'railway' | 'present'; terrainModel?: PlanningTerrain
   onProgress?: (year: number) => void
   onPreview?: (roads: SimulatedRoad[], year: number) => void
+  onCivicPopulation?: (year: number, population: { point: Point; households: number }[]) => void
   stationAccessProjects?: { station: Point; route: PlannedRoute }[]
   railwayCorridors?: { id: string; points: Point[]; builtYear?: number }[]
   onRailwayPlanning?: (state: { roads: SimulatedRoad[]; centers: GrowthCenter[] }) => { stationPoints: Point[]; stationAccessProjects?: { station: Point; route: PlannedRoute }[]; railwayCorridors?: { id: string; points: Point[]; builtYear?: number }[] }
@@ -625,6 +626,9 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       if (changed) { existing(year); occupy(target.households, year) }
     }
     growthLog.push({ phase, year, roadsAdded: graph.roads.length - before, reason: graph.roads.length > before ? '既存宅地の供給を利用した後、予算と開発便益を満たす交通事業を実施' : '既存供給で需要を充足、または新設事業が採算・地形条件を満たさない', households: target.households, unmetHouseholds: Math.max(0, target.households - allocated), constructionCost: expenditure })
+    // Detached snapshot: civic programmes may inspect this round's occupied
+    // catchments without modifying later simulation cells or retaining aliases.
+    if (year >= 1955) input.onCivicPopulation?.(year, cells.filter(cell => cell.households > 0).map(cell => ({ point: { ...cell.point }, households: cell.households })))
     if (year % 25 === 0 || year === endYear) input.onPreview?.(graph.roads, year)
   }
   const finalTarget = demandSchedule.at(-1) ?? demandAt(1650)

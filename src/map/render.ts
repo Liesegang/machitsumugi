@@ -85,6 +85,8 @@ export function traceRegion(ctx: CanvasRenderingContext2D, region: Pick<Area, 'p
 
 export function areaColor(area: Area, style: MapStyle): string {
   if (area.id === 'harbor-yard') return style === 'standard' ? '#deded8' : style === 'mono' ? '#e2e2e2' : '#48504c'
+  if (area.id.startsWith('castle-wall-')) return style === 'standard' ? '#b5b9aa' : style === 'mono' ? '#b7b7b7' : '#627066'
+  if (area.id.startsWith('castle-courtyard-')) return style === 'standard' ? '#e2dfce' : style === 'mono' ? '#e5e5e5' : '#4b5146'
   if (!area.landUse || area.landUse === 'farmland') return PALETTES[style][area.kind]
   const colors = {
     standard: { meadow: '#dfe7d5', wetland: '#cdded5', vacant: '#e8eadd', paddy: '#cbdab8', 'dry-field': '#e2d9b9' },
