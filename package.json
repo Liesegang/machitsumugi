@@ -8,6 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:unit": "vitest run --exclude \"src/domain/generator*.test.ts\"",
+    "test:generation": "vitest run src/domain/generator",
     "lint": "oxlint"
   },
   "dependencies": {
