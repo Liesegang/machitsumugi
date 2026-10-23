@@ -1,4 +1,8 @@
 import { erodeTerrain } from './hydrology.ts'
+import { initialLandscape } from './initial-landscape.ts'
+import type { ErosionDiagnostics, SedimentDiagnostics } from './hydrology.ts'
+import type { CityConfig, TerrainSurface } from './types'
+export interface RegionalPreview { surface: TerrainSurface; iteration: number; iterations: number; cached?: boolean; seaLevel: number }
 
 export interface RegionalTerrain {
   extent: number
@@ -16,6 +20,9 @@ export interface RegionalTerrain {
   processedCells: number
   outletArea: number
   fillVolume: number
+  erosion: ErosionDiagnostics
+  alluvium: Float32Array
+  sediment: SedimentDiagnostics
 }
 const clamp = (v: number, a = 0, b = 1) => Math.max(a, Math.min(b, v))
 const fade = (t: number) => t * t * (3 - 2 * t)
@@ -32,42 +39,46 @@ export function sampleRegional(world: RegionalTerrain, field: Float32Array | Flo
 }
 const cache = new Map<string, RegionalTerrain>()
 
+/** Separable uniform-grid PCHIP reconstruction. Harmonic-mean tangents retain
+ * C1 continuity and the cell-corner elevation range; an offshore cliff must not
+ * create a new positive hill on a flat coast through Catmull-Rom overshoot.
+ * Fritsch–Butland monotone piecewise cubic interpolation (1984).
+ */
+export function sampleRegionalCubic(world: RegionalTerrain, field: Float32Array, x: number, y: number) {
+  const gx = clamp(x / world.resolution, 1, world.columns - 2.001), gy = clamp(y / world.resolution, 1, world.rows - 2.001), ix = Math.floor(gx), iy = Math.floor(gy)
+  const cubic = (a: number, b: number, c: number, d: number, t: number) => {
+    const left = b - a, middle = c - b, right = d - c
+    const first = left * middle > 0 ? 2 * left * middle / (left + middle) : 0
+    const last = middle * right > 0 ? 2 * middle * right / (middle + right) : 0
+    const square = t * t, cube = square * t
+    return (2 * cube - 3 * square + 1) * b + (cube - 2 * square + t) * first + (-2 * cube + 3 * square) * c + (cube - square) * last
+  }
+  const values: number[] = []
+  for (let j = -1; j <= 2; j++) { const row = (iy + j) * world.columns + ix; values.push(cubic(field[row - 1]!, field[row]!, field[row + 1]!, field[row + 2]!, gx - ix)) }
+  return cubic(values[0]!, values[1]!, values[2]!, values[3]!, gy - iy)
+}
+
 /** Regional landforms precede the 4×3km city crop; river catchments are never viewport-sized. */
-export function getRegionalTerrain(seedText: string): RegionalTerrain {
-  const cached = cache.get(seedText)
-  if (cached) { cache.delete(seedText); cache.set(seedText, cached); return cached }
-  const extent = 24_000, resolution = 50, columns = extent / resolution + 1, rows = columns, count = columns * rows
-  const seed = terrainSeed(`${seedText}:watershed-v4`), initial = new Float32Array(count)
-  const ridges = [-1, 1].map((side, ridge) => Array.from({ length: 7 }, (_, i) => ({ x: extent * (.56 + side * (ridge === 0 ? .17 : .30)) + (terrainNoise(seed + 51 + ridge, i * 1.71, 8) - .5) * 1900, y: i * extent / 6 })))
-  const segmentDistance = (x: number, y: number, a: { x: number; y: number }, b: { x: number; y: number }) => {
-    const dx = b.x - a.x, dy = b.y - a.y, t = clamp(((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy))
-    return Math.hypot(x - a.x - dx * t, y - a.y - dy * t)
+export function getRegionalTerrain(seedText: string, coastType: CityConfig['coastType'] = 'bay', onPreview?: (frame: RegionalPreview) => void, relief: CityConfig['relief'] = 'hills'): RegionalTerrain {
+  const key = `${seedText}:${coastType}:${relief}`, cached = cache.get(key)
+  const frame = (elevation: Float32Array, columns: number, resolution: number, iteration: number, iterations: number, cached = false, seaLevel = 0) => {
+    if (!onPreview) return
+    const stride = 2, side = Math.floor((columns - 1) / stride) + 1, elevations: number[] = []
+    for (let y = 0; y < columns; y += stride) for (let x = 0; x < columns; x += stride) elevations.push(elevation[y * columns + x]!)
+    onPreview({ surface: { columns: side, rows: side, cellSize: resolution * stride, elevations }, iteration, iterations, cached, seaLevel })
   }
-  for (let row = 0; row < rows; row++) for (let col = 0; col < columns; col++) {
-    const x = col * resolution, y = row * resolution, nx = x / extent, ny = y / extent
-    const t = .79 - ny
-    // Regional coastal subsidence opens the valley into a bay rather than ending
-    // the drainage in a narrow, accidentally enclosed negative-elevation pit.
-    const coast = fade(clamp((ny - .72) / .28))
-    const base = 430 * Math.sign(t) * Math.pow(Math.abs(t), 1.6) - coast * 220
-    // A broad, wandering structural valley joins the mountain catchments. Its cross
-    // slope must exceed D8's angular threshold away from the floor; a nearly
-    // uniform tilted plane otherwise creates many artificial parallel channels.
-    const valleyAxis = .56 + (terrainNoise(seed + 409, 0, y / 5200) - .5) * .08 + (terrainNoise(seed + 683, 0, y / 1900) - .5) * .045
-    const valleyDistance = Math.abs(nx - valleyAxis), transverse = 1250 * Math.pow(valleyDistance, 1.4)
-    let uplift = 0
-    for (const [ridgeIndex, ridge] of ridges.entries()) {
-      let d = Infinity
-      for (let i = 1; i < ridge.length; i++) d = Math.min(d, segmentDistance(x, y, ridge[i - 1]!, ridge[i]!))
-      uplift += (ridgeIndex === 0 ? 265 : 190) * Math.exp(-((d / 1850) ** 2))
-    }
-    const roughness = 14 + clamp(valleyDistance / .30) * 76
-    const low = (terrainNoise(seed, x / 3700, y / 3700) - .5) * roughness
-    const medium = (terrainNoise(seed + 119, x / 1350, y / 1350) - .5) * roughness * .36
-    const detail = (terrainNoise(seed + 217, x / 520, y / 520) - .5) * roughness * .08
-    initial[row * columns + col] = base + transverse + uplift + low + medium + detail
-  }
-  const eroded = erodeTerrain(initial, columns, rows, resolution, 2)
+  if (cached) { cache.delete(key); cache.set(key, cached); frame(cached.rawDEM, cached.columns, cached.resolution, cached.erosion.iterations, cached.erosion.iterations, true); return cached }
+  const extent = 24_000, resolution = 100, columns = extent / resolution + 1, rows = columns, count = columns * rows
+  const seed = terrainSeed(`${seedText}:uplift-v1`)
+  const initial = initialLandscape({ columns, resolution, extent, noise: terrainNoise, seed, coastType, relief })
+  const eroded = erodeTerrain(initial.elevation, columns, rows, resolution, {
+    passes: 256, timeStepYears: 4000, uplift: initial.uplift, erodibility: initial.erodibility,
+    diffusivity: .15, sediment: true,
+    // Drowned valleys result from a late base-level rise over the previously
+    // eroded terrain. No ria outline or river-mouth trumpet is stamped on it.
+    seaLevel: coastType === 'ria' ? (iteration, iterations) => -40 * (1 - clamp((iteration - iterations + 16) / 16)) : undefined,
+    onStep: state => frame(state.elevation, columns, resolution, state.iteration, state.iterations, false, state.seaLevel),
+  })
   const ocean = new Uint8Array(count), queue = new Int32Array(count)
   let head = 0, tail = 0
   for (let row = 0; row < rows; row++) for (let col = 0; col < columns; col++) if (!row || !col || row === rows - 1 || col === columns - 1) {
@@ -81,7 +92,7 @@ export function getRegionalTerrain(seedText: string): RegionalTerrain {
     }
   }
   const result: RegionalTerrain = { extent, columns, rows, resolution, seed, ...eroded, ocean }
-  cache.set(seedText, result)
-  while (cache.size > 2) cache.delete(cache.keys().next().value!)
+  cache.set(key, result)
+  while (cache.size > 6) cache.delete(cache.keys().next().value!)
   return result
 }

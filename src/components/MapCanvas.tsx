@@ -1,26 +1,26 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { LocateFixed, Minus, Plus } from 'lucide-react'
-import type { Building, CityMap, Facility, Point } from '../domain/types'
+import type { CityMap, Point } from '../domain/types'
+import { createMapInspector, featureSummary, featureTitle } from '../map/inspect'
+import type { MapFeature } from '../map/inspect'
 import { renderMap } from '../map/render'
 import type { Annotation, RenderOptions } from '../map/render'
 export interface MapHandle { zoom: (factor: number) => void; fit: () => void; center: (point: Point) => void; getCenter: () => Point }
-interface Props { map: CityMap; options: RenderOptions; pinMode: boolean; onPick: (point: Point, feature?: Building | Facility) => void; onAnnotationPick: (pin: Annotation) => void }
+interface Props { map: CityMap; options: RenderOptions; pinMode: boolean; onPick: (point: Point, feature?: MapFeature) => void; onAnnotationPick: (pin: Annotation) => void }
 interface View { x: number; y: number; scale: number }
-function contains(point: Point, polygon: Point[]) {
-  let inside = false
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const a = polygon[i], b = polygon[j]
-    if ((a.y > point.y) !== (b.y > point.y) && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x) inside = !inside
-  }
-  return inside
-}
 export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, options, pinMode, onPick, onAnnotationPick }, ref) {
   const container = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLCanvasElement>(null)
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 1 })
+  const [fittedFor, setFittedFor] = useState('')
+  const [hover, setHover] = useState<{ point: Point; feature: MapFeature } | null>(null)
+  const inspect = useMemo(() => createMapInspector(map), [map])
+  const lastHover = useRef(0)
   const pointers = useRef(new Map<number, Point>())
   const gesture = useRef({ x: 0, y: 0, moved: false })
+  const mapIdentity = JSON.stringify(map.config)
+  const regionalPreview = map.previewPhase === 'landscape' || map.previewPhase === 'erosion'
   const baseScale = Math.min(size.width / map.width, size.height / map.height)
   const fit = useCallback(() => {
     if (!size.width || !size.height) return
@@ -32,16 +32,18 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
     if (!element) return
     const bounds = element.getBoundingClientRect()
     setSize({ width: bounds.width, height: bounds.height })
-    const observer = new ResizeObserver(([entry]) => setSize({ width: entry.contentRect.width, height: entry.contentRect.height }))
+    const observer = new ResizeObserver(([entry]) => setSize(old => old.width === entry.contentRect.width && old.height === entry.contentRect.height ? old : { width: entry.contentRect.width, height: entry.contentRect.height }))
     observer.observe(element)
     return () => observer.disconnect()
   }, [])
-  useLayoutEffect(() => {
-    if (size.width > 0 && size.width < 850) {
-      const scale = Math.max(size.width / map.width, size.height / map.height)
-      setView({ x: (size.width - map.width * scale) / 2, y: (size.height - map.height * scale) / 2, scale })
-    } else fit()
-  }, [fit, map, size])
+  const fitKey = JSON.stringify([mapIdentity, map.width, map.height, size.width, size.height, regionalPreview])
+  // Fit before painting a new extent/configuration. Replacing a worker frame
+  // with the next phase of the same map leaves the user's view untouched.
+  if (size.width > 0 && size.height > 0 && fittedFor !== fitKey) {
+    const scale = (size.width < 850 && !regionalPreview ? Math.max : Math.min)(size.width / map.width, size.height / map.height)
+    setFittedFor(fitKey)
+    setView({ x: (size.width - map.width * scale) / 2, y: (size.height - map.height * scale) / 2, scale })
+  }
   const zoomAt = useCallback((factor: number, point: Point) => setView(old => {
     const scale = Math.max(baseScale * .6, Math.min(baseScale * 14, old.scale * factor)), ratio = scale / old.scale
     return { scale, x: point.x - (point.x - old.x) * ratio, y: point.y - (point.y - old.y) * ratio }
@@ -66,9 +68,7 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
     if (pinMode) return onPick(point)
     const pin = [...options.annotations].reverse().find(item => (options.showSecrets || !item.secret) && Math.hypot((point.x - item.point.x) * view.scale, (point.y - item.point.y) * view.scale + 20) < 24)
     if (pin) return onAnnotationPick(pin)
-    const facility = options.layers.facilities ? map.facilities.find(item => Math.hypot(item.point.x - point.x, item.point.y - point.y) < 16 / view.scale) : undefined
-    const building = options.layers.buildings ? map.buildings.find(item => contains(point, item.polygon)) : undefined
-    onPick(point, facility || building)
+    onPick(point, inspect(point, 7 / view.scale, options.layers))
   }
   const scaleMeters = view.scale > 1 ? 100 : view.scale > .5 ? 200 : 500
   return <div className={`map-canvas ${pinMode ? 'pin-mode' : ''}`} ref={container}>
@@ -80,9 +80,18 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
         if (event.key === '-') { event.preventDefault(); zoom(1 / 1.3) }
         if (event.key === 'Home') { event.preventDefault(); fit() }
       }}
-      onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY }); gesture.current = { x: event.clientX, y: event.clientY, moved: false } }}
+      onPointerDown={event => { setHover(null); event.currentTarget.setPointerCapture(event.pointerId); pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY }); gesture.current = { x: event.clientX, y: event.clientY, moved: false } }}
       onPointerMove={event => {
-        const previous = pointers.current.get(event.pointerId); if (!previous) return
+        const previous = pointers.current.get(event.pointerId)
+        if (!previous) {
+          if (pinMode || event.pointerType === 'touch' || performance.now() - lastHover.current < 50) return
+          lastHover.current = performance.now()
+          const rect = event.currentTarget.getBoundingClientRect(), cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+          const point = { x: (cursor.x - view.x) / view.scale, y: (cursor.y - view.y) / view.scale }
+          const feature = inspect(point, 7 / view.scale, options.layers)
+          setHover(feature ? { point: cursor, feature } : null)
+          return
+        }
         const current = { x: event.clientX, y: event.clientY }; if (Math.hypot(current.x - gesture.current.x, current.y - gesture.current.y) > 5) gesture.current.moved = true
         if (pointers.current.size === 2) {
           const other = [...pointers.current.entries()].find(([id]) => id !== event.pointerId)![1], oldDist = Math.hypot(previous.x - other.x, previous.y - other.y), newDist = Math.hypot(current.x - other.x, current.y - other.y), rect = event.currentTarget.getBoundingClientRect()
@@ -92,7 +101,9 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
       }}
       onPointerUp={event => { if (!gesture.current.moved && pointers.current.size === 1) pick({ x: event.clientX, y: event.clientY }); pointers.current.delete(event.pointerId) }}
       onPointerCancel={event => pointers.current.delete(event.pointerId)}
+      onPointerLeave={() => setHover(null)}
       onDoubleClick={event => { const rect = event.currentTarget.getBoundingClientRect(); zoomAt(1.7, { x: event.clientX - rect.left, y: event.clientY - rect.top }) }} />
+    {hover && !pinMode && <div className="map-hover" role="tooltip" style={{ left: Math.max(6, Math.min(size.width - 226, hover.point.x + 14)), top: Math.max(6, Math.min(size.height - 90, hover.point.y + 14)) }}><strong>{featureTitle(hover.feature)}</strong><span>{featureSummary(hover.feature) || 'クリックで履歴を表示'}</span></div>}
     <div className="scale-bar"><span style={{ width: Math.max(40, scaleMeters * view.scale) }} /><b>{scaleMeters} m</b></div>
     <div className="zoom-controls"><button aria-label="拡大" title="拡大 (+)" onClick={() => zoom(1.4)}><Plus size={19} /></button><button aria-label="縮小" title="縮小 (-)" onClick={() => zoom(1 / 1.4)}><Minus size={19} /></button><button aria-label="地図全体を表示" title="地図全体を表示 (Home)" onClick={fit}><LocateFixed size={19} /></button></div><span className="zoom-label">{Math.round(view.scale / (baseScale || 1) * 100)}%</span>
   </div>

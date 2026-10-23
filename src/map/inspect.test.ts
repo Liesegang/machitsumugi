@@ -1,0 +1,32 @@
+import { expect, it } from 'vitest'
+import type { CityMap } from '../domain/types'
+import { createMapInspector, featureHistory } from './inspect'
+
+const map = {
+  width: 100, height: 100, description: '履歴と地物選択の検証', areas: [], stations: [],
+  config: { name: '検証市', seed: 'inspect', type: 'castle', terrain: 'river', density: 50, forest: 0, railway: false, stations: 1, arterial: false, facilities: [] },
+  buildings: [{ id: 'building-p-2020', parcelId: 'p', polygon: [{ x: 10, y: 10 }, { x: 30, y: 10 }, { x: 30, y: 30 }, { x: 10, y: 30 }], kind: 'residential', height: 3, builtYear: 2020 }],
+  roads: [{ id: 'road', points: [{ x: 0, y: 50 }, { x: 100, y: 50 }], width: 6, kind: 'local', builtYear: 1800 }], railways: [], facilities: [],
+  districts: [{ id: 'town', name: '川端町', regions: [{ polygon: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }], holes: [[{ x: 70, y: 70 }, { x: 90, y: 70 }, { x: 90, y: 90 }, { x: 70, y: 90 }]] }], point: { x: 40, y: 40 } }],
+  parcels: [{ id: 'p', polygon: [], entrance: { x: 20, y: 35 }, roadId: 'road', createdYear: 1800, use: 'residential' }],
+  events: [
+    { id: 'a', entityId: 'building-p', year: 1850, kind: 'construction', reason: '最初の家' },
+    { id: 'b', entityId: 'building-p', year: 2020, kind: 'acquisition', reason: '建替え' },
+    { id: 'c', entityId: 'building-p-2020', year: 2020, kind: 'construction', reason: '新しい共同住宅' },
+    { id: 'other', entityId: 'building-p-other', year: 1900, kind: 'construction', reason: '無関係な家' },
+  ],
+} as CityMap
+const layers = { buildings: true, facilities: true, roads: true, railway: true, terrain: true, labels: true }
+it('selects actual building/road footprints and respects district holes and hidden layers', () => {
+  const pick = createMapInspector(map)
+  expect(pick({ x: 20, y: 20 }, 1, layers)?.type).toBe('building')
+  expect(pick({ x: 50, y: 52 }, 1, layers)?.item.id).toBe('road')
+  expect(pick({ x: 60, y: 60 }, 1, layers)?.item.id).toBe('town')
+  expect(pick({ x: 80, y: 80 }, 1, layers)).toBeUndefined()
+  expect(pick({ x: 20, y: 20 }, 1, { ...layers, buildings: false, labels: false })).toBeUndefined()
+})
+it('shows recorded parcel rebuild history without inventing or including unrelated events', () => {
+  const history = featureHistory(map, { type: 'building', item: map.buildings[0]! })
+  expect(history.map(e => [e.year, e.reason])).toEqual([[1850, '最初の家'], [2020, '建替え'], [2020, '新しい共同住宅']])
+  expect(featureHistory(map, { type: 'area', item: { id: 'forest', kind: 'forest', polygon: [] } })).toEqual([])
+})

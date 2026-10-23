@@ -1,6 +1,9 @@
 import type { CityMap, Point } from '../domain/types'
-import { buildingColor, FACILITY_SYMBOLS, MAP_FONT, PALETTES, renderMap } from './render'
+import { areaColor, buildingColor, FACILITY_SYMBOLS, MAP_FONT, PALETTES, renderMap } from './render'
 import type { RenderOptions } from './render'
+import { terrainContours } from './contours'
+import { waterGeometry } from './water-surfaces'
+import { areaLabelPoint } from './area-labels'
 
 function filename(map: CityMap, extension: string) {
   return `${map.config.name.replace(/[\\/:*?"<>|]/g, '_') || 'machitsumugi'}-${map.config.seed.replace(/[^\w\u3000-\u9fff-]/g, '_').slice(0, 48)}.${extension}`
@@ -52,7 +55,7 @@ export async function exportMapPng(map: CityMap, options: RenderOptions, width =
   ctx.fillStyle = colors.label
   ctx.textBaseline = 'middle'
   ctx.font = `${Math.round(size * .0052)}px ${MAP_FONT}`
-  ctx.fillText(`街紡ぎ  ·  ${map.config.seed}  ·  実在しない街の地図`, margin, height - footer / 2)
+  ctx.fillText(`架空日本地図ジェネレーター  ·  ${map.config.seed}  ·  実在しない街の地図`, margin, height - footer / 2)
   const barX = size - margin - 500 * scale
   const barY = height - footer / 2 + size * .002
   ctx.strokeStyle = colors.label
@@ -82,16 +85,29 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
   const parts: string[] = []
   const px = Math.max(1, map.width / 2100)
   const text = (name: string, p: Point, color: string, size = 12, weight = 500) => `<text x="${p.x.toFixed(2)}" y="${p.y.toFixed(2)}" text-anchor="middle" dominant-baseline="central" font-size="${size * px}" font-weight="${weight}" fill="${color}" stroke="${c.halo}" stroke-width="${3 * px}" paint-order="stroke" stroke-linejoin="round">${escapeXml(name)}</text>`
-  parts.push(`<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="4096" height="${Math.round(4096 * map.height / map.width)}" viewBox="0 0 ${map.width} ${map.height}" font-family="Noto Sans JP,Yu Gothic,Hiragino Kaku Gothic ProN,sans-serif"><title>${escapeXml(map.config.name)} — 街紡ぎ</title><desc>架空都市地図。seed: ${escapeXml(map.config.seed)}</desc><defs><clipPath id="bounds"><rect width="${map.width}" height="${map.height}"/></clipPath><pattern id="forest" width="25" height="25" patternUnits="userSpaceOnUse"><circle cx="6" cy="8" r="7" fill="${c.tree}" opacity=".45"/><circle cx="20" cy="21" r="6" fill="${c.treeDark}" opacity=".3"/></pattern></defs><rect width="${map.width}" height="${map.height}" fill="${c.ground}"/><g clip-path="url(#bounds)" stroke-linejoin="round" stroke-linecap="round">`)
+  parts.push(`<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="4096" height="${Math.round(4096 * map.height / map.width)}" viewBox="0 0 ${map.width} ${map.height}" font-family="Noto Sans JP,Yu Gothic,Hiragino Kaku Gothic ProN,sans-serif"><title>${escapeXml(map.config.name)} — 架空日本地図ジェネレーター</title><desc>架空都市地図。seed: ${escapeXml(map.config.seed)}</desc><defs><clipPath id="bounds"><rect width="${map.width}" height="${map.height}"/></clipPath></defs><rect width="${map.width}" height="${map.height}" fill="${c.ground}"/><g clip-path="url(#bounds)" stroke-linejoin="round" stroke-linecap="round">`)
   if (layers.terrain) {
     for (const area of map.areas) {
-      parts.push(`<path d="${path(area.polygon, true)}" fill="${c[area.kind]}"${area.kind === 'water' ? ` stroke="${c.waterEdge}" stroke-width="1.5"` : ''}/>`)
-      if (area.kind === 'forest') parts.push(`<path d="${path(area.polygon, true)}" fill="url(#forest)"/>`)
+      if (area.kind === 'water') continue
+      if (options.contours && map.terrainSurface) continue
+      const d = [area.polygon, ...area.holes ?? []].map(ring => path(ring, true)).join(' ')
+      parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
+      // The portable full-city view uses the same continuous woodland fill as
+      // the canvas overview; individual tree texture belongs to close zooms.
     }
+    const water = waterGeometry(map.areas)
+    for (const area of water.surfaces) parts.push(`<path d="${[area.polygon, ...(area.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
+    for (const shoreline of water.shorelines) parts.push(`<path d="${[shoreline.polygon, ...(shoreline.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="none" stroke="${c.waterEdge}" stroke-width="1.5"/>`)
   }
-  if (layers.buildings && map.parcels) for (const p of map.parcels.filter(p => p.developedYear)) parts.push(`<path d="${path(p.polygon, true)}" fill="none" stroke="${c.roadEdge}" stroke-width=".6"/>`)
+  if (options.contours && map.terrainSurface) for (const line of terrainContours(map.terrainSurface)) {
+    parts.push(`<path data-elevation="${line.elevation}" d="${path(line.points)}" fill="none" stroke="${options.style === 'mono' ? '#777777' : '#9b8060'}" stroke-width="${(line.index ? 1.15 : .6) * px}" opacity="${line.index ? .85 : .48}"/>`)
+    if (line.index && line.points.length > 8) parts.push(text(`${line.elevation}m`, line.points[Math.floor(line.points.length * .43)]!, '#816849', 10))
+  }
+  if (layers.labels) for (const district of map.districts) for (const region of district.regions ?? []) parts.push(`<path d="${[region.polygon, ...(region.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="none" stroke="${options.style === 'night' ? '#b3a6c8' : '#8a8293'}" stroke-width="${(district.kind === 'ward' ? 1.25 : .65) * px}" stroke-dasharray="${4 * px} ${3 * px}" opacity=".65"/>`)
+  if (layers.buildings && map.parcels) for (const p of map.parcels.filter(p => p.developedYear && p.retiredYear === undefined)) parts.push(`<path d="${path(p.polygon, true)}" fill="none" stroke="${c.roadEdge}" stroke-width=".6"/>`)
   if (layers.buildings) for (const b of map.buildings) parts.push(`<path d="${path(b.polygon, true)}" fill="${buildingColor(b, options.style)}"/>`)
   if (layers.roads) {
+    for (const p of map.parcels ?? []) if (p.developedYear && p.retiredYear === undefined && p.access?.length) parts.push(`<path d="${path(p.access)}" fill="none" stroke="${c.roadEdge}" stroke-width="3.4"/><path d="${path(p.access)}" fill="none" stroke="${c.road}" stroke-width="2.8"/>`)
     for (const kind of ['local', 'arterial'] as const) {
       for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.arteryEdge : c.roadEdge}" stroke-width="${road.width + 2.5}"/>`)
       for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.artery : c.road}" stroke-width="${road.width}"/>`)
@@ -105,6 +121,11 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
     for (let y = 0; y <= map.height; y += 100) parts.push(`<path d="M0 ${y}H${map.width}" stroke="${c.grid}" stroke-width="1" opacity=".3"/>`)
   }
   if (layers.labels) for (const district of map.districts) parts.push(text(district.name, district.point, c.label))
+  if (layers.labels && layers.buildings) for (const building of map.buildings) {
+    if (building.use !== 'lodging' || !building.name || !building.polygon.length) continue
+    const center = building.polygon.reduce((a, p) => ({ x: a.x + p.x / building.polygon.length, y: a.y + p.y / building.polygon.length }), { x: 0, y: 0 })
+    parts.push(text(building.name, center, c.label, 10))
+  }
   if (layers.railway) for (const station of map.stations) {
     const { x, y } = station.point
     parts.push(`<rect x="${x - 6 * px}" y="${y - 6 * px}" width="${12 * px}" height="${12 * px}" rx="${px}" fill="${c.station}" stroke="${c.halo}" stroke-width="${px}"/><path d="M${x - 3 * px} ${y - 3 * px}h${6 * px}v${5 * px}h${-6 * px}z M${x - 2.5 * px} ${y + 4 * px}h${5 * px}" stroke="${c.halo}" stroke-width="${px}" fill="none"/>`)
@@ -114,6 +135,11 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
     const { x, y } = facility.point
     parts.push(`<circle cx="${x}" cy="${y}" r="${8 * px}" fill="${c.halo}"/>${text(FACILITY_SYMBOLS[facility.kind] ?? '●', facility.point, c.landmark, 11, 700)}`)
     if (layers.labels) parts.push(text(facility.name, { x, y: y + 18 * px }, c.label, 10))
+  }
+  if (layers.labels && layers.terrain) for (const area of map.areas) {
+    if (!area.name || (layers.facilities && map.facilities.some(facility => facility.name === area.name))) continue
+    const point = areaLabelPoint(area, map.areas)
+    if (point) parts.push(text(area.name, point, area.kind === 'water' ? c.station : c.landmark, 11))
   }
   for (const annotation of options.annotations) {
     if (annotation.secret && !options.showSecrets) continue

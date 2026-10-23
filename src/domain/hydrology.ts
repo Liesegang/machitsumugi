@@ -1,3 +1,6 @@
+import { transportSediment } from './sediment-transport.ts'
+import { routeLeastTransverse } from './flow-directions.ts'
+import { transportHillslope } from './hillslope-transport.ts'
 /** DEM conditioning and single-flow drainage. Distances/elevations are metres; area is m². */
 export interface DrainageResult {
   hydroDEM: Float32Array
@@ -10,7 +13,7 @@ export interface DrainageResult {
 }
 
 /** Priority-Flood fills accidental pits; equal-height flats drain using the flood ordering. */
-export function routeDrainage(raw: Float32Array, columns: number, rows: number, cellSize: number): DrainageResult {
+export function routeDrainage(raw: Float32Array, columns: number, rows: number, cellSize: number, method: 'd8' | 'd8-ltd' = 'd8-ltd'): DrainageResult {
   const count = columns * rows, hydroDEM = new Float32Array(raw), visited = new Uint8Array(count)
   const heap = new Int32Array(count), rank = new Int32Array(count), floodParent = new Int32Array(count)
   floodParent.fill(-1)
@@ -68,6 +71,7 @@ export function routeDrainage(raw: Float32Array, columns: number, rows: number, 
     flowTo[i] = best
     if (best >= 0) indegree[best]++
   }
+  if (method === 'd8-ltd') return { hydroDEM, fillVolume, ...routeLeastTransverse({ elevation: hydroDEM, columns, rows, cellSize, floodRank: rank, fallback: flowTo }) }
   const order = new Int32Array(count)
   let head = 0, tail = 0, outletArea = 0
   for (let i = 0; i < count; i++) if (!indegree[i]) order[tail++] = i
@@ -79,24 +83,124 @@ export function routeDrainage(raw: Float32Array, columns: number, rows: number, 
   return { hydroDEM, flowTo, accumulatedArea, order, processedCells: tail, outletArea, fillVolume }
 }
 
-/** Few geomorphic relaxation steps, not a calibrated geologic clock or flood simulation. */
-export function erodeTerrain(raw: Float32Array, columns: number, rows: number, cellSize: number, passes = 2) {
+export interface LandscapeOptions {
+  passes?: number
+  timeStepYears?: number
+  uplift?: Float32Array
+  erodibility?: Float32Array
+  diffusivity?: number
+  sediment?: boolean
+  seaLevel?: (iteration: number, iterations: number) => number
+  onStep?: (state: { elevation: Float32Array; iteration: number; iterations: number; alluvium: Float64Array; seaLevel: number }) => void
+}
+export interface SedimentDiagnostics {
+  erodedSourceVolume: number; depositedVolume: number; exportedVolume: number
+  sedimentReentrainedVolume: number; marineDepositedVolume: number; terrestrialDepositedVolume: number; lakeDepositedVolume: number
+  hillslopeBedrockVolume: number; hillslopeTransferredVolume: number
+  storedVolume: number; massBalanceError: number
+}
+export interface ErosionDiagnostics {
+  iterations: number; timeStepYears: number; elapsedYears: number
+  erodedVolume: number; upliftVolume: number; maxIncision: number; maxCumulativeIncision: number; maxRaising: number
+  rmsElevationChange: number; meanAbsoluteChange: number; changedCells: number
+  finalStepRms: number; flowReorganization: number; rmsHistory: number[]
+  initialTerrainVolume: number; finalTerrainVolume: number; diffusionNetVolume: number; terrainBalanceError: number
+}
+
+/**
+ * Detachment-limited stream-power landscape evolution, m=.5, n=1. Receiver-first
+ * implicit integration follows the equation used by Cordonnier et al. (2016),
+ * after Braun & Willett (2013). The raster routing/initial relief here differ
+ * from that paper's triangulated graph and flat-start convergence experiment.
+ * Optional conservative multi-flow sediment routing follows each incision step.
+ * This is not SPACE: bedrock/alluvium share erodibility, runoff is time-averaged,
+ * and marine waves, grain sorting and 2-D water momentum are not solved.
+ */
+export function erodeTerrain(raw: Float32Array, columns: number, rows: number, cellSize: number, options: number | LandscapeOptions = 32) {
+  const settings = typeof options === 'number' ? { passes: options } : options
+  const passes = settings.passes ?? 32, dt = settings.timeStepYears ?? 250
+  const diffusion = Math.min(.2, (settings.diffusivity ?? .2) * dt / (cellSize * cellSize))
   let terrain = new Float32Array(raw), drainage = routeDrainage(terrain, columns, rows, cellSize)
   const initial = new Float32Array(raw)
+  const firstFlow = new Int32Array(drainage.flowTo), cumulativeIncision = new Float32Array(raw.length)
+  let alluvium = new Float64Array(raw.length)
+  const sediment: SedimentDiagnostics = { erodedSourceVolume: 0, depositedVolume: 0, exportedVolume: 0, sedimentReentrainedVolume: 0, marineDepositedVolume: 0, terrestrialDepositedVolume: 0, lakeDepositedVolume: 0, hillslopeBedrockVolume: 0, hillslopeTransferredVolume: 0, storedVolume: 0, massBalanceError: 0 }
+  let erodedVolume = 0, upliftVolume = 0, diffusionNetVolume = 0
+  const rmsHistory: number[] = []
+  settings.onStep?.({ elevation: terrain, iteration: 0, iterations: passes, alluvium, seaLevel: settings.seaLevel?.(0, passes) ?? 0 })
   for (let pass = 0; pass < passes; pass++) {
+    const seaLevel = settings.seaLevel?.(pass + 1, passes) ?? 0
     const next = new Float32Array(terrain)
-    for (let y = 1; y < rows - 1; y++) for (let x = 1; x < columns - 1; x++) {
-      const i = y * columns + x, downstream = drainage.flowTo[i]!
-      if (terrain[i]! <= 0 || downstream < 0) continue
+    const detached = new Float64Array(raw.length)
+    const incisionArea = drainage.accumulatedArea
+    // order is sources→outlets; reversal makes every updated receiver available.
+    for (let index = drainage.processedCells - 1; index >= 0; index--) {
+      const i = drainage.order[index]!, x = i % columns, y = Math.floor(i / columns), downstream = drainage.flowTo[i]!
+      if (!x || !y || x === columns - 1 || y === rows - 1) continue
+      const uplift = (settings.uplift?.[i] ?? 0) * dt, raised = terrain[i]! + uplift
+      next[i] = raised; upliftVolume += uplift * cellSize ** 2
+      // Tectonic uplift applies to the prescribed crust field under the sea as
+      // well as exposed land. The absence of a marine erosion model must not
+      // suppress submarine uplift until sediment happens to expose the cell.
+      if (terrain[i]! <= seaLevel || downstream < 0) continue
       const horizontal = (i % columns === downstream % columns || Math.floor(i / columns) === Math.floor(downstream / columns)) ? cellSize : cellSize * Math.SQRT2
-      const slope = Math.max(0, (drainage.hydroDEM[i]! - drainage.hydroDEM[downstream]!) / horizontal)
-      const catchmentKm2 = drainage.accumulatedArea[i]! / 1_000_000
-      const incision = Math.min(3.5, 24 * Math.pow(catchmentKm2, .45) * slope)
-      const mean = (terrain[i - 1]! + terrain[i + 1]! + terrain[i - columns]! + terrain[i + columns]!) / 4
-      const diffusion = Math.max(-.8, Math.min(.8, (mean - terrain[i]!) * .10))
-      next[i] = Math.max(.01, terrain[i]! - incision + diffusion)
+      // A conditioned depression is standing water at its spill level. Routing
+      // across its surface must not excavate a fictitious river in its bed, or
+      // let an inflowing channel incise below that receiving water surface.
+      // Uplift still applies to the submerged bed; lake filling is handled by
+      // the supplied sediment, never by turning hydroDEM into solid ground.
+      const receiverLake = drainage.hydroDEM[downstream]! - terrain[downstream]! > .01
+      const receiver = Math.max(seaLevel, next[downstream]!, receiverLake ? drainage.hydroDEM[downstream]! : -Infinity), k = settings.erodibility?.[i] ?? 2.5e-5
+      const coefficient = dt * k * Math.sqrt(incisionArea[i]!) / horizontal
+      const submerged = drainage.hydroDEM[i]! - terrain[i]! > .01
+      const eroded = !submerged && raised > receiver ? (raised + coefficient * receiver) / (1 + coefficient) : raised
+      const incision = raised - eroded
+      const reentrained = Math.min(alluvium[i]!, incision)
+      alluvium[i] -= reentrained
+      sediment.sedimentReentrainedVolume += reentrained * cellSize ** 2
+      sediment.erodedSourceVolume += (incision - reentrained) * cellSize ** 2
+      if (settings.sediment) detached[i] = incision * cellSize ** 2
+      else sediment.exportedVolume += incision * cellSize ** 2 // Detachment-limited boundary: no fluvial redeposition.
+      next[i] = eroded
+      cumulativeIncision[i] += incision
+      erodedVolume += incision * cellSize * cellSize
     }
-    terrain = next; drainage = routeDrainage(terrain, columns, rows, cellSize)
+    const creep = transportHillslope({ elevation: next, alluvium, columns, rows, cellSize, coefficient: diffusion, seaLevel })
+    const relaxed = creep.elevation
+    alluvium = creep.alluvium
+    diffusionNetVolume += creep.netTerrainVolume
+    sediment.erodedSourceVolume += creep.bedrockSourceVolume
+    sediment.hillslopeBedrockVolume += creep.bedrockSourceVolume
+    sediment.hillslopeTransferredVolume += creep.transferredVolume
+    let squares = 0
+    if (settings.sediment) {
+      const routed = routeDrainage(relaxed, columns, rows, cellSize)
+      const transported = transportSediment({ elevation: relaxed, hydroElevation: routed.hydroDEM, flowTo: routed.flowTo, order: routed.order, sourceVolume: detached, columns, rows, cellSize, seaLevel })
+      for (let i = 0; i < relaxed.length; i++) { relaxed[i] += transported.deposition[i]!; alluvium[i] += transported.deposition[i]! }
+      sediment.depositedVolume += transported.depositedVolume
+      sediment.exportedVolume += transported.exportedVolume
+      sediment.marineDepositedVolume += transported.marineDepositedVolume
+      sediment.terrestrialDepositedVolume += transported.terrestrialDepositedVolume
+      sediment.lakeDepositedVolume += transported.lakeDepositedVolume
+    }
+    for (let i = 0; i < raw.length; i++) squares += (relaxed[i]! - terrain[i]!) ** 2
+    rmsHistory.push(Math.sqrt(squares / raw.length))
+    terrain = relaxed; drainage = routeDrainage(terrain, columns, rows, cellSize)
+    if ((pass + 1) % 4 === 0 || pass + 1 === passes) settings.onStep?.({ elevation: terrain, iteration: pass + 1, iterations: passes, alluvium, seaLevel })
   }
-  return { rawDEM: terrain, initialDEM: initial, ...drainage }
+  let squares = 0, absolute = 0, changedCells = 0, reorganized = 0, maxIncision = 0, maxCumulativeIncision = 0, maxRaising = 0
+  for (let i = 0; i < raw.length; i++) {
+    const change = terrain[i]! - raw[i]!
+    squares += change * change; absolute += Math.abs(change)
+    if (Math.abs(change) > .01) changedCells++
+    if (firstFlow[i] !== drainage.flowTo[i]) reorganized++
+    maxIncision = Math.max(maxIncision, -change); maxRaising = Math.max(maxRaising, change)
+    maxCumulativeIncision = Math.max(maxCumulativeIncision, cumulativeIncision[i]!)
+  }
+  const initialTerrainVolume = raw.reduce((sum, value) => sum + value * cellSize ** 2, 0), finalTerrainVolume = terrain.reduce((sum, value) => sum + value * cellSize ** 2, 0)
+  const terrainBalanceError = finalTerrainVolume - initialTerrainVolume - upliftVolume + erodedVolume - sediment.depositedVolume - diffusionNetVolume
+  const erosion: ErosionDiagnostics = { iterations: passes, timeStepYears: dt, elapsedYears: passes * dt, erodedVolume, upliftVolume, maxIncision, maxCumulativeIncision, maxRaising, rmsElevationChange: Math.sqrt(squares / raw.length), meanAbsoluteChange: absolute / raw.length, changedCells, finalStepRms: rmsHistory.at(-1) ?? 0, flowReorganization: reorganized / raw.length, rmsHistory, initialTerrainVolume, finalTerrainVolume, diffusionNetVolume, terrainBalanceError }
+  sediment.storedVolume = alluvium.reduce((sum, thickness) => sum + thickness * cellSize ** 2, 0)
+  sediment.massBalanceError = sediment.erodedSourceVolume - sediment.storedVolume - sediment.exportedVolume
+  return { rawDEM: terrain, initialDEM: initial, alluvium: Float32Array.from(alluvium), sediment, erosion, ...drainage }
 }

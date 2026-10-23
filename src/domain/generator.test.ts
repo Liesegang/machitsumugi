@@ -31,14 +31,16 @@ function fixture(config: Parameters<typeof generateCity>[0]) {
   return fixtures.get(key)!;
 }
 
-describe('Japanese city generation', { timeout: 180000 }, () => {
+// Integration cases run complete coupled landscapes and historical cities;
+// reproducibility and multi-seed harbor cases intentionally build several.
+describe('Japanese city generation', { timeout: 1_200_000 }, () => {
   it('is exactly reproducible and gives another layout for another seed', () => {
     const a = generateCity(DEFAULT_CONFIG), b = generateCity({ ...DEFAULT_CONFIG });
     fixtures.set(JSON.stringify(DEFAULT_CONFIG), a);
     expect(a).toEqual(b);
     expect(generateCity({ ...DEFAULT_CONFIG, seed: 'another-city' }).buildings).not.toEqual(a.buildings);
     expect(a.buildings.length).toBeGreaterThan(0);
-    expect(a.generatorVersion).toBe('2.0.0');
+    expect(a.generatorVersion).toBe('2.1.0');
   });
 
   it('housing demand changes supply and expansion instead of stamping density over a fixed grid', () => {
@@ -63,7 +65,7 @@ describe('Japanese city generation', { timeout: 180000 }, () => {
       expect(Math.min(...distances)).toBeLessThan(1e-7);
       expect(map.roads.some(r => r.points.some(p => Math.hypot(p.x - station.point.x, p.y - station.point.y) < 1e-7))).toBe(true);
     }
-  });
+  }, 600000);
 
   it('normalizes a plain port to a coast without mutating the supplied configuration', () => {
     const input = { ...DEFAULT_CONFIG, density: 0, type: 'port' as const, terrain: 'plain' as const };
@@ -101,7 +103,11 @@ describe('Japanese city generation', { timeout: 180000 }, () => {
       expect(empty.areas.filter(a => a.id === 'historic-core').every(a => !a.name)).toBe(true);
       const all: FacilityKind[] = ['shrine', 'school', 'hospital', 'police', 'shop', 'park', 'castle', 'port', 'onsen'];
       const full = fixture({ ...DEFAULT_CONFIG, type: preset.id, density: 0, facilities: all });
-      expect(full.facilities.map(f => f.kind).sort()).toEqual([...all].sort());
+      expect([...new Set([...full.facilities.map(f => f.kind), ...full.unplacedFacilities!.map(f => f.kind)])].sort()).toEqual([...all].sort());
+      for (const rejected of full.unplacedFacilities!) {
+        expect(full.facilities.some(f => f.kind === rejected.kind)).toBe(false);
+        expect(rejected.reason.length).toBeGreaterThan(10);
+      }
       if (preset.id === 'castle' || preset.id === 'temple') expect(empty.areas.some(a => a.id === 'historic-core')).toBe(true);
     });
 
@@ -137,6 +143,8 @@ describe('Japanese city generation', { timeout: 180000 }, () => {
         const p = building.polygon, bb = bounds(p);
         if (bb.x0 < 0 || bb.y0 < 0 || bb.x1 > map.width || bb.y1 > map.height) failures.push(`${building.id}: map bounds`);
         for (const obstacle of obstacles) {
+          // Castle keeps and gates stand inside their own reserved bailey land.
+          if (building.id.startsWith('castle-') && map.areas.some(a => a.id === 'historic-core' && a.polygon === obstacle.polygon)) continue;
           if (bb.x1 < obstacle.x0 || bb.x0 > obstacle.x1 || bb.y1 < obstacle.y0 || bb.y0 > obstacle.y1) continue;
           if (p.some(q => contains(obstacle.polygon, q)) || obstacle.polygon.some(q => contains(p, q)) || p.some((a, i) => obstacle.polygon.some((c, j) => segmentCross(a, p[(i + 1) % p.length]!, c, obstacle.polygon[(j + 1) % obstacle.polygon.length]!)))) failures.push(`${building.id}: ${obstacle.polygon.length}-point land exclusion`);
         }

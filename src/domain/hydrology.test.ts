@@ -36,4 +36,67 @@ describe('Priority-Flood and drainage conservation', () => {
     expect(relaxed.processedCells).toBe(raw.length)
     expect(relaxed.outletArea).toBe(raw.length * 2500)
   })
+  it('uses the implicit receiver-first equation rather than an explicit incision clamp', () => {
+    const columns = 7, rows = 9, raw = new Float32Array(columns * rows)
+    for (let y = 0; y < rows; y++) for (let x = 0; x < columns; x++) raw[y * columns + x] = 100 - y * 3 + Math.abs(x - 3) * .3
+    const drainage = routeDrainage(raw, columns, rows, 50), expected = new Float32Array(raw), k = new Float32Array(raw.length).fill(.0003), dt = 500
+    for (const i of [...drainage.order].reverse()) {
+      const x = i % columns, y = Math.floor(i / columns), receiver = drainage.flowTo[i]!
+      if (!x || !y || x === columns - 1 || y === rows - 1 || receiver < 0) continue
+      const length = Math.hypot(x - receiver % columns, y - Math.floor(receiver / columns)) * 50
+      const coefficient = dt * k[i]! * Math.sqrt(drainage.accumulatedArea[i]!) / length
+      expected[i] = (raw[i]! + coefficient * expected[receiver]!) / (1 + coefficient)
+    }
+    const result = erodeTerrain(raw, columns, rows, 50, { passes: 1, timeStepYears: dt, erodibility: k, diffusivity: 0 })
+    expect(result.rawDEM).toEqual(expected)
+    expect(result.erosion.erodedVolume).toBeGreaterThan(0)
+    expect(result.erosion.iterations).toBe(1)
+  })
+  it('separates uplift, incision and measured initial-to-final displacement', () => {
+    const raw = new Float32Array(81).fill(.003), uplift = new Float32Array(81).fill(.001), resistant = new Float32Array(81)
+    const preserved = erodeTerrain(raw, 9, 9, 50, { passes: 8, diffusivity: 0, erodibility: resistant })
+    expect(preserved.rawDEM).toEqual(raw) // No .01m flattening of low positive land.
+    const result = erodeTerrain(raw, 9, 9, 50, { passes: 8, timeStepYears: 100, uplift, diffusivity: 0, erodibility: resistant })
+    expect(result.rawDEM[40]).toBeCloseTo(.803, 5)
+    expect(result.erosion.upliftVolume).toBeGreaterThan(0)
+    expect(result.erosion.erodedVolume).toBe(0)
+    expect(result.erosion.rmsHistory).toHaveLength(8)
+    expect(result.erosion.rmsElevationChange).toBeGreaterThan(0)
+    expect(result.erosion.maxIncision).toBe(0)
+  })
+  it('balances actual terrain volume against uplift, incision, sediment and boundary creep', () => {
+    const n = 31, raw = new Float32Array(n * n), uplift = new Float32Array(n * n).fill(.0008)
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) raw[y * n + x] = 60 - y * 3 + Math.abs(x - 15) * .8
+    const result = erodeTerrain(raw, n, n, 50, { passes: 12, timeStepYears: 500, sediment: true, uplift })
+    expect(result.erosion.upliftVolume).toBeGreaterThan(0)
+    expect(result.erosion.erodedVolume).toBeGreaterThan(0)
+    expect(Math.abs(result.erosion.terrainBalanceError)).toBeLessThan(result.erosion.erodedVolume * 1e-5)
+    expect(Math.abs(result.sediment.massBalanceError)).toBeLessThan(1e-3)
+  })
+  it('does not carve a drainage path below a lake surface, while retaining bed uplift', () => {
+    const n = 9, raw = new Float32Array(n * n).fill(10), uplift = new Float32Array(n * n), k = new Float32Array(n * n)
+    for (let y = 2; y < 7; y++) for (let x = 2; x < 7; x++) { const i = y * n + x; raw[i] = 1 + (y - 2) * .2; uplift[i] = .001; k[i] = .2 }
+    raw[4 * n + 7] = 4; raw[4 * n + 8] = 4
+    const result = erodeTerrain(raw, n, n, 50, { passes: 1, timeStepYears: 100, uplift, erodibility: k, diffusivity: 0 })
+    for (let y = 2; y < 7; y++) for (let x = 2; x < 7; x++) expect(result.rawDEM[y * n + x]).toBeCloseTo(raw[y * n + x]! + .1, 5)
+    expect(result.erosion.erodedVolume).toBe(0)
+    expect(result.fillVolume).toBeGreaterThan(0) // Water volume is not solid fill.
+  })
+  it('uses a lake spill level as the tailwater for incoming stream incision', () => {
+    const n = 9, raw = new Float32Array(n * n).fill(10), k = new Float32Array(n * n).fill(.2)
+    for (let y = 2; y < 7; y++) for (let x = 2; x < 7; x++) raw[y * n + x] = 1
+    raw[1 * n + 4] = 8; raw[4 * n + 7] = 4; raw[4 * n + 8] = 4
+    const result = erodeTerrain(raw, n, n, 50, { passes: 1, timeStepYears: 4000, erodibility: k, diffusivity: 0 })
+    expect(result.rawDEM[n + 4]).toBeGreaterThanOrEqual(4)
+    expect(result.rawDEM[n + 4]).toBeLessThan(8)
+    expect(result.rawDEM[4 * n + 4]).toBe(1)
+  })
+  it('applies the prescribed crustal uplift below sea level without marine stream incision', () => {
+    const n = 9, raw = new Float32Array(n * n).fill(-10), uplift = new Float32Array(n * n).fill(.001)
+    const result = erodeTerrain(raw, n, n, 50, { passes: 5, timeStepYears: 100, uplift, diffusivity: 0 })
+    expect(result.rawDEM[40]).toBeCloseTo(-9.5, 5)
+    expect(result.rawDEM[0]).toBe(-10)
+    expect(result.erosion.erodedVolume).toBe(0)
+    expect(result.erosion.upliftVolume).toBeCloseTo(49 * .5 * 2500, 2)
+  })
 })

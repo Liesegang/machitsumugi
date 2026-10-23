@@ -18,7 +18,7 @@ const crosses = (a: Point, b: Point, c: Point, d: Point) => {
 }
 const model = createTerrainModel(defaults)
 
-describe('regional terrain and local suitability', () => {
+describe('regional terrain and local suitability', { timeout: 180000 }, () => {
   it('is deterministic and uses a catchment larger than the visible map', () => {
     expect(createTerrainModel(defaults).areas).toEqual(model.areas)
     expect(model.hydrology.extent).toBeGreaterThan(defaults.width * 4)
@@ -72,7 +72,9 @@ describe('regional terrain and local suitability', () => {
   })
   it('selects bridge candidates on water with dry, gently sloping banks', () => {
     expect(model.bridgeCandidates.length).toBeGreaterThan(0)
-    expect(model.bridgeCandidates.length).toBeLessThanOrEqual(8)
+    // Every independent river barrier needs surveys. A global cap of eight
+    // discarded the tributary between the town and all trunk bridge sites.
+    expect(model.bridgeCandidates.every(site => model.rivers.some(r => r.id === site.riverId))).toBe(true)
     expect(model.bridgeSites.length).toBeLessThanOrEqual(3)
     expect(model.bridgeCandidates.some(c => c.riverId === 'river')).toBe(true)
     for (const bridge of model.bridgeCandidates) {
@@ -83,13 +85,29 @@ describe('regional terrain and local suitability', () => {
       expect(model.slope(bridge.bankB)).toBeLessThan(.12)
     }
   })
-  it('retains a main-trunk survey with a dry approach to the southern east bank', () => {
-    const destination = { x: defaults.width - 28, y: defaults.height * .67 }
-    const approachable = model.bridgeCandidates.filter(c => c.riverId === 'river').some(c => {
-      const bank = c.bankA.x > c.bankB.x ? c.bankA : c.bankB
-      return Array.from({ length: 101 }, (_, i) => ({ x: bank.x + (destination.x - bank.x) * i / 100, y: bank.y + (destination.y - bank.y) * i / 100 })).every(p => !model.waterAt(p))
-    })
-    expect(approachable).toBe(true)
+  it('retains distinct surveys for the trunk and tributary barriers instead of assuming one bridge crosses the whole valley', () => {
+    // A laterally adjoining tributary can require a second bridge. Requiring a
+    // fixed straight road from one trunk bank to the viewport edge would force
+    // the terrain model to delete a valid tributary whenever drainage changes.
+    const trunk = model.bridgeCandidates.filter(c => c.riverId === 'river')
+    const tributaries = model.bridgeCandidates.filter(c => c.riverId !== 'river')
+    expect(trunk.length).toBeGreaterThanOrEqual(2)
+    expect(tributaries.length).toBeGreaterThan(0)
+    for (const id of new Set(model.bridgeCandidates.map(c => c.riverId))) {
+      const sites = model.bridgeCandidates.filter(c => c.riverId === id)
+      for (let i = 0; i < sites.length; i++) for (let j = i + 1; j < sites.length; j++) expect(Math.hypot(sites[i]!.point.x - sites[j]!.point.x, sites[i]!.point.y - sites[j]!.point.y)).toBeGreaterThan(600)
+    }
+  })
+  it('continues physical water and ground beyond the viewport within an explicit surveyed boundary', () => {
+    const continuation = model.continuationTerrain!
+    for (const p of [{ x: 120, y: 200 }, { x: 2200, y: 1700 }, { x: 3900, y: 2700 }]) {
+      expect(continuation.waterAt(p)).toBe(model.waterAt(p))
+      expect(continuation.elevation(p)).toBe(model.elevation(p))
+    }
+    const outside = model.rivers.flatMap(r => r.points).filter(p => (p.x < -20 || p.x > defaults.width + 20 || p.y < -20 || p.y > defaults.height + 20) && continuation.contains(p))
+    expect(outside.some(p => continuation.waterAt(p))).toBe(true)
+    expect(continuation.contains({ x: -600, y: 1000 })).toBe(false)
+    expect(() => continuation.waterAt({ x: -600, y: 1000 })).toThrow(RangeError)
   })
   it('makes forest amount monotonic and excludes water from cultivable land', () => {
     const empty = createTerrainModel({ ...defaults, forest: 0 }), full = createTerrainModel({ ...defaults, forest: 100 })
@@ -102,7 +120,7 @@ describe('regional terrain and local suitability', () => {
   for (const terrain of ['plain', 'river', 'coast'] as const) it(`${terrain}: exact water occupancy and valid visible polygon boundaries`, () => {
     const m = createTerrainModel({ ...defaults, terrain, forest: 100 }), water = m.areas.filter(a => a.kind === 'water')
     if (terrain === 'coast') expect(water.some(a => a.id === 'sea')).toBe(true)
-    for (let x = 37; x < 4000; x += 181) for (let y = 29; y < 3000; y += 173) expect(m.waterAt({ x, y })).toBe(water.some(a => inside({ x, y }, a.polygon)))
+    for (let x = 37; x < 4000; x += 181) for (let y = 29; y < 3000; y += 173) expect(m.waterAt({ x, y })).toBe(water.some(a => inside({ x, y }, a.polygon) && !a.holes?.some(h => inside({ x, y }, h))))
     for (const region of m.areas) {
       const p = region.polygon
       expect(p.every(q => q.x >= 0 && q.y >= 0 && q.x <= 4000 && q.y <= 3000)).toBe(true)

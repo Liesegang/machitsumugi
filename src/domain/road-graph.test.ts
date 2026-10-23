@@ -6,6 +6,27 @@ const metadata = (id: string): RoadMetadata => ({ id, builtYear: 1700, phase: 'o
 const point = (x: number, y: number) => ({ x, y })
 
 describe('incremental planar road graph', () => {
+  it('invalidates exact road and travel queries after a new shortcut, including retained accessors', () => {
+    const graph = new PlanarRoadGraph(), source = point(0, 0), destination = point(300, 0), middle = point(150, 0)
+    graph.add([source, point(0, 300), point(300, 300), destination], metadata('old-detour'), false)
+    expect(graph.nearest(middle, 20)).toBeNull()
+    const time = graph.accessibilityFrom(source)
+    expect(time(destination)).toBeCloseTo(900 / 220, 9)
+    expect(graph.accessibilityFrom(source)).toBe(time)
+    graph.add([source, destination], metadata('shortcut'))
+    expect(graph.nearest(middle, 20)!.distance).toBe(0)
+    expect(time(destination)).toBeCloseTo(300 / 220, 9)
+    expect(graph.accessibilityFrom(source)(destination)).toBe(time(destination))
+  })
+
+  it('does not retain an unreachable cached result after the first road is built', () => {
+    const graph = new PlanarRoadGraph(), source = point(0, 0), destination = point(100, 0)
+    const time = graph.accessibilityFrom(source)
+    expect(time(destination)).toBe(Infinity)
+    graph.add([source, destination], metadata('first-road'), false)
+    expect(time(destination)).toBeCloseTo(100 / 220, 9)
+  })
+
   it('inserts true crossing junctions while preserving the old physical route', () => {
     const graph = new PlanarRoadGraph()
     graph.add([point(0, 100), point(300, 100)], metadata('old'), false)
@@ -25,6 +46,40 @@ describe('incremental planar road graph', () => {
     expect(anchors.length).toBeGreaterThan(2)
     expect(new Set(anchors.map(a => a.road.id)).size).toBe(1)
     expect(Math.max(...anchors.map(a => a.point.x)) - Math.min(...anchors.map(a => a.point.x))).toBeGreaterThan(150)
+  })
+
+  it('finds physical survey-line crossings and builds a real connected loop', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(20, 20), point(200, 20), point(200, 180), point(20, 180)], metadata('old-route'), false)
+    const hits = graph.crossings(point(80, 0), point(80, 200))
+    expect(hits.map(hit => hit.point)).toEqual([point(80, 20), point(80, 180)])
+    graph.add(hits.map(hit => hit.point), metadata('survey-link'))
+    expect(extractStreetBlocks(graph.roads)).toHaveLength(1)
+    expect(graph.roads[0]!.points).toContainEqual(point(80, 20))
+    expect(graph.roads[0]!.points).toContainEqual(point(80, 180))
+  })
+
+  it('distinguishes extending an open road end from a turn at an actual junction', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(20, 100), point(200, 100)], metadata('old'), false)
+    expect(graph.openEndHeading(point(200, 100))).toBeCloseTo(0, 8)
+    expect(Math.abs(graph.openEndHeading(point(20, 100))!)).toBeCloseTo(Math.PI, 8)
+    expect(graph.openEndHeading(point(100, 100))).toBeUndefined()
+    graph.add([point(200, 100), point(200, 240)], metadata('junction-arm'))
+    expect(graph.openEndHeading(point(200, 100))).toBeUndefined()
+  })
+
+  it('gives a new main street a perpendicular approach and refuses a fifth junction arm', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(100, 500), point(1100, 500)], { ...metadata('old-main'), kind: 'arterial', width: 13 }, false)
+    const heading = graph.junctionHeading(point(600, 500), point(300, 1000))!
+    expect(heading).toBeCloseTo(Math.PI / 2, 8)
+    graph.add([point(600, 500), point(600, 1000)], metadata('south'))
+    expect(graph.junctionHeading(point(600, 500), point(900, 100))).toBeCloseTo(-Math.PI / 2, 8)
+    graph.add([point(600, 500), point(600, 100)], metadata('north'))
+    expect(graph.junctionHeading(point(600, 500), point(900, 800))).toBeNull()
+    expect(graph.hasAcuteMajorCrossing([point(100, 450), point(1000, 550)])).toBe(true)
+    expect(graph.hasAcuteMajorCrossing([point(300, 300), point(300, 700)])).toBe(false)
   })
 
   it('extracts actual bounded street faces and removes dead-end excursions', () => {
@@ -54,5 +109,37 @@ describe('incremental planar road graph', () => {
     expect(graph.travelTime(point(400, 100), station)).toBeCloseTo(.5 / 220, 7)
     expect(graph.ensureJunction(point(650, 100))).toBe(true)
     expect(graph.roads[0]!.points).toContainEqual(point(650, 100))
+  })
+
+  it('keeps grade-separated mainlines inaccessible until explicit interchange ramps connect both levels', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(100, 100), point(100, 500), point(100, 900)], metadata('west-street'), false)
+    graph.add([point(900, 100), point(900, 500), point(900, 900)], metadata('east-street'), false)
+    graph.add([point(0, 500), point(100, 500), point(900, 500), point(1000, 500)], { ...metadata('expressway'), role: 'expressway', width: 22, level: 1, controlledAccess: true }, false)
+    expect(graph.travelTime(point(100, 100), point(900, 100))).toBe(Infinity)
+    expect(graph.nearest(point(500, 500), 50)).toBeNull()
+    const ramp = { ...metadata('west-ramp'), role: 'ramp' as const, width: 7, level: 1, controlledAccess: true }
+    graph.add([point(100, 800), point(250, 800), point(350, 500)], ramp)
+    expect(graph.travelTime(point(100, 100), point(900, 100))).toBe(Infinity)
+    graph.add([point(900, 800), point(750, 800), point(650, 500)], { ...ramp, id: 'east-ramp' })
+    expect(Number.isFinite(graph.travelTime(point(100, 100), point(900, 100)))).toBe(true)
+    expect(graph.roads.find(road => road.id === 'expressway')!.points).toContainEqual(point(350, 500))
+    expect(extractStreetBlocks(graph.roads)).toEqual([])
+  })
+
+  it('leaves no half-built infrastructure when one mandatory access is rejected', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(100, 100), point(900, 100)], metadata('old'), false)
+    const before = structuredClone(graph.roads)
+    expect(graph.addBatch([{ points: [point(100, 400), point(900, 400)], metadata: { ...metadata('mainline'), role: 'expressway', controlledAccess: true, level: 1 }, requireConnection: false }, { points: [point(500, 300), point(600, 400)], metadata: { ...metadata('unconnected-ramp'), role: 'ramp', controlledAccess: true, level: 1 } }])).toBeNull()
+    expect(graph.roads).toEqual(before)
+  })
+
+  it('keeps a physically surveyed short culvert instead of breaking the route at its stream', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(100, 100), point(300, 100)], metadata('approach'), false)
+    expect(graph.add([point(300, 100), point(302, 100)], { ...metadata('culvert'), role: 'bridge', bridge: true })).not.toBeNull()
+    expect(graph.add([point(302, 100), point(500, 100)], metadata('far-bank'))).not.toBeNull()
+    expect(Number.isFinite(graph.travelTime(point(100, 100), point(500, 100)))).toBe(true)
   })
 })

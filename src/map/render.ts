@@ -1,4 +1,7 @@
-import type { Building, CityMap, Point } from '../domain/types'
+import type { Area, Building, CityMap, Point } from '../domain/types'
+import { terrainContours } from './contours'
+import { waterGeometry } from './water-surfaces'
+import { areaLabelPoint } from './area-labels'
 
 export type LayerSettings = {
   buildings: boolean
@@ -18,6 +21,7 @@ export type RenderOptions = {
   annotations: Annotation[]
   showSecrets: boolean
   scale: number
+  contours?: boolean
 }
 
 export const DEFAULT_LAYERS: LayerSettings = {
@@ -56,6 +60,7 @@ export const FACILITY_SYMBOLS: Record<string, string> = {
 export const MAP_FONT = '"Noto Sans JP", "Yu Gothic", "Hiragino Kaku Gothic ProN", sans-serif'
 
 export function buildingColor(building: Building, style: MapStyle): string {
+  if (building.use === 'lodging') return style === 'standard' ? '#c8a487' : style === 'mono' ? '#949494' : '#a08368'
   if (building.kind === 'residential' && building.height >= 3) return style === 'standard' ? '#9fa9a8' : style === 'mono' ? '#ababab' : '#62736b'
   return PALETTES[style][building.kind]
 }
@@ -68,29 +73,52 @@ export function tracePath(ctx: CanvasRenderingContext2D, points: Point[], close 
   if (close) ctx.closePath()
 }
 
+export function traceRegion(ctx: CanvasRenderingContext2D, region: Pick<Area, 'polygon' | 'holes'>) {
+  ctx.beginPath()
+  for (const ring of [region.polygon, ...region.holes ?? []]) {
+    if (!ring.length) continue
+    ctx.moveTo(ring[0]!.x, ring[0]!.y)
+    for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i]!.x, ring[i]!.y)
+    ctx.closePath()
+  }
+}
+
+export function areaColor(area: Area, style: MapStyle): string {
+  if (area.id === 'harbor-yard') return style === 'standard' ? '#deded8' : style === 'mono' ? '#e2e2e2' : '#48504c'
+  if (!area.landUse || area.landUse === 'farmland') return PALETTES[style][area.kind]
+  const colors = {
+    standard: { meadow: '#dfe7d5', wetland: '#cdded5', vacant: '#e8eadd', paddy: '#cbdab8', 'dry-field': '#e2d9b9' },
+    mono: { meadow: '#ededed', wetland: '#e1e1e1', vacant: '#f2f2f2', paddy: '#dadada', 'dry-field': '#e7e7e7' },
+    night: { meadow: '#394c3c', wetland: '#344e47', vacant: '#3e4940', paddy: '#415744', 'dry-field': '#5a523d' },
+  }
+  return colors[style][area.landUse]
+}
+
 function noise(x: number, y: number) {
   const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123
   return n - Math.floor(n)
 }
 
-function terrainTexture(ctx: CanvasRenderingContext2D, polygon: Point[], color: string, dark: string, scale: number) {
-  if (!polygon.length) return
+function terrainTexture(ctx: CanvasRenderingContext2D, polygon: Point[], color: string, dark: string, scale: number, holes?: Point[][]) {
+  // Woodland is a continuous land cover at neighbourhood/city scales. Canopy
+  // detail appears only close up and stays quieter than streets and buildings.
+  if (!polygon.length || scale < .8) return
   const minX = Math.min(...polygon.map(p => p.x))
   const maxX = Math.max(...polygon.map(p => p.x))
   const minY = Math.min(...polygon.map(p => p.y))
   const maxY = Math.max(...polygon.map(p => p.y))
   ctx.save()
-  tracePath(ctx, polygon, true)
-  ctx.clip()
+  traceRegion(ctx, { polygon, holes })
+  ctx.clip('evenodd')
   // Tree crowns are fixed in world space, so panning and exporting keep the same woodland.
-  const spacing = scale < .12 ? 40 : 25
+  const spacing = 45
   for (let x = Math.floor(minX / spacing) * spacing; x < maxX; x += spacing) {
     for (let y = Math.floor(minY / spacing) * spacing; y < maxY; y += spacing) {
       const v = noise(x, y)
       ctx.fillStyle = v > .5 ? color : dark
-      ctx.globalAlpha = .3 + v * .22
+      ctx.globalAlpha = .05 + v * .035
       ctx.beginPath()
-      ctx.arc(x + noise(x + 5, y) * spacing, y + noise(x, y + 7) * spacing, 5 + v * 9, 0, Math.PI * 2)
+      ctx.arc(x + noise(x + 5, y) * spacing, y + noise(x, y + 7) * spacing, 6 + v * 7, 0, Math.PI * 2)
       ctx.fill()
     }
   }
@@ -99,7 +127,52 @@ function terrainTexture(ctx: CanvasRenderingContext2D, polygon: Point[], color: 
 
 type LabelBox = { x: number; y: number; width: number; height: number }
 
+const reliefCache = new WeakMap<object, HTMLCanvasElement>()
+function renderRelief(ctx: CanvasRenderingContext2D, map: CityMap) {
+  const surface = map.terrainSurface!
+  let canvas = reliefCache.get(surface)
+  if (!canvas) {
+    canvas = document.createElement('canvas'); canvas.width = surface.columns; canvas.height = surface.rows
+    const raster = canvas.getContext('2d')!, pixels = raster.createImageData(canvas.width, canvas.height), z = surface.elevations
+    for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
+      const i = y * canvas.width + x, h = z[i]!, dx = (z[y * canvas.width + Math.min(canvas.width - 1, x + 1)]! - z[y * canvas.width + Math.max(0, x - 1)]!) / (surface.cellSize * 2), dy = (z[Math.min(canvas.height - 1, y + 1) * canvas.width + x]! - z[Math.max(0, y - 1) * canvas.width + x]!) / (surface.cellSize * 2)
+      const shade = Math.max(.45, Math.min(1.22, .88 + (-dx * .7 - dy * .7) * 3)), t = Math.min(1, Math.max(0, h / 650))
+      const rgb = h <= (map.previewSeaLevel ?? 0) ? [87, 150, 175] : [156 + t * 46, 184 + t * 8, 137 + t * 37]
+      for (let c = 0; c < 3; c++) pixels.data[i * 4 + c] = Math.min(255, rgb[c]! * shade)
+      pixels.data[i * 4 + 3] = 255
+    }
+    raster.putImageData(pixels, 0, 0); reliefCache.set(surface, canvas)
+  }
+  ctx.save(); ctx.imageSmoothingEnabled = true; ctx.drawImage(canvas, 0, 0, map.width, map.height); ctx.restore()
+}
+function renderContours(ctx: CanvasRenderingContext2D, map: CityMap, scale: number, style: MapStyle) {
+  if (!map.terrainSurface) return
+  const lines = terrainContours(map.terrainSurface)
+  ctx.save(); ctx.lineJoin = 'round'; ctx.lineCap = 'round'
+  for (const line of lines) {
+    tracePath(ctx, line.points)
+    ctx.strokeStyle = style === 'night' ? '#bcaa81' : style === 'mono' ? '#777777' : '#9b8060'
+    ctx.globalAlpha = line.index ? .85 : .48; ctx.lineWidth = (line.index ? 1.15 : .6) / scale; ctx.stroke()
+  }
+  ctx.globalAlpha = 1; ctx.font = `500 ${10 / scale}px ${MAP_FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+  const occupied: Point[] = []
+  for (const line of lines) if (line.index && line.points.length > 8) {
+    const point = line.points[Math.floor(line.points.length * .43)]!
+    if (occupied.some(p => Math.hypot(p.x - point.x, p.y - point.y) * scale < 70)) continue
+    occupied.push(point); ctx.strokeStyle = PALETTES[style].halo; ctx.lineWidth = 3 / scale; ctx.strokeText(`${line.elevation}m`, point.x, point.y); ctx.fillStyle = style === 'night' ? '#d3c6a4' : '#816849'; ctx.fillText(`${line.elevation}m`, point.x, point.y)
+  }
+  ctx.restore()
+}
+function renderCrop(ctx: CanvasRenderingContext2D, map: CityMap, scale: number) {
+  if (!map.previewCrop?.length) return
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, map.width, map.height)
+  const crop = map.previewCrop; ctx.moveTo(crop[0]!.x, crop[0]!.y); for (const p of crop.slice(1)) ctx.lineTo(p.x, p.y); ctx.closePath()
+  ctx.fillStyle = '#142b3d65'; ctx.fill('evenodd'); tracePath(ctx, crop, true); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2 / scale; ctx.stroke()
+  const centre = crop.reduce((p, q) => ({ x: p.x + q.x / crop.length, y: p.y + q.y / crop.length }), { x: 0, y: 0 })
+  ctx.font = `600 ${12 / scale}px ${MAP_FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.strokeStyle = '#233c45'; ctx.lineWidth = 3 / scale; ctx.strokeText('地図を生成する範囲', centre.x, centre.y); ctx.fillStyle = '#ffffff'; ctx.fillText('地図を生成する範囲', centre.x, centre.y); ctx.restore()
+}
 export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: RenderOptions): void {
+  if (map.terrainSurface && (map.previewPhase === 'landscape' || map.previewPhase === 'erosion')) { renderRelief(ctx, map); if (options.contours) renderContours(ctx, map, Math.max(.01, options.scale), options.style); renderCrop(ctx, map, Math.max(.01, options.scale)); return }
   const { layers, style, annotations, showSecrets } = options
   const scale = Math.max(.01, options.scale)
   const colors = PALETTES[style]
@@ -111,27 +184,44 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
   ctx.clip()
   ctx.lineJoin = 'round'
   ctx.lineCap = 'round'
+  if (options.contours && map.terrainSurface) { ctx.globalAlpha = .35; renderRelief(ctx, map); ctx.globalAlpha = 1 }
 
   if (layers.terrain) {
     for (const area of map.areas) {
-      tracePath(ctx, area.polygon, true)
-      ctx.fillStyle = colors[area.kind]
-      ctx.fill()
-      if (area.kind === 'water') {
-        ctx.lineWidth = .6 / scale
-        ctx.strokeStyle = colors.waterEdge
-        ctx.stroke()
-      } else if (area.kind === 'forest') {
-        terrainTexture(ctx, area.polygon, colors.tree, colors.treeDark, scale)
+      if (area.kind === 'water') continue
+      if (options.contours && map.terrainSurface) continue
+      traceRegion(ctx, area)
+      ctx.fillStyle = areaColor(area, style)
+      ctx.fill('evenodd')
+      if (area.kind === 'forest') {
+        terrainTexture(ctx, area.polygon, colors.tree, colors.treeDark, scale, area.holes)
       }
     }
+    const water = waterGeometry(map.areas)
+    for (const area of water.surfaces) { traceRegion(ctx, area); ctx.fillStyle = areaColor(area, style); ctx.fill('evenodd') }
+    ctx.lineWidth = .6 / scale; ctx.strokeStyle = colors.waterEdge
+    for (const shoreline of water.shorelines) { traceRegion(ctx, shoreline); ctx.stroke() }
+  }
+
+  if (options.contours) renderContours(ctx, map, scale, style)
+
+  if (layers.labels) {
+    ctx.save()
+    ctx.strokeStyle = style === 'night' ? '#b3a6c8' : '#8a8293'
+    ctx.globalAlpha = .65
+    ctx.setLineDash([4 / scale, 3 / scale])
+    for (const district of map.districts) {
+      ctx.lineWidth = (district.kind === 'ward' ? 1.25 : .65) / scale
+      for (const region of district.regions ?? []) { traceRegion(ctx, region); ctx.stroke() }
+    }
+    ctx.restore()
   }
 
   if (layers.buildings && scale > .38 && map.parcels) {
     ctx.strokeStyle = colors.roadEdge
     ctx.lineWidth = .4 / scale
     for (const parcel of map.parcels) {
-      if (!parcel.developedYear) continue
+      if (!parcel.developedYear || parcel.retiredYear !== undefined) continue
       tracePath(ctx, parcel.polygon, true)
       ctx.stroke()
     }
@@ -150,6 +240,16 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
   }
 
   if (layers.roads) {
+    for (const parcel of map.parcels ?? []) {
+      if (!parcel.developedYear || parcel.retiredYear !== undefined || !parcel.access?.length) continue
+      tracePath(ctx, parcel.access)
+      ctx.strokeStyle = colors.roadEdge
+      ctx.lineWidth = 3.4
+      ctx.stroke()
+      ctx.strokeStyle = colors.road
+      ctx.lineWidth = 2.8
+      ctx.stroke()
+    }
     // Draw every casing before its road interior, preserving open junctions.
     for (const kind of ['local', 'arterial'] as const) {
       for (const road of map.roads) {
@@ -249,11 +349,16 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
 
   if (layers.labels) {
     for (const district of map.districts) label(district.name, district.point, colors.label, 12)
+    if (layers.buildings && scale > .55) for (const building of map.buildings) {
+      if (building.use !== 'lodging' || !building.name || !building.polygon.length) continue
+      const center = building.polygon.reduce((a, p) => ({ x: a.x + p.x / building.polygon.length, y: a.y + p.y / building.polygon.length }), { x: 0, y: 0 })
+      label(building.name, center, colors.label, 10, 500)
+    }
     if (layers.terrain) {
       for (const area of map.areas) {
         if (!area.name || !area.polygon.length || (layers.facilities && map.facilities.some(f => f.name === area.name))) continue
-        const center = area.polygon.reduce((a, p) => ({ x: a.x + p.x / area.polygon.length, y: a.y + p.y / area.polygon.length }), { x: 0, y: 0 })
-        label(area.name, center, area.kind === 'water' ? colors.station : colors.landmark, 11, 500)
+        const center = areaLabelPoint(area, map.areas)
+        if (center) label(area.name, center, area.kind === 'water' ? colors.station : colors.landmark, 11, 500)
       }
     }
   }

@@ -46,7 +46,12 @@ describe('land market and surviving historic stock regressions', () => {
   it('keeps old buildings and parcel geometry unless an acquisition records their replacement', () => {
     for (const old of historic.buildings) {
       const surviving = flat.buildings.find(building => building.id === old.id)
-      if (surviving) expect(surviving).toEqual(old)
+      if (surviving) {
+        // Occupants can move into a surviving historic house; its physical
+        // structure and provenance must remain unchanged without acquisition.
+        const structure = ({ occupancy: _occupancy, occupiedHouseholds: _households, ...building }: typeof old) => building
+        expect(structure(surviving)).toEqual(structure(old))
+      }
       else expect(flat.events.some(event => event.kind === 'acquisition' && event.entityId === old.id)).toBe(true)
       const oldParcel = historic.parcels.find(p => p.id === old.parcelId)!
       const currentParcel = flat.parcels.find(p => p.id === old.parcelId)!

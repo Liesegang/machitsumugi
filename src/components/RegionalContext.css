@@ -1,0 +1,5 @@
+.regional-context { position: absolute; right: 16px; bottom: 58px; margin: 0; width: 164px; background: #fff; border: 1px solid #b8c4bf; z-index: 4; pointer-events: none; }
+.regional-context canvas { width: 164px; height: 164px; display: block; }
+.regional-context figcaption { padding: 5px 6px; color: #32433d; font-size: 10px; line-height: 1.3; }
+.regional-context figcaption span { display: block; color: #68776f; }
+@media (max-width: 700px) { .regional-context { right: 12px; bottom: 60px; width: 112px; } .regional-context canvas { width: 112px; height: 112px; } .regional-context figcaption { font-size: 9px; } }

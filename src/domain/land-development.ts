@@ -1,22 +1,47 @@
 import type { Building, CityConfig, GrowthEvent, Parcel, Point, Road, SimulationSnapshot, Station } from './types'
-import { boundsOf, distance, overlaps, polygonsOverlap, projectPoint, seededRandom } from './geometry'
+import { boundsOf, distance, overlaps, pointInPolygon, polygonArea, polygonsOverlap, projectPoint, seededRandom } from './geometry'
 import type { Bounds } from './geometry'
 import { scenarioDemandAtYear } from './urban-growth'
-import { roadTravelSpeed } from './road-graph'
+import type { DemographicScenario } from './urban-growth'
+import { controlledRoad, roadLevelAt, roadTravelSpeed } from './road-graph'
+import { createUrbanZoning } from './urban-zoning'
+import { developmentClimbMinutes, surveyDevelopmentSite } from './development-terrain'
+import type { DevelopmentSiteSurvey } from './development-terrain'
+import { isConstructionYear, simulationEndYear, simulationYears } from './simulation-calendar'
 
-export const GENERATOR_VERSION = '2.0.0'
-export const EPOCH_YEAR = { historic: 1800, railway: 1930, present: 2025 } as const
+export const GENERATOR_VERSION = '2.1.0'
+export { EPOCH_YEAR } from './simulation-calendar'
 
 interface Candidate {
   parcel: Parcel; footprint: Point[]; frontage: Point; road: Road; segment: number
-  area: number; reluctance: number; capacity: number; building?: Building
+  area: number; reluctance: number; capacity: number; formation: DevelopmentSiteSurvey; form: 'house' | 'apartment' | 'retail' | 'workshop'; building?: Building
 }
 interface DevelopmentInput {
   config: CityConfig; roads: Road[]; center: Point; stations: Station[]
+  /** A surveyed bath/spring centre; onsen scenarios otherwise use their historic nucleus. */
+  thermalCenter?: Point
   centers?: { point: Point; activeYear: number; catchment: number; weight: number; kind?: string }[]
   /** Tests the complete land polygon against physical obstacles present in this year. */
   canPlace(polygon: Point[], year: number): boolean
   slope(point: Point): number
+  elevation?: (point: Point) => number
+}
+
+function convexHull(points: Point[]): Point[] {
+  const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y)
+  const cross = (a: Point, b: Point, c: Point) => (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+  const half = (list: Point[]) => { const hull: Point[] = []; for (const point of list) { while (hull.length > 1 && cross(hull.at(-2)!, hull.at(-1)!, point) <= 0) hull.pop(); hull.push(point) } return hull.slice(0, -1) }
+  return [...half(sorted), ...half(sorted.reverse())]
+}
+
+/** Fictional visitor-room demand, separate from residents and housing capacity.
+ * Small inns precede post-war hotel investment; this is not a tourism forecast. */
+function lodgingDemand(config: CityConfig, year: number): number {
+  if (config.density <= 0) return 0
+  const scale = config.settlement === 'village' ? .18 : config.settlement === 'rural-town' ? .55 : config.settlement === 'metropolis' ? 1.4 : 1
+  const stage = year < 1800 ? .10 + (year - 1700) / 100 * .08 : year < 1900 ? .18 + (year - 1800) / 100 * .12 : year < 1955 ? .30 + (year - 1900) / 55 * .15 : .45 + Math.min(1, (year - 1955) / 35) * .55
+  const decline = config.populationTrend === 'declining' && year > 1990 ? 1 - (year - 1990) / 35 * .25 : 1
+  return Math.max(0, Math.round((180 + config.density * 5.5) * scale * stage * decline))
 }
 
 // Spatial buckets keep full polygon tests local; no center-only collision test.
@@ -32,16 +57,17 @@ function index<T extends { bounds: Bounds }>() {
 /** Shared-point road graph. Curve samples are degree-two vertices, not intersections. */
 function accessibility(roads: Road[], destinations: Point[]) {
   const ids = new Map<string, number[]>(), points: Point[] = [], edges: { to: number; cost: number }[][] = []
-  const node = (p: Point) => {
+  const node = (p: Point, road: Road) => {
     const x = Math.floor(p.x * 5), y = Math.floor(p.y * 5)
-    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (const id of ids.get(`${x + dx}:${y + dy}`) ?? []) if (distance(points[id]!, p) < .15) return id
-    const key = `${x}:${y}`, id = points.length, list = ids.get(key) ?? []
+    const level = roadLevelAt(road, p)
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (const id of ids.get(`${level}:${x + dx}:${y + dy}`) ?? []) if (distance(points[id]!, p) < .15) return id
+    const key = `${level}:${x}:${y}`, id = points.length, list = ids.get(key) ?? []
     list.push(id); ids.set(key, list); points.push(p); edges.push([])
     return id
   }
   const roadNodes = new Map<string, number[]>()
   for (const road of roads) {
-    const nodes = road.points.map(node); roadNodes.set(road.id, nodes)
+    const nodes = road.points.map(point => node(point, road)); roadNodes.set(road.id, nodes)
     for (let i = 1; i < nodes.length; i++) {
       const a = nodes[i - 1]!, b = nodes[i]!, cost = distance(points[a]!, points[b]!) / roadTravelSpeed(road)
       edges[a]!.push({ to: b, cost }); edges[b]!.push({ to: a, cost })
@@ -55,7 +81,7 @@ function accessibility(roads: Road[], destinations: Point[]) {
   const pop = () => { const first = heap[0]!, last = heap.pop()!; if (heap.length) { let i = 0; while (i * 2 + 1 < heap.length) { let child = i * 2 + 1; if (child + 1 < heap.length && heap[child + 1]!.cost < heap[child]!.cost) child++; if (last.cost <= heap[child]!.cost) break; heap[i] = heap[child]!; i = child } heap[i] = last } return first }
   for (const destination of destinations) {
     let nearest: { road: Road; segment: number; point: Point; d: number } | null = null
-    for (const road of roads) for (let i = 1; i < road.points.length; i++) {
+    for (const road of roads.filter(road => !controlledRoad(road))) for (let i = 1; i < road.points.length; i++) {
       const p = projectPoint(destination, road.points[i - 1]!, road.points[i]!), d = distance(destination, p)
       if (!nearest || d < nearest.d) nearest = { road, segment: i, point: p, d }
     }
@@ -90,12 +116,17 @@ function accessibility(roads: Road[], destinations: Point[]) {
  */
 export function developLand(input: DevelopmentInput) {
   const { config, center, canPlace, slope, stations } = input
+  const scenario: DemographicScenario = config, settlement = scenario.settlement ?? 'regional-city'
+  const terrain = { slope, elevation: input.elevation }
+  const survey = (footprint: Point[]) => surveyDevelopmentSite(terrain, footprint.reduce((sum, p) => ({ x: sum.x + p.x / footprint.length, y: sum.y + p.y / footprint.length }), { x: 0, y: 0 }), footprint)
+  const thermalCenter = input.thermalCenter ?? (config.type === 'onsen' ? center : undefined)
+  const zoning = createUrbanZoning({ roads: input.roads, stations, center, thermalCenter, centers: input.centers, metropolitan: settlement === 'metropolis', terrain })
   const industry = input.centers?.find(c => c.kind === 'industrial')
-  const end = EPOCH_YEAR[config.era ?? 'present'], candidates: Candidate[] = [], events: GrowthEvent[] = [], snapshots: SimulationSnapshot[] = []
+  const end = simulationEndYear(config), candidates: Candidate[] = [], events: GrowthEvent[] = [], snapshots: SimulationSnapshot[] = []
   const lots = index<{ polygon: Point[]; bounds: Bounds }>()
-  const roads = [...input.roads].sort((a, b) => (a.builtYear ?? 1700) - (b.builtYear ?? 1700) || a.id.localeCompare(b.id))
+  const roads = input.roads.filter(road => (road.builtYear ?? 1700) <= end).sort((a, b) => (a.builtYear ?? 1700) - (b.builtYear ?? 1700) || a.id.localeCompare(b.id))
   for (const road of roads) {
-    if (road.bridge || road.role === 'bridge') continue
+    if (road.bridge || road.role === 'bridge' || controlledRoad(road)) continue
     const year = road.builtYear ?? 1700, random = seededRandom(`${config.seed}:parcels:${road.id}`)
     const old = year < 1900
     let remaining = 12 + random() * 8, serial = 0
@@ -105,24 +136,56 @@ export function developLand(input: DevelopmentInput) {
       const ux = (b.x - a.x) / length, uy = (b.y - a.y) / length
       while (remaining < length) {
         const frontage = { x: a.x + ux * remaining, y: a.y + uy * remaining }
-        const industrial = road.id.startsWith('industrial') || (config.type === 'port' && industry && distance(frontage, industry.point) < industry.catchment * .75 && road.role !== 'farm')
-        const width = industrial ? 32 + random() * 20 : old ? 10 + random() * 9 : 13 + random() * 10
+        const zone = zoning(frontage, year)
+        const industrial = road.role !== 'farm' && (road.id.startsWith('industrial') || zone.industrialShare > .5 && random() < zone.industrialShare || (config.type === 'port' && industry && industry.activeYear <= year && distance(frontage, industry.point) < industry.catchment * .75))
+        // Large modern plots belong to station/estate development, rather than
+        // stretching every detached house to the same size along every street.
+        const stationDistance = year >= 1900 && stations.length ? Math.min(...stations.map(s => distance(frontage, s.point))) : Infinity
+        const estate = (settlement === 'regional-city' || settlement === 'metropolis') && config.type === 'newtown' && year >= 1955 && (stationDistance < 850 || distance(frontage, center) < 600)
+        const districtApartment = settlement !== 'village' && year >= 1955 && random() < zone.apartmentShare
+        const form: Candidate['form'] = industrial ? 'workshop' : districtApartment || (estate && random() < .24) ? 'apartment' : year >= 1955 && (road.role === 'collector' || road.role === 'highway') && random() < zone.retailShare * .4 ? 'retail' : 'house'
+        const width = industrial ? 32 + random() * 24 : form === 'apartment' ? 28 + random() * 16 : form === 'retail' ? 25 + random() * 23 : old ? 9 + random() * 10 : 10 + random() * 9
         for (const side of [-1, 1]) {
           const lotRandom = seededRandom(`${config.seed}:parcel:${road.id}:${serial}:${side}`)
-          const depth = industrial ? 34 + lotRandom() * 19 : old ? 26 + lotRandom() * 13 : 25 + lotRandom() * 13
+          const depth = industrial ? 34 + lotRandom() * 24 : form === 'apartment' || form === 'retail' ? 30 + lotRandom() * 15 : old ? 26 + lotRandom() * 13 : 23 + lotRandom() * 11
           const setback = road.width / 2 + 2.6
           const transform = (x: number, y: number): Point => ({ x: Math.round((frontage.x + x * ux - (setback + y) * uy * side) * 10) / 10, y: Math.round((frontage.y + x * uy + (setback + y) * ux * side) * 10) / 10 })
-          const polygon = [transform(-width / 2 + .4, 0), transform(width / 2 - .4, 0), transform(width / 2 - .4, depth), transform(-width / 2 + .4, depth)]
+          let polygon = [transform(-width / 2 + .4, 0), transform(width / 2 - .4, 0), transform(width / 2 - .4, depth), transform(-width / 2 + .4, depth)]
+          let rear: { polygon: Point[]; footprint: Point[]; entrance: Point; access: Point[] } | undefined
+          // A rear subdivision is a flag-shaped property with its own 2.8m
+          // connection to the public road. It is considered only when the whole
+          // stem and rear garden fit; never stamp an inaccessible second row.
+          if (year >= 1955 && form === 'house' && width >= 17.5 && lotRandom() < .32) {
+            const stemLeft = width / 2 - 3.2, backDepth = 21 + lotRandom() * 7
+            const front = [transform(-width / 2 + .4, 0), transform(stemLeft - .4, 0), transform(stemLeft - .4, depth), transform(-width / 2 + .4, depth)]
+            const back = [transform(stemLeft, 0), transform(width / 2 - .4, 0), transform(width / 2 - .4, depth + backDepth), transform(-width / 2 + .4, depth + backDepth), transform(-width / 2 + .4, depth + 1), transform(stemLeft, depth + 1)]
+            const backBounds = boundsOf(back)
+            if (canPlace(front, year) && canPlace(back, year) && slope(transform(0, depth + backDepth / 2)) <= .18 && !lots.query(backBounds).some(lot => polygonsOverlap(lot.polygon, back))) {
+              polygon = front
+              rear = { polygon: back, footprint: [transform(-width * .32, depth + 4), transform(width * .32, depth + 4), transform(width * .32, depth + 17), transform(-width * .32, depth + 17)], entrance: transform(width / 2 - 1.8, 0), access: [transform(width / 2 - 1.8, -setback), transform(width / 2 - 1.8, depth + 3), transform(width * .28, depth + 3)] }
+            }
+          }
           const bounds = boundsOf(polygon)
           if (!canPlace(polygon, year) || slope(transform(0, depth / 2)) > .22 || lots.query(bounds).some(lot => polygonsOverlap(lot.polygon, polygon))) continue
           const id = `parcel-${road.id}-${serial}-${side}`
-          const reluctant = lotRandom(), buildingWidth = width * (industrial ? .8 : old ? .86 : .72), buildingDepth = depth * (industrial ? .8 : old ? .66 : .55)
-          const garden = old ? 1.2 : 4 + lotRandom() * 3
-          const cutCorner = !industrial && lotRandom() < .28
-          const footprint = cutCorner ? [transform(-buildingWidth / 2, garden), transform(buildingWidth / 2, garden), transform(buildingWidth / 2, garden + buildingDepth * .63), transform(buildingWidth * .18, garden + buildingDepth * .63), transform(buildingWidth * .18, garden + buildingDepth), transform(-buildingWidth / 2, garden + buildingDepth)] : [transform(-buildingWidth / 2, garden), transform(buildingWidth / 2, garden), transform(buildingWidth / 2, garden + buildingDepth), transform(-buildingWidth / 2, garden + buildingDepth)]
+          const reluctant = lotRandom(), buildingWidth = (width - (rear ? 3.6 : 0)) * (industrial ? .8 : form === 'apartment' || form === 'retail' ? .86 : old ? .80 : .67), buildingDepth = depth * (industrial ? .8 : form === 'apartment' ? .43 : form === 'retail' ? .76 : old ? .56 : .46)
+          const garden = old ? 1.2 : form === 'retail' ? 2 : 4 + lotRandom() * 3
+          const cutCorner = form === 'house' && lotRandom() < .35
+          const house = (x: number, y: number) => transform(x - (rear ? 1.8 : 0), y)
+          const footprint = cutCorner ? [house(-buildingWidth / 2, garden), house(buildingWidth / 2, garden), house(buildingWidth / 2, garden + buildingDepth * .63), house(buildingWidth * .18, garden + buildingDepth * .63), house(buildingWidth * .18, garden + buildingDepth), house(-buildingWidth / 2, garden + buildingDepth)] : [house(-buildingWidth / 2, garden), house(buildingWidth / 2, garden), house(buildingWidth / 2, garden + buildingDepth), house(-buildingWidth / 2, garden + buildingDepth)]
+          const formation = survey(footprint)
+          if (!formation.viable) continue
           const parcel: Parcel = { id, polygon, entrance: transform(0, 0), roadId: road.id, createdYear: year, use: industrial ? 'industrial' : 'residential' }
-          candidates.push({ parcel, footprint, frontage, road, segment, area: width * depth, reluctance: reluctant, capacity: 1 })
+          candidates.push({ parcel, footprint, frontage, road, segment, area: width * depth, reluctance: reluctant, capacity: 1, formation, form })
           lots.add({ polygon, bounds })
+          if (rear) {
+            const rearFormation = survey(rear.footprint)
+            if (!rearFormation.viable) continue
+            const rearParcel: Parcel = { id: `${id}-rear`, polygon: rear.polygon, entrance: rear.entrance, access: rear.access, roadId: road.id, createdYear: year, use: 'residential' }
+            const rearFrontage = transform(width / 2 - 1.8, -setback)
+            candidates.push({ parcel: rearParcel, footprint: rear.footprint, frontage: rearFrontage, road, segment, area: width * 24 + depth * 2.8, reluctance: lotRandom(), capacity: 1, formation: rearFormation, form: 'house' })
+            lots.add({ polygon: rear.polygon, bounds: boundsOf(rear.polygon) })
+          }
         }
         remaining += width + 1.2; serial++
       }
@@ -130,64 +193,146 @@ export function developLand(input: DevelopmentInput) {
     }
   }
   let capacity = 0, industrialJobs = 0
+  let lodgingSerial = 0, lastHotelYear = -Infinity
   const built: Candidate[] = []
-  for (let year = 1700; year <= end; year += 5) {
+  for (const year of simulationYears(end)) {
+    const constructionYear = isConstructionYear(year)
     const activeRoads = roads.filter(r => (r.builtYear ?? 1700) <= year)
     const activeStations = year >= 1900 ? stations : []
     const destinations = input.centers?.filter(c => c.activeYear <= year).map(c => c.point) ?? [center]
     const travel = accessibility(activeRoads, [...destinations, ...activeStations.map(s => s.point)])
     const { households, jobs } = scenarioDemandAtYear(config, year)
+    if (thermalCenter && constructionYear) {
+      const target = lodgingDemand(config, year)
+      let rooms = built.reduce((sum, c) => sum + (c.building?.guestRooms ?? 0), 0)
+      const eligible = candidates.filter(c => !c.parcel.retiredYear && !c.parcel.access && c.parcel.createdYear <= year && c.parcel.use !== 'industrial' && c.road.role !== 'farm' && c.building?.use !== 'lodging' && distance(c.frontage, thermalCenter) < 750 && travel(c) < 12 && slope(c.frontage) < .12)
+      const ranked = eligible.map(c => ({ c, score: Math.exp(-distance(c.frontage, thermalCenter) / 320 - developmentClimbMinutes(c.frontage, thermalCenter, input.elevation, year) / 7) * c.formation.suitability - c.reluctance * .16 - c.formation.formationCostPerHousehold / 36 })).filter(candidate => candidate.score > 0).sort((a, b) => b.score - a.score || a.c.parcel.id.localeCompare(b.c.parcel.id))
+      const retireBuilding = (c: Candidate, reason: string) => {
+        if (!c.building) return
+        capacity -= c.capacity
+        events.push({ id: `lodging-acquisition-${year}-${c.parcel.id}`, year, kind: 'acquisition', entityId: c.building.id, reason })
+        built.splice(built.indexOf(c), 1); c.building = undefined; c.capacity = 0
+      }
+      const open = (c: Candidate, footprint: Point[], height: number, kind: 'ryokan' | 'hotel', formation: DevelopmentSiteSurvey) => {
+        // Gross floor area per guest room includes corridors, baths and dining.
+        // It is a scenario assumption, never counted as resident households.
+        const guestRooms = Math.max(5, Math.floor(polygonArea(footprint) * height / (kind === 'hotel' ? 48 : 42)))
+        retireBuilding(c, '温泉街の宿泊需要に伴う沿道敷地の取得・建替え')
+        const stem = ['松風', '川音', '山水', '若葉', '紅葉', '清流', '朝霧', '菊乃', '月見', '白雲', '春木', '水明', '桜井', '竹風', '深山', '千景'][lodgingSerial % 16]!
+        const suffix = lodgingSerial >= 16 ? `${Math.floor(lodgingSerial / 16) + 1}` : ''
+        lodgingSerial++
+        c.parcel.use = 'commercial'; c.parcel.developedYear = year; c.capacity = 0
+        c.building = { id: `lodging-${c.parcel.id}-${year}`, parcelId: c.parcel.id, polygon: footprint, kind: 'commercial', use: 'lodging', lodgingType: kind, guestRooms, name: kind === 'hotel' ? `ホテル${stem}${suffix}` : `${stem}${suffix}旅館`, height, builtYear: year, occupiedHouseholds: 0, occupancy: 'occupied' }
+        c.footprint = footprint; c.formation = formation; built.push(c); rooms += guestRooms
+        events.push({ id: `lodging-construction-${year}-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: kind === 'hotel' ? '連続する沿道敷地を取得した温泉ホテルの開業' : '湯の徒歩圏に立地する小旅館の開業' })
+      }
+      // A hotel must acquire a continuous, gently turning stretch on one road
+      // side. The acquired hull is checked in full, including the gaps between
+      // old properties; it cannot consume a different owner's intervening lot.
+      const hotelRooms = built.reduce((sum, c) => sum + (c.building?.lodgingType === 'hotel' ? c.building.guestRooms ?? 0 : 0), 0)
+      if (year >= 1960 && target >= 220 && year - lastHotelYear >= 15 && rooms < target && hotelRooms < target * .65) for (const { c } of ranked.slice(0, 48)) {
+        const a = c.road.points[c.segment - 1]!, b = c.road.points[c.segment]!, length = distance(a, b)
+        if (length < 1) continue
+        const ux = (b.x - a.x) / length, uy = (b.y - a.y) / length
+        const normal = (lot: Candidate) => lot.parcel.polygon.reduce((sum, p) => sum + (p.x - c.frontage.x) * -uy + (p.y - c.frontage.y) * ux, 0) / lot.parcel.polygon.length
+        const sameSide = eligible.filter(n => n.road.id === c.road.id && normal(n) * normal(c) > 0 && distance(n.frontage, c.frontage) < 85 && Math.abs((n.frontage.x - c.frontage.x) * -uy + (n.frontage.y - c.frontage.y) * ux) < 9).sort((p, q) => (p.frontage.x - q.frontage.x) * ux + (p.frontage.y - q.frontage.y) * uy)
+        const anchor = sameSide.indexOf(c)
+        for (const count of [4, 3, 2]) {
+          const selected = sameSide.slice(Math.max(0, anchor - 1), Math.max(0, anchor - 1) + count)
+          if (selected.length !== count || selected.some((lot, i) => i > 0 && distance(lot.frontage, selected[i - 1]!.frontage) > 38)) continue
+          const polygon = convexHull(selected.flatMap(lot => lot.parcel.polygon)), area = polygonArea(polygon), selectedSet = new Set(selected)
+          if (area < 900 || area > 4200 || !canPlace(polygon, year) || polygon.some(p => slope(p) > .12) || candidates.some(lot => !lot.parcel.retiredYear && !selectedSet.has(lot) && polygonsOverlap(polygon, lot.parcel.polygon))) continue
+          const centroid = polygon.reduce((p, q) => ({ x: p.x + q.x / polygon.length, y: p.y + q.y / polygon.length }), { x: 0, y: 0 })
+          if (slope(centroid) > .12) continue
+          const footprint = polygon.map(p => ({ x: Math.round((centroid.x + (p.x - centroid.x) * .79) * 10) / 10, y: Math.round((centroid.y + (p.y - centroid.y) * .79) * 10) / 10 }))
+          if (!canPlace(footprint, year)) continue
+          const formation = survey(footprint)
+          if (!formation.viable || formation.maximumFloors < 4) continue
+          for (const previous of selected) {
+            retireBuilding(previous, '隣接する宿泊用地の集約に伴う土地・建物の取得')
+            events.push({ id: `hotel-land-acquisition-${year}-${previous.parcel.id}`, year, kind: 'acquisition', entityId: previous.parcel.id, reason: '温泉ホテル用地として隣接敷地を一体取得' })
+            previous.parcel.retiredYear = year; previous.parcel.developedYear = undefined
+          }
+          const parcel: Parcel = { id: `hotel-parcel-${c.parcel.id}-${year}`, polygon, entrance: c.parcel.entrance, roadId: c.road.id, createdYear: year, developedYear: year, use: 'commercial' }
+          const hotel: Candidate = { ...c, parcel, footprint, formation, area, capacity: 0, building: undefined }
+          candidates.push(hotel)
+          open(hotel, footprint, Math.min(formation.maximumFloors, 7, 4 + Math.floor(seededRandom(`${config.seed}:hotel:${year}`)() * 4)), 'hotel', formation)
+          lastHotelYear = year
+          break
+        }
+        if (lastHotelYear === year) break
+      }
+      // Small inns use existing frontages rather than inserting a second,
+      // inaccessible row or blanket-converting every house in the town.
+      for (const { c } of ranked) {
+        if (rooms >= target || c.parcel.retiredYear || c.building?.use === 'lodging' || c.building && year < 1900) continue
+        if (!canPlace(c.parcel.polygon, year)) continue
+        const polygon = c.parcel.polygon
+        if (polygon.length !== 4) continue
+        const [a, b, , d] = polygon
+        const inset = (u: number, v: number) => ({ x: Math.round((a!.x + (b!.x - a!.x) * u + (d!.x - a!.x) * v) * 10) / 10, y: Math.round((a!.y + (b!.y - a!.y) * u + (d!.y - a!.y) * v) * 10) / 10 })
+        const footprint = [inset(.07, .10), inset(.93, .10), inset(.93, .78), inset(.55, .78), inset(.55, .91), inset(.07, .91)]
+        if (!footprint.every(p => pointInPolygon(p, polygon)) || !canPlace(footprint, year)) continue
+        const formation = survey(footprint)
+        if (!formation.viable) continue
+        const height = Math.min(formation.maximumFloors, year < 1900 ? 2 : 2 + (seededRandom(`${config.seed}:inn:${c.parcel.id}`)() < .55 ? 1 : 0))
+        open(c, footprint, height, 'ryokan', formation)
+      }
+    }
     // Reuse existing capacity before making a new development commitment.
     const shortage = Math.max(0, Math.ceil(households * 1.035) - capacity)
-    if (shortage > 0) {
-      const ranked = candidates.filter(c => !c.building && c.parcel.createdYear <= year && (c.parcel.use !== 'industrial' || year >= (industry?.activeYear ?? 1750))).map(c => {
+    if (shortage > 0 && constructionYear) {
+      const ranked = candidates.filter(c => !c.parcel.retiredYear && !c.building && c.parcel.createdYear <= year && (c.parcel.use !== 'industrial' || year >= (industry?.activeYear ?? 1750))).map(c => {
         const time = travel(c)
         const station = activeStations.length ? Math.min(...activeStations.map(s => distance(c.frontage, s.point))) : Infinity
         const urban = Math.exp(-time * (year < 1900 ? 2.7 : year < 1950 ? 1.5 : 1) / 7)
         const centers = input.centers ?? [{ point: center, activeYear: 1650, catchment: 640, weight: 1.15 }]
-        const reach = centers.filter(center => center.activeYear <= year).reduce((total, center) => total + center.weight * Math.exp(-distance(c.frontage, center.point) / (center.catchment * (year < 1900 ? .95 : 1.25))), 0)
+        const reach = centers.filter(center => center.activeYear <= year).reduce((total, center) => total + center.weight * Math.exp(-distance(c.frontage, center.point) / (center.catchment * (year < 1900 ? .95 : 1.25)) - developmentClimbMinutes(c.frontage, center.point, input.elevation, year) / 7), 0)
         const pressure = 1 + .75 * Math.log1p(Math.max(0, households - 100) / 250)
-        const suitability = Math.max(.25, 1 - slope(c.frontage) * 4)
-        return { c, time, station, score: pressure * urban * reach * suitability - c.reluctance * (year < 1950 ? .30 : .22) - (c.road.role === 'farm' ? .12 : 0) }
+        return { c, time, station, score: pressure * urban * reach * c.formation.suitability - c.reluctance * (year < 1950 ? .30 : .22) - (c.road.role === 'farm' ? .12 : 0) - c.formation.formationCostPerHousehold / (year < 1900 ? 28 : 36) }
       }).filter(r => Number.isFinite(r.time) && r.score > (year < 1900 ? .045 : .025)).sort((a, b) => b.score - a.score || a.c.parcel.id.localeCompare(b.c.parcel.id))
       let added = 0
-      for (const { c, station, time } of ranked) {
+      for (const { c, time } of ranked) {
         if (added >= shortage) break
         if (c.parcel.use === 'industrial' && industrialJobs >= jobs * .45) continue
         if (!canPlace(c.footprint, year)) continue
         const random = seededRandom(`${config.seed}:building:${c.parcel.id}`)
-        const commercial = c.parcel.use !== 'industrial' && ((time < 2.5 && c.road.role !== 'farm' && random() < .48) || (station < 230 && random() < .72))
-        const apartment = year >= 1960 && station < 550 && random() < .3
+        const zone = zoning(c.frontage, year)
+        const commercial = !c.parcel.access && c.parcel.use !== 'industrial' && c.form !== 'apartment' && (c.form === 'retail' || time < 10 && c.road.role !== 'farm' && random() < zone.retailShare)
+        const apartment = settlement !== 'village' && !c.parcel.access && year >= 1955 && (c.form === 'apartment' || year >= 1960 && random() < zone.apartmentShare)
         c.parcel.use = c.parcel.use === 'industrial' ? 'industrial' : commercial ? 'commercial' : 'residential'
         c.parcel.developedYear = year
-        const height = c.parcel.use === 'industrial' ? 1 : commercial ? year < 1900 ? 2 : 3 + Math.floor(random() * 3) : apartment ? 3 + Math.floor(random() * 5) : 1 + Math.floor(random() * 2)
+        const height = Math.min(zone.maximumFloors, c.formation.maximumFloors, c.parcel.use === 'industrial' ? 1 : commercial ? year < 1900 ? 2 : 3 + Math.floor(random() * (settlement === 'metropolis' ? 9 : 3)) : apartment ? settlement === 'metropolis' ? 7 + Math.floor(random() * 10) : 3 + Math.floor(random() * 5) : 1 + Math.floor(random() * 2))
+        if (height < 1) { c.parcel.developedYear = undefined; continue }
         c.capacity = c.parcel.use === 'industrial' ? 0 : apartment ? height * 2 : commercial ? 1 : 1
         c.building = { id: `building-${c.parcel.id}`, parcelId: c.parcel.id, builtYear: year, polygon: c.footprint, kind: c.parcel.use, height }
         built.push(c); capacity += c.capacity; added += c.capacity
         if (c.parcel.use === 'industrial') industrialJobs += Math.round(c.area / 35)
-        events.push({ id: `construction-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: c.parcel.use === 'industrial' ? '物流に接続した事業用地の供給' : '既存空室を使い切った後の住宅・商業需要' })
+        events.push({ id: `construction-${year}-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: c.parcel.use === 'industrial' ? '物流に接続した事業用地の供給' : '既存空室を使い切った後の住宅・商業需要' })
       }
     }
     // Station access can pay for rebuilding ageing stock after vacant capacity has
     // been used. Property boundaries survive; the old and new buildings are events.
-    if (year >= 1960 && activeStations.length && capacity < households) {
+    if (constructionYear && settlement !== 'village' && year >= 1960 && activeStations.length && capacity < households) {
       const random = seededRandom(`${config.seed}:redevelopment:${year}`)
       for (const c of [...built].sort((a, b) => a.parcel.id.localeCompare(b.parcel.id))) {
         if (capacity >= households * 1.035) break
         const old = c.building!
-        if (old.kind === 'industrial' || c.capacity > 1 || year - (old.builtYear ?? year) < 35 || c.area < 320) continue
+        if (old.kind === 'industrial' || old.use === 'lodging' || c.parcel.polygon.length !== 4 || c.capacity > 1 || year - (old.builtYear ?? year) < 35 || c.area < 320) continue
         const station = Math.min(...activeStations.map(s => distance(c.frontage, s.point)))
-        if (station > 430 || random() > .055) continue
+        if (station > (settlement === 'metropolis' ? 1200 : 430) || random() > (settlement === 'metropolis' ? .13 : .055)) continue
         const pressure = 1 + .75 * Math.log1p(Math.max(0, households - 100) / 250)
-        const floors = station < 220 ? 5 : 3, newCapacity = floors * 2
-        if ((newCapacity - c.capacity) * pressure < 4 + c.reluctance * 20) continue
         const [a, b, , d] = c.parcel.polygon
         const inset = (u: number, v: number) => ({ x: Math.round((a!.x + (b!.x - a!.x) * u + (d!.x - a!.x) * v) * 10) / 10, y: Math.round((a!.y + (b!.y - a!.y) * u + (d!.y - a!.y) * v) * 10) / 10 })
         const renewed = [inset(.07, .10), inset(.93, .10), inset(.93, .88), inset(.07, .88)]
         if (!canPlace(renewed, year)) continue
+        const formation = survey(renewed)
+        if (!formation.viable) continue
+        const floors = Math.min(zoning(c.frontage, year).maximumFloors, formation.maximumFloors, settlement === 'metropolis' ? station < 550 ? 12 : 7 : station < 220 ? 5 : 3), newCapacity = floors * 2
+        if ((newCapacity - c.capacity) * pressure < 4 + c.reluctance * 20 + formation.formationCostPerHousehold / 6) continue
         events.push({ id: `redevelop-acquire-${year}-${c.parcel.id}`, year, kind: 'acquisition', entityId: old.id, reason: '駅周辺の住宅需要による老朽建物の建替え' })
         c.building = { ...old, id: `building-${c.parcel.id}-${year}`, builtYear: year, height: floors, polygon: renewed }
-        capacity += newCapacity - c.capacity; c.capacity = newCapacity
+        capacity += newCapacity - c.capacity; c.capacity = newCapacity; c.formation = formation
         events.push({ id: `redevelop-build-${year}-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: '既存敷地を継承した共同住宅への建替え' })
       }
     }
@@ -200,6 +345,15 @@ export function developLand(input: DevelopmentInput) {
         events.push({ id: `acquisition-${year}-${c.parcel.id}`, year, kind: 'acquisition', entityId: c.building!.id, reason: '後年の交通用地取得' })
         c.building = undefined; c.parcel.developedYear = undefined; built.splice(i, 1)
       }
+    }
+    // Falling population vacates properties; it does not erase their parcel,
+    // footprint or history. Accessible homes retain use longest in this model.
+    let residents = households
+    const occupied = built.map(c => ({ c, value: travel(c) + distance(c.frontage, center) / 500 })).sort((a, b) => a.value - b.value || a.c.parcel.id.localeCompare(b.c.parcel.id))
+    for (const { c } of occupied) {
+      const used = Math.min(c.capacity, residents)
+      residents -= used
+      Object.assign(c.building!, { occupiedHouseholds: used, occupancy: c.building!.use === 'lodging' ? 'occupied' : c.capacity === 0 ? jobs < industrialJobs * .6 ? 'underused' : 'occupied' : used === 0 ? 'vacant' : used < c.capacity ? 'underused' : 'occupied' })
     }
     if (year % 25 === 0 || year === end || year === 1930) snapshots.push({ year, households, capacity, vacant: Math.max(0, capacity - households), unmet: Math.max(0, households - capacity), roads: activeRoads.length, buildings: built.length })
   }
