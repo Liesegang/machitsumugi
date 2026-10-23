@@ -1,0 +1,60 @@
+name: Extended terrain and city regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/domain/**'
+      - 'src/map/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vitest.config.ts'
+      - '.github/workflows/regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: city-regressions
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      files: ${{ steps.suites.outputs.files }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Discover expensive numerical and complete-city suites
+        id: suites
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readdirSync } from 'node:fs';
+          const files = readdirSync('src/domain')
+            .filter(file => /^generator.*\.test\.ts$/.test(file))
+            .map(file => `src/domain/${file}`);
+          files.push('src/domain/station-access.test.ts', 'src/domain/railway-planner.test.ts', 'src/domain/terrain.test.ts');
+          if (!files.every(file => existsSync(file))) throw new Error('Missing regression suite');
+          appendFileSync(process.env.GITHUB_OUTPUT, `files=${JSON.stringify(files.sort())}\n`);
+          NODE
+
+  regression:
+    name: Regression (${{ matrix.file }})
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file: ${{ fromJSON(needs.discover.outputs.files) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # These cases still run automatically, but do not hold a checked release
+      # behind several independent multi-minute world simulations.
+      - name: Test full numerical grids and independent complete worlds
+        run: npm exec -- vitest run "${{ matrix.file }}"
