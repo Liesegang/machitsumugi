@@ -181,7 +181,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       ...(d.parentId === undefined ? {} : { parentId: string(d.parentId, '所属区域', 128) }),
       ...(d.foundedYear === undefined ? {} : { foundedYear: year(d.foundedYear, '地区成立年') }),
       ...(d.nameOrigin === undefined ? {} : { nameOrigin: string(d.nameOrigin, '地名の由来', 600) }),
-      ...(d.namingSource === undefined ? {} : { namingSource: choice(d.namingSource, ['provisional', 'llm'] as const, '命名方法') }),
+      ...(d.namingSource === undefined ? {} : { namingSource: choice(d.namingSource, ['provisional', 'llm', 'edited'] as const, '命名方法') }),
       ...(d.regions === undefined ? {} : { regions: array(d.regions, '地区の区域', 4000).map(item => {
         const region = object(item, '地区の区域')
         return { polygon: points(region.polygon, '区域境界', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints), ...(region.holes === undefined ? {} : { holes: array(region.holes, '区域の穴', 1000).map(hole => points(hole, '区域の穴の境界', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints)) }) }

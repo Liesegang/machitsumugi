@@ -42,6 +42,7 @@ function sessionDraft(fallback: CityConfig): CityConfig {
   } catch { return fallback }
 }
 const normalizeConfig = (config: CityConfig): CityConfig => ({ ...config, era: config.era ?? 'present', relief: config.relief ?? 'hills', terrain: (config.type === 'port' || config.facilities.includes('port')) && config.terrain === 'plain' ? 'coast' : config.terrain })
+const timelineKey = (config: CityConfig) => JSON.stringify(Object.fromEntries(Object.entries({ ...config, targetYear: config.targetYear ?? ({ historic: 1800, railway: 1930, present: 2025 }[config.era ?? 'present']) }).sort(([a], [b]) => a.localeCompare(b))))
 const newProject = (): Project => ({ version: 2, config: livePreview ? sessionDraft(DEFAULT_CONFIG) : DEFAULT_CONFIG, layers: DEFAULT_LAYERS, annotations: [], style: 'standard' })
 const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', facilities: '施設', grid: '100 m グリッド' }
 const eraNames = { historic: '近世の街', railway: '鉄道開通後', present: '郊外拡大後' }
@@ -149,7 +150,10 @@ function App() {
       if (typeof event.data.progress === 'string') { setGenerationLabel(event.data.progress); return }
       if (event.data.preview) { setPreviewMap(event.data.preview); return }
       workerBusy.current = false
-      if (event.data.error) { setGenerating(false); setPreviewMap(null); setError(event.data.error) }
+      if (event.data.error) {
+        setGenerating(false); setPreviewMap(null); setError(event.data.error)
+        if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null) }
+      }
       else if (event.data.map) {
         const generated = event.data.map
         setGenerating(false)
@@ -165,6 +169,7 @@ function App() {
       workerBusy.current = false; instance.terminate()
       if (activeWorker.current === instance) activeWorker.current = null
       setGenerating(false); setPreviewMap(null); setError('地図を生成できませんでした。ページを再読み込みしてください。')
+      if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null) }
     }
     instance.addEventListener('message', handleMessage)
     instance.addEventListener('error', handleError)
@@ -180,7 +185,7 @@ function App() {
   useEffect(() => { if (project.snapshot) completedProject.current = project }, [project])
   useEffect(() => {
     if (!project.snapshot) return
-    const cache = timelineCache.current, key = JSON.stringify(project.snapshot.config)
+    const cache = timelineCache.current, key = timelineKey(project.snapshot.config)
     cache.delete(key); cache.set(key, project.snapshot)
     while (cache.size > 3) cache.delete(cache.keys().next().value!)
   }, [project.snapshot])
@@ -219,30 +224,33 @@ function App() {
     location.reload()
   }
   function showYear(targetYear: number) {
-    const base = project.snapshot ? project : completedProject.current
-    if (!base?.snapshot) return
+    const base = project
+    if (!map && !base.snapshot) return
     const config = { ...base.config, targetYear }
-    if ((base.snapshot.year ?? 2025) === targetYear && !generating) return
+    if ((base.snapshot?.year ?? map?.year ?? 2025) === targetYear && !generating) return
     sequence.current += 1
     if (workerBusy.current) { activeWorker.current?.terminate(); activeWorker.current = null; workerBusy.current = false }
-    const cached = timelineCache.current.get(JSON.stringify(config))
+    const cached = timelineCache.current.get(timelineKey(config))
+    const restored = cached ? { ...cached, config } : undefined
     setFeature(null); setSelected(null); setPinMode(false); setPreviewMap(null); setError('')
     setGenerationLabel(`${targetYear}年までの歴史を計算中…`)
-    setProject({ ...base, config, snapshot: cached })
+    setProject({ ...base, config, snapshot: restored })
     // Changing the date must not silently apply other unfinished settings.
     setDraft(old => ({ ...old, targetYear }))
-    if (cached) { setMap(cached); setGenerating(false) }
+    if (restored) { setMap(restored); setGenerating(false) }
     else setGenerating(true)
   }
   function applyDistrictNames(proposals: NameProposal[]) {
-    if (!map || !project.snapshot || generating) return
+    if (!map || !project.snapshot || generating) return false
     try {
       const checked = parseNameProposals(JSON.stringify({ names: proposals }), map.districts)
       const names = new Map(checked.map(p => [p.id, p]))
-      const renamed = { ...map, districts: map.districts.map(d => ({ ...d, name: names.get(d.id)!.name, nameOrigin: names.get(d.id)!.reason, namingSource: 'llm' as const })) }
+      const renamed = { ...map, districts: map.districts.map(d => ({ ...d, name: names.get(d.id)!.name, nameOrigin: names.get(d.id)!.reason, namingSource: names.get(d.id)!.source ?? 'llm' as const })) }
       setMap(renamed); setProject(old => ({ ...old, snapshot: renamed })); setFeature(null)
+      setError('')
       setToast('確認した地名を地図に反映しました。')
-    } catch (err) { setError(err instanceof Error ? err.message : '地名を反映できませんでした。') }
+      return true
+    } catch (err) { setError(err instanceof Error ? err.message : '地名を反映できませんでした。'); return false }
   }
   function cancelGeneration() {
     sequence.current += 1
@@ -294,6 +302,7 @@ function App() {
       activeWorker.current?.terminate(); activeWorker.current = null
       workerBusy.current = false
       restoreSequence.current += 1
+      timelineCache.current.clear()
       setRestoring(false)
       setProject(next); setDraft(next.config); setSelected(null); setFeature(null); setPinMode(false); setError('')
       setGenerating(!next.snapshot)

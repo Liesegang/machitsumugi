@@ -23,7 +23,7 @@ export interface Area { id: string; polygon: Point[]; holes?: Point[][]; kind: '
 export interface Railway { id: string; points: Point[]; name: string; elevations?: number[]; structures?: { kind: 'bridge' | 'cutting' | 'embankment'; from: Point; to: Point; maxHeight: number; length?: number }[]; junction?: { parentId: string; point: Point }; builtYear?: number }
 export interface Station { id: string; point: Point; name: string }
 export interface Facility { id: string; point: Point; name: string; kind: FacilityKind }
-export interface District { id: string; point: Point; name: string; kind?: 'town' | 'ward'; parentId?: string; regions?: { polygon: Point[]; holes?: Point[][] }[]; foundedYear?: number; nameOrigin?: string; namingSource?: 'provisional' | 'llm' }
+export interface District { id: string; point: Point; name: string; kind?: 'town' | 'ward'; parentId?: string; regions?: { polygon: Point[]; holes?: Point[][] }[]; foundedYear?: number; nameOrigin?: string; namingSource?: 'provisional' | 'llm' | 'edited' }
 export interface Parcel { id: string; polygon: Point[]; entrance: Point; access?: Point[]; roadId: string; createdYear: number; developedYear?: number; retiredYear?: number; use: 'residential' | 'commercial' | 'industrial' }
 export interface GrowthEvent { id: string; year: number; kind: 'road' | 'construction' | 'acquisition' | 'railway'; entityId: string; reason: string }
 export interface SimulationSnapshot { year: number; households: number; capacity: number; vacant: number; unmet: number; roads: number; buildings: number }

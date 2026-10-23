@@ -46,8 +46,12 @@ export function featureHistory(map: CityMap, feature: MapFeature): GrowthEvent[]
     }
   }
   if (feature.type === 'facility') {
-    for (const b of map.buildings) if (b.id.startsWith(`facility-${feature.item.kind}`)) ids.add(b.id)
-    ids.add(`facility-access-${feature.item.kind}`)
+    if (feature.item.id === `facility-${feature.item.kind}` || feature.item.id === 'origin') {
+      const stems = [`facility-building-${feature.item.kind}`, `facility-lot-${feature.item.kind}`, `facility-access-${feature.item.kind}`]
+      const belongs = (id: string) => stems.some(stem => id === stem || id.startsWith(`${stem}-relocation-`))
+      for (const event of map.events ?? []) if (belongs(event.entityId)) ids.add(event.entityId)
+      for (const b of map.buildings) if (belongs(b.id) || feature.item.kind === 'castle' && b.id.startsWith('castle-')) ids.add(b.id)
+    }
   }
   if (feature.type === 'district' && feature.item.regions) {
     for (const b of map.buildings) if (feature.item.regions.some(region => pointInRegion(b.polygon[0]!, region))) ids.add(b.id)

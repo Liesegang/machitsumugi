@@ -93,7 +93,7 @@ input:not([type="checkbox"]):not([type="range"]), select { height: 36px; }
 .map-view-3d :focus-visible { outline: 2px solid #3b6b88; outline-offset: 2px; }
 .map-view-3d canvas:focus-visible { outline-offset: -3px; }
 .map-area .regional-context { right: 60px; }
-.map-area[data-view-mode="3d"] .regional-context { right: auto; left: 10px; bottom: 52px; }
+.map-area[data-view-mode="3d"] .regional-context { right: auto; left: 10px; bottom: 175px; }
 .map-canvas > canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 .map-canvas > canvas:active { cursor: grabbing; }
 .map-canvas.pin-mode > canvas { cursor: crosshair; }
@@ -249,8 +249,9 @@ dialog::backdrop { background: #1d2e3b55; }
   .mobile-label { display: inline; }
   .map-legend { gap: 9px; padding: 5px 6px; }
   .map-legend > span { font-size: 9px; }
-  .map-area .regional-context { right: 64px; bottom: 90px; }
-  .map-area[data-view-mode="3d"] .regional-context { right: auto; bottom: 52px; }
+  .map-area .regional-context { right: 64px; bottom: 175px; }
+  .map-area[data-view-mode="3d"] .regional-context { right: auto; bottom: 175px; }
+  .map-view-3d .map-3d-controls { bottom: 175px; }
 }
 @media (max-height: 500px) {
   .map-view-3d .map-3d-note { display: none; }

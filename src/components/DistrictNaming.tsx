@@ -2,24 +2,31 @@ import { useEffect, useRef, useState } from 'react'
 import type { CityMap } from '../domain/types'
 import type { NameProposal } from '../ai/district-names'
 
-export function DistrictNaming({ map, disabled, onApply }: { map: CityMap; disabled: boolean; onApply: (proposals: NameProposal[]) => void }) {
-  const [busy, setBusy] = useState(false), [progress, setProgress] = useState(''), [error, setError] = useState(''), [proposals, setProposals] = useState<NameProposal[]>([])
+export function DistrictNaming({ map, disabled, onApply }: { map: CityMap; disabled: boolean; onApply: (proposals: NameProposal[]) => boolean }) {
+  const [activeMap, setActiveMap] = useState<CityMap | null>(null), [progress, setProgress] = useState('')
+  const [failure, setFailure] = useState<{ map: CityMap; message: string } | null>(null)
+  const [batch, setBatch] = useState<{ map: CityMap; items: NameProposal[] } | null>(null)
+  const busy = activeMap === map, error = failure?.map === map ? failure.message : '', proposals = batch?.map === map ? batch.items : []
   const controller = useRef<AbortController | null>(null)
-  useEffect(() => () => { controller.current?.abort() }, [])
+  useEffect(() => {
+    if (disabled) controller.current?.abort()
+    return () => controller.current?.abort()
+  }, [map, disabled])
   async function propose() {
+    controller.current?.abort()
     const request = new AbortController(); controller.current = request
-    setBusy(true); setError(''); setProposals([]); setProgress('小型モデルを読み込み中…')
+    setActiveMap(map); setFailure(null); setBatch(null); setProgress('小型モデルを読み込み中…')
     try {
       const { proposeDistrictNames } = await import('../ai/local-naming')
       const result = await proposeDistrictNames(map, request.signal, setProgress)
-      if (!request.signal.aborted) setProposals(result)
-    } catch (err) { if (!request.signal.aborted) setError(err instanceof Error ? err.message : '命名できませんでした。') }
-    finally { if (controller.current === request) { controller.current = null; setBusy(false) } }
+      if (!request.signal.aborted) setBatch({ map, items: result })
+    } catch (err) { if (!request.signal.aborted) setFailure({ map, message: err instanceof Error ? err.message : '命名できませんでした。' }) }
+    finally { if (controller.current === request) { controller.current = null; setActiveMap(null) } }
   }
-  return <section className="district-naming"><h2>区域と地名</h2><p className="muted">道路と集落から区域を分けます。小型LLMが地形と履歴をもとに地名を提案します。</p>
-    <p className="panel-footnote">Qwen3 0.6Bをブラウザ内で実行します。初回は数百MBのモデルを取得します。WebGPUと約2GBのGPUメモリが必要です。</p>
+  return <section className="district-naming"><h2>区域と地名</h2><p className="muted">道路と集落から区域を分けます。地理条件に合う架空の地名候補を作り、小型LLMが区域の特徴に合わせて選びます。</p>
+    <p className="panel-footnote">Qwen3 1.7Bをブラウザ内で実行します。初回は約1GBのモデルを取得します。WebGPU対応のGPUが必要です。</p>
     {busy ? <><p role="status">{progress}</p><button className="secondary full" onClick={() => controller.current?.abort()}>命名を中止</button></> : <button className="secondary full" disabled={disabled || !map.districts.length} onClick={() => { void propose() }}>小型LLMで地名を提案</button>}
     {error && <p role="alert">{error}</p>}
-    {!!proposals.length && <><p className="muted">提案を確認してから反映できます。由来は架空の命名理由です。</p><div className="name-proposals">{proposals.map(proposal => <label key={proposal.id}><input aria-label={`${proposal.id}の地名案`} maxLength={16} value={proposal.name} onChange={event => setProposals(old => old.map(p => p.id === proposal.id ? { ...p, name: event.target.value } : p))} /><small>{proposal.reason}</small></label>)}</div><button className="primary full" disabled={disabled} onClick={() => { onApply(proposals); setProposals([]) }}>地図に反映</button></>}
+    {!!proposals.length && <><p className="muted">区域の特徴と地名案を確認してから、表示中の年代の地図に反映できます。架空の命名です。</p><div className="name-proposals">{proposals.map(proposal => <label key={proposal.id}><input aria-label={`${proposal.id}の地名案`} maxLength={16} value={proposal.name} onChange={event => setBatch(old => old?.map === map ? { map, items: old.items.map(p => p.id === proposal.id ? { ...p, name: event.target.value, source: 'edited', reason: p.reason.replace('架空の候補から小型LLMが選びました。', '架空の候補をもとに利用者が編集しました。') } : p) } : old)} /><small>{proposal.reason}</small></label>)}</div><button className="primary full" disabled={disabled} onClick={() => { if (onApply(proposals)) setBatch(null) }}>地図に反映</button></>}
   </section>
 }

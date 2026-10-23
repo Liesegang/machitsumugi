@@ -30,3 +30,13 @@ it('shows recorded parcel rebuild history without inventing or including unrelat
   expect(history.map(e => [e.year, e.reason])).toEqual([[1850, '最初の家'], [2020, '建替え'], [2020, '新しい共同住宅']])
   expect(featureHistory(map, { type: 'area', item: { id: 'forest', kind: 'forest', polygon: [] } })).toEqual([])
 })
+it('includes dated civic relocation history when its label is clicked', () => {
+  const civic: CityMap = { ...map, events: [
+    { id: 'school-open', entityId: 'facility-building-school', year: 1875, kind: 'construction', reason: '学校を建設' },
+    { id: 'school-acquired', entityId: 'facility-building-school', year: 1955, kind: 'acquisition', reason: '道路用地取得' },
+    { id: 'school-moved', entityId: 'facility-building-school-relocation-1955-1', year: 1955, kind: 'construction', reason: '学校を移転再建' },
+    { id: 'other', entityId: 'facility-building-police', year: 1880, kind: 'construction', reason: '別施設' },
+  ] }
+  const history = featureHistory(civic, { type: 'facility', item: { id: 'facility-school', kind: 'school', name: '学校', point: { x: 40, y: 40 } } })
+  expect(history.map(e => e.id)).toEqual(['school-open', 'school-acquired', 'school-moved'])
+})

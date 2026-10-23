@@ -14,7 +14,7 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 1 })
   const [fittedFor, setFittedFor] = useState('')
-  const [hover, setHover] = useState<{ point: Point; feature: MapFeature } | null>(null)
+  const [hover, setHover] = useState<{ point: Point; feature: MapFeature; map: CityMap; view: View; layers: RenderOptions['layers'] } | null>(null)
   const inspect = useMemo(() => createMapInspector(map), [map])
   const lastHover = useRef(0)
   const pointers = useRef(new Map<number, Point>())
@@ -89,7 +89,7 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
           const rect = event.currentTarget.getBoundingClientRect(), cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top }
           const point = { x: (cursor.x - view.x) / view.scale, y: (cursor.y - view.y) / view.scale }
           const feature = inspect(point, 7 / view.scale, options.layers)
-          setHover(feature ? { point: cursor, feature } : null)
+          setHover(feature ? { point: cursor, feature, map, view, layers: options.layers } : null)
           return
         }
         const current = { x: event.clientX, y: event.clientY }; if (Math.hypot(current.x - gesture.current.x, current.y - gesture.current.y) > 5) gesture.current.moved = true
@@ -103,7 +103,7 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
       onPointerCancel={event => pointers.current.delete(event.pointerId)}
       onPointerLeave={() => setHover(null)}
       onDoubleClick={event => { const rect = event.currentTarget.getBoundingClientRect(); zoomAt(1.7, { x: event.clientX - rect.left, y: event.clientY - rect.top }) }} />
-    {hover && !pinMode && <div className="map-hover" role="tooltip" style={{ left: Math.max(6, Math.min(size.width - 226, hover.point.x + 14)), top: Math.max(6, Math.min(size.height - 90, hover.point.y + 14)) }}><strong>{featureTitle(hover.feature)}</strong><span>{featureSummary(hover.feature) || 'クリックで履歴を表示'}</span></div>}
+    {hover && hover.map === map && hover.view === view && hover.layers === options.layers && !pinMode && <div className="map-hover" role="tooltip" style={{ left: Math.max(6, Math.min(size.width - 226, hover.point.x + 14)), top: Math.max(6, Math.min(size.height - 90, hover.point.y + 14)) }}><strong>{featureTitle(hover.feature)}</strong><span>{featureSummary(hover.feature) || 'クリックで履歴を表示'}</span></div>}
     <div className="scale-bar"><span style={{ width: Math.max(40, scaleMeters * view.scale) }} /><b>{scaleMeters} m</b></div>
     <div className="zoom-controls"><button aria-label="拡大" title="拡大 (+)" onClick={() => zoom(1.4)}><Plus size={19} /></button><button aria-label="縮小" title="縮小 (-)" onClick={() => zoom(1 / 1.4)}><Minus size={19} /></button><button aria-label="地図全体を表示" title="地図全体を表示 (Home)" onClick={fit}><LocateFixed size={19} /></button></div><span className="zoom-label">{Math.round(view.scale / (baseScale || 1) * 100)}%</span>
   </div>
