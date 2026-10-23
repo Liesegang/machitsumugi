@@ -10,4 +10,5 @@ it('accepts checked proposals and preserves identities', () => {
 it('rejects missing, invented or repeated IDs and names before modifying a map', () => {
   for (const names of [valid.names.slice(0, 1), [valid.names[0], valid.names[0]], [{ ...valid.names[0], id: 'imaginary' }, valid.names[1]], [{ ...valid.names[0], name: '西山区' }, valid.names[1]], [{ ...valid.names[0], name: '<script>' }, valid.names[1]], [valid.names[0], { ...valid.names[1], name: '山町' }]]) expect(() => parseNameProposals(JSON.stringify({ names }), districts)).toThrow()
   expect(() => parseNameProposals(JSON.stringify(valid), districts, ['湯本町'])).toThrow()
+  expect(() => parseNameProposals(JSON.stringify({ names: [{ ...valid.names[0], name: '水杜市' }, valid.names[1]] }), districts)).toThrow()
 })

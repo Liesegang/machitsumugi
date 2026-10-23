@@ -21,6 +21,7 @@ import { agriculturalAccessSurvey } from './agricultural-access'
 import { applyHarborTerrain } from './harbor-terrain'
 import type { HarborPlatform } from './harbor-terrain'
 import { castleLayout } from './castle-layout'
+import { buildDistricts } from './districts'
 
 export const DEFAULT_CONFIG: CityConfig = {
   name: '水杜市', seed: 'minato-2026', type: 'castle', terrain: 'river', relief: 'hills', density: 65, forest: 30,
@@ -505,8 +506,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   for (const region of wetlands) occupied.add({ ...region, bounds: boundsOf(region.polygon) })
   for (const parcel of development.parcels.filter(p => !p.developedYear)) emitCover([parcel], 'vacant', occupied)
   emitCover([mapBoundary], 'meadow', convertedLand)
-  const names = ['本町', '新町', '桜町', '西町', '東町', '緑ヶ丘', '南台']
-  const districts: CityMap['districts'] = growth.centers.filter(c => c.kind !== 'industrial').map((center, i) => ({ id: `district-${i}`, point: { x: clamp(center.point.x + 180, 140, W - 140), y: clamp(center.point.y + 150, 160, H - 160) }, name: `${names[i % names.length]}${i > 6 ? Math.floor(i / 7) + 1 : ''}` }))
+  const districts = buildDistricts({ width: W, height: H, config, roads, blocks, parcels: development.parcels, areas, stations, facilities })
   return { width: W, height: H, config, buildings, roads, areas, railways, stations, facilities, districts, description: CITY_PRESETS.find(p => p.id === config.type)!.description, growthLog: growth.growthLog, generatorVersion: GENERATOR_VERSION, year, terrainSurface: surface(), regionalContext,
     unplacedFacilities: config.facilities.filter(kind => facilityInception[kind] <= year && !facilities.some(facility => facility.kind === kind)).map(kind => ({ kind, reason: kind === 'shop' ? '商店街を構成する連続した商業敷地が成立していません。' : '水域・地盤・接道の条件を満たす用地を確保できませんでした。' })),
     terrainSimulation: { resolution: naturalTerrain.hydrology.resolution, steps: naturalTerrain.hydrology.erosion.iterations, elapsedYears: naturalTerrain.hydrology.erosion.elapsedYears,
