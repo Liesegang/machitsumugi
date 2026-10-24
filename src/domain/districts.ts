@@ -186,13 +186,11 @@ export function buildDistricts(input: DistrictInput): District[] {
     const regions = merge(members.flatMap(index => nodes[index]!.regions)), point = anchor(members, regions)
     let foundedYear = Math.min(...members.map(index => nodes[index]!.year))
     for (const region of regions) for (const record of history(boundsOf(region.polygon))) if (record.parcel.createdYear < foundedYear && pointInRegion(record.point, region)) foundedYear = record.parcel.createdYear
-    const station = input.stations?.find(station => distance(station.point, point) < 250)
-    const facility = input.facilities?.find(facility => distance(facility.point, point) < 160)
     const id = `town-${hash(members.map(index => nodes[index]!.id).sort().join('|'))}`
     const direction = point.y < input.height * .35 ? '北' : point.y > input.height * .65 ? '南' : point.x < input.width * .35 ? '西' : point.x > input.width * .65 ? '東' : '中'
     const name = provisionalPlaceName({ seed: input.config.seed, id, kind: 'town', direction }, usedNames)
     usedNames.add(name)
-    return { id, name, kind: 'town', regions, point, foundedYear, namingSource: 'provisional', nameOrigin: `仮の町名。${station ? `${station.name}に接続する` : facility ? `${facility.name}に近い` : '接道敷地と'}街区群。最古の敷地記録は${foundedYear}年。` }
+    return { id, name, kind: 'town', regions, point, foundedYear, namingSource: 'provisional' }
   })
   if (input.config.settlement !== 'metropolis' || towns.length < 8) return towns
   const townGraph = towns.map(() => new Set<number>())
@@ -209,7 +207,7 @@ export function buildDistricts(input: DistrictInput): District[] {
     const regions = merge(members.flatMap(i => towns[i]!.regions!)), nodeMembers = members.flatMap(i => compactGroups[i]!)
     const name = provisionalPlaceName({ seed: input.config.seed, id, kind: 'ward' }, usedNames)
     usedNames.add(name)
-    wards.push({ id, name, kind: 'ward', regions, point: anchor(nodeMembers, regions), foundedYear: Math.min(...members.map(i => towns[i]!.foundedYear!)), namingSource: 'provisional', nameOrigin: '仮の区名。隣接する町の街路接続をまとめた大都市の上位地域区分。年は区域内で最古の敷地記録。' })
+    wards.push({ id, name, kind: 'ward', regions, point: anchor(nodeMembers, regions), foundedYear: Math.min(...members.map(i => towns[i]!.foundedYear!)), namingSource: 'provisional' })
   }
   return [...wards, ...towns]
 }

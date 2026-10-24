@@ -207,6 +207,36 @@ dialog::backdrop { background: #1d2e3b55; }
 .unplaced-facilities dl > div { margin-bottom: 10px; }
 .unplaced-facilities dt { font-weight: 600; }
 .unplaced-facilities dd { margin: 2px 0 0; color: #64727b; }
+.generation-issue { display: grid; justify-items: start; gap: 2px; padding: 8px 0; color: #7c3d2b; font-size: 12px; line-height: 1.6; }
+.generation-issue .text-button { padding: 3px 0; min-height: 24px; text-decoration: underline; color: inherit; }
+.map-report-button { min-height: 28px; padding: 3px 8px; border: 0; background: transparent; color: var(--color-accent); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+.map-report-button:hover { background: var(--color-tint); }
+.generation-report { font-size: 13px; line-height: 1.7; }
+.report-context { margin: 0 0 12px; color: var(--color-text); overflow-wrap: anywhere; }
+.report-overview { display: grid; gap: 4px; margin: 0 0 20px; }
+.report-overview > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 12px; }
+.report-overview dt, .report-facilities li > span:first-child { color: #52616b; }
+.report-overview dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.generation-report h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.report-problems { margin: 0 0 24px; padding-left: 12px; border-left: 3px solid #ad654e; }
+.report-problems > p { margin: 0 0 12px; }
+.report-problems dl { margin: 0 0 16px; }
+.report-problems dl > div { margin-bottom: 12px; }
+.report-problems dt { font-weight: 600; }
+.report-problems dd { margin: 2px 0 0; color: #52616b; }
+.report-facilities { margin-bottom: 20px; }
+.report-facilities dl { margin: 0; }
+.report-facilities dl > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--color-border); }
+.report-facilities dt { color: #52616b; }
+.report-facilities dd { margin: 0; overflow-wrap: anywhere; }
+.report-facilities summary { min-height: 24px; cursor: pointer; }
+.report-facilities ul { list-style: none; margin: 4px 0; padding: 0; }
+.report-detail { border-top: 1px solid var(--color-border); }
+.report-detail > summary { padding: 10px 0; cursor: pointer; }
+.report-history { padding: 0; margin: 0 0 12px; list-style: none; }
+.report-history li { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 8px; padding: 6px 0; }
+.report-history time { font-variant-numeric: tabular-nums; }
+.report-detail .terrain-calculation { border: 0; padding: 0; }
 .danger { color: #a63e31; }
 .danger:hover { background: #faefed; }
 .toast, .error-toast { position: fixed; left: 50%; bottom: 34px; z-index: 70; transform: translateX(-50%); max-width: calc(100vw - 28px); padding: 8px 12px; border: 1px solid #a8b8c3; border-radius: 2px; background: #fff; color: #314f61; font-size: 12px; line-height: 1.6; }

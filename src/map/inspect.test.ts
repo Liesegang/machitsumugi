@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest'
 import type { CityMap } from '../domain/types'
-import { createMapInspector, featureHistory } from './inspect'
+import { createMapInspector, featureHistory, featureSummary } from './inspect'
 
 const map = {
   width: 100, height: 100, description: '履歴と地物選択の検証', areas: [], stations: [],
@@ -39,4 +39,10 @@ it('includes dated civic relocation history when its label is clicked', () => {
   ] }
   const history = featureHistory(civic, { type: 'facility', item: { id: 'facility-school', kind: 'school', name: '学校', point: { x: 40, y: 40 } } })
   expect(history.map(e => e.id)).toEqual(['school-open', 'school-acquired', 'school-moved'])
+})
+it('distinguishes inherited routes from their actual later construction works', () => {
+  const road = { ...map.roads[0]!, builtYear: 1650, modifiedYear: 1985, reason: '交通量増加による6mへの拡幅' }
+  expect(featureSummary({ type: 'road', item: road })).toBe('幅員6 m · 1650年成立 · 1985年改良')
+  const events = featureHistory({ ...map, events: [] }, { type: 'road', item: road })
+  expect(events.map(event => [event.year, event.reason])).toEqual([[1650, '道の成立'], [1985, '交通量増加による6mへの拡幅']])
 })

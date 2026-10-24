@@ -8,7 +8,7 @@ export function FeatureDetails({ map, feature, point, onClose, onPin }: { map: C
   return <section className="feature-popover" aria-label="この場所の履歴">
     <button className="icon-button popover-close" aria-label="建物情報を閉じる" onClick={onClose}><X size={16} /></button>
     <span className="field-caption">この場所について</span><h3>{featureTitle(feature)}</h3><p>{featureSummary(feature)}</p>
-    {feature.type === 'district' && feature.item.nameOrigin && <p>{feature.item.namingSource === 'edited' ? '編集した地名の手がかり：' : feature.item.namingSource === 'llm' ? '命名の手がかり：' : '仮称の説明：'}{feature.item.nameOrigin}</p>}
+    {feature.type === 'district' && feature.item.nameOrigin && (feature.item.namingSource === 'edited' || feature.item.namingSource === 'llm') && <><h4>名前の由来</h4><p>{feature.item.nameOrigin}</p></>}
     <h4>記録された履歴</h4>
     {history.length ? <ol className="feature-history">{history.map(event => <li key={event.id}><time>{event.year}年</time><span>{event.reason}</span></li>)}</ol> : <p>この場所の成立や変化は未記録です。</p>}
     <button className="secondary full" onClick={() => onPin(point)}><MapPin size={15} />ここにピンを追加</button>

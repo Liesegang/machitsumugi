@@ -3,7 +3,6 @@ import { Download, Eye, EyeOff, FolderOpen, HelpCircle, Image, LoaderCircle, Map
 import type { CityConfig, CityMap, Point } from './domain/types'
 import type { MapFeature } from './map/inspect'
 import { DEFAULT_CONFIG } from './domain/generator'
-import { GENERATOR_VERSION } from './domain/land-development'
 import { downloadProject, loadProjectArchive, MAX_PROJECT_FILE_BYTES, parseProject, persistProjectArchive } from './domain/project'
 import type { Project } from './domain/project'
 import { areaColor, DEFAULT_LAYERS, PALETTES } from './map/render'
@@ -12,7 +11,7 @@ import { exportMapPng, exportMapSvg } from './map/export'
 import { MapCanvas } from './components/MapCanvas'
 import type { MapHandle } from './components/MapCanvas'
 import { SettingsPanel, Toggle } from './components/SettingsPanel'
-import { FACILITY_NAMES } from './components/facility-labels'
+import { GenerationReport } from './components/GenerationReport'
 import { Dialog } from './components/Dialog'
 import { FeatureDetails } from './components/FeatureDetails'
 import { TimelineControl } from './components/TimelineControl'
@@ -55,23 +54,6 @@ const newProject = (): Project => ({ version: 2, config: livePreview ? sessionDr
 const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', facilities: '施設', grid: '100 m グリッド' }
 // A disposable development preview must never replace a saved TRPG world.
 const livePreview = import.meta.env.DEV && new URLSearchParams(location.search).get('preview') === 'latest'
-function TerrainCalculation({ simulation: s }: { simulation: NonNullable<CityMap['terrainSimulation']> }) {
-  const volume = (value: number) => `${value !== 0 && Math.abs(value) < .01 ? value.toExponential(2) : value.toLocaleString('ja-JP', { maximumFractionDigits: 2 })} m³`
-  const rows = [
-    ['計算格子・反復', `${s.resolution.toLocaleString('ja-JP')} m · ${s.steps.toLocaleString('ja-JP')}回`],
-    ['地形形成の相当時間', `${s.elapsedYears.toLocaleString('ja-JP')}年`],
-    ['岩盤削剥', volume(s.bedrockErodedVolume)],
-    ['堆積物貯留', volume(s.storedSedimentVolume)],
-    ['領域外への土砂排出', volume(s.exportedSedimentVolume)],
-    ['局所河床の掘削', volume(s.localExcavationVolume)],
-    ['局所河床への堆積', volume(s.localDepositionVolume)],
-    ['局所処理の土砂排出', volume(s.localExportedVolume)],
-    ['土砂収支誤差', volume(s.sedimentBalanceError)],
-    ['地盤収支誤差', volume(s.groundBalanceError)],
-    ['局所処理の収支誤差', volume(s.localBalanceError)],
-  ]
-  return <section className="terrain-calculation" aria-label="この地図の地形計算"><h3>この地図の地形計算</h3><dl>{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl><p>運搬長と河道侵食力（stream-power）による簡略モデルです。2D流体計算は行いません。</p></section>
-}
 
 function App() {
   const [project, setProject] = useState<Project>(newProject)
@@ -96,7 +78,7 @@ function App() {
   const [showSecrets, setShowSecrets] = useState(true)
   const [selected, setSelected] = useState<Annotation | null>(null)
   const [feature, setFeature] = useState<{ point: Point; feature: MapFeature } | null>(null)
-  const [dialog, setDialog] = useState<'export' | 'help' | null>(null)
+  const [dialog, setDialog] = useState<'export' | 'help' | 'report' | null>(null)
   const [format, setFormat] = useState<'png' | 'svg'>('png')
   const [exportWidth, setExportWidth] = useState(4096)
   const [includeSecrets, setIncludeSecrets] = useState(false)
@@ -181,7 +163,7 @@ function App() {
         setProject(old => ({ ...old, config: generated.config, snapshot: generated }))
         setDraft(old => ({ ...old, targetYear: generated.year ?? requestedDisplayYear.current }))
         setError('')
-        if (generated.unplacedFacilities?.length) setToast(`施設${generated.unplacedFacilities.length}件は成立しませんでした。詳細は「使い方」で確認できます。`)
+        if (generated.unplacedFacilities?.length) setToast(`施設${generated.unplacedFacilities.length}種を配置できませんでした。「生成結果」で確認できます。`)
       }
     }
     const handleError = () => {
@@ -424,7 +406,7 @@ function App() {
     <div className="workspace">
       {sidebarOpen && <button className="sidebar-scrim" aria-label="設定パネルを閉じる" onClick={() => setSidebarOpen(false)} />}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label="街の設定"><nav className="panel-tabs" aria-label="編集パネル"><button className={tab === 'create' ? 'active' : ''} aria-current={tab === 'create' ? 'page' : undefined} onClick={() => setTab('create')}>生成</button><button className={tab === 'layers' ? 'active' : ''} aria-current={tab === 'layers' ? 'page' : undefined} onClick={() => setTab('layers')}>表示</button><button className={tab === 'edit' ? 'active' : ''} aria-current={tab === 'edit' ? 'page' : undefined} onClick={() => { setTab('edit'); setViewMode('map'); setPinMode(false); setFeature(null) }}>編集</button><button className={tab === 'pins' ? 'active' : ''} aria-current={tab === 'pins' ? 'page' : undefined} onClick={() => setTab('pins')}>ピン</button><button className="close-sidebar icon-button" aria-label="設定パネルを閉じる" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={18} /></button></nav>
-        {tab === 'create' && <SettingsPanel config={draft} onChange={setDraft} generating={generating} dirty={dirty} onGenerate={generate} onCancel={cancelGeneration} />}
+        {tab === 'create' && <SettingsPanel config={draft} onChange={setDraft} generating={generating} dirty={dirty} onGenerate={generate} onCancel={cancelGeneration} unplacedCount={project.snapshot?.unplacedFacilities?.length} onReport={() => setDialog('report')} />}
         {tab === 'edit' && <MapEditor year={displayYear} tool={editorTool} onTool={startEditorTool} targetKind={editorTargetKind} onTargetKind={kind => { setEditorTargetKind(kind); setEditorSelection(null) }} selection={editorSelection} points={editPoints} values={editorValues} onValues={setEditorValues} onFinish={finishEdit} onCancel={cancelEdit} onBack={() => setEditPoints(old => old.slice(0, -1))} onDelete={() => changeSelectedEdit('delete')} onRename={() => changeSelectedEdit('rename')} onRedraw={redrawSelectedEdit} onUndo={undoEdit} onRedo={redoEdit} canUndo={!!project.edits?.length} canRedo={!!redoEdits.length} disabled={generating || !project.snapshot} />}
         {tab === 'layers' && <div className="panel-scroll">
           <section><h2>レイヤー</h2>{Object.entries(layerNames).map(([key, name]) => <Toggle key={key} label={name} value={project.layers[key as keyof typeof layerNames]} onChange={value => setProject(old => ({ ...old, layers: { ...old.layers, [key]: value } }))} />)}</section>
@@ -451,14 +433,15 @@ function App() {
         {viewMode === 'contour' && displayedMap && !displayedMap.terrainSurface && <div className="mode-notice" role="note">この保存地図には標高データがありません。</div>}
         {(restoring || generating) && <div className={`generation-overlay ${displayedMap ? 'regenerating' : ''}`} role="status"><LoaderCircle className="spin" size={25} /><span>{restoring ? '保存済みの地図を読み込み中…' : generationLabel}</span>{generating && !restoring && <button className="text-button" onClick={cancelGeneration}>中止</button>}</div>}
         {feature && displayedMap && <FeatureDetails map={displayedMap} feature={feature.feature} point={feature.point} onClose={() => setFeature(null)} onPin={addPin} />}
-      </div><footer className="map-status"><span className="map-stock">{previewMap ? previewStockLabel(previewMap) : displayedMap ? `建物 ${displayedMap.buildings.length.toLocaleString()}棟` : '生成中'}</span><BuildIdentity mapVersion={displayedMap?.generatorVersion} preview={!!previewMap} /></footer></main>
+      </div><footer className="map-status"><span className="map-stock">{previewMap ? previewStockLabel(previewMap) : displayedMap ? `建物 ${displayedMap.buildings.length.toLocaleString()}棟` : '生成中'}</span>{project.snapshot && !generating && <button className="map-report-button" onClick={() => setDialog('report')}>生成結果</button>}<BuildIdentity mapVersion={displayedMap?.generatorVersion} preview={!!previewMap} /></footer></main>
     </div>
     <input ref={importRef} type="file" accept="application/json,.json" hidden onChange={event => void importFile(event.target.files?.[0])} />
     {toast && <div className="toast" role="status">{toast}</div>}
     {error && <div className="error-toast" role="alert"><span>{error}</span><button aria-label="エラーを閉じる" onClick={() => setError('')}><X size={17} /></button></div>}
     {selected && <Dialog title="ピンを編集" onClose={() => setSelected(null)}><div className="dialog-body"><label className="stack-field">場所の名前<input autoFocus value={selected.name} maxLength={60} placeholder="例：古書店「月読堂」" onChange={event => setSelected({ ...selected, name: event.target.value })} /></label><label className="stack-field">メモ<textarea value={selected.note} maxLength={2000} rows={4} placeholder="この場所にある手がかりや、登場人物など" onChange={event => setSelected({ ...selected, note: event.target.value })} /></label><Toggle label="GM用ピンにする" value={selected.secret} onChange={value => setSelected({ ...selected, secret: value })} icon={<EyeOff size={17} />} /><p className="muted">GM用ピンは、画像の書き出し時に隠せます。</p></div><div className="dialog-footer">{project.annotations.some(item => item.id === selected.id) ? <button className="text-button danger" onClick={() => { setProject(old => ({ ...old, annotations: old.annotations.filter(item => item.id !== selected.id) })); setSelected(null) }}><Trash2 size={16} />削除</button> : <span />}<button className="primary" disabled={!selected.name.trim()} onClick={savePin}>ピンを保存</button></div></Dialog>}
     {dialog === 'export' && <Dialog title="画像を書き出す" onClose={() => { if (!exporting) setDialog(null) }}><div className="dialog-body"><p className="muted">2D地図を、現在のレイヤーとスタイルで書き出します。等高線表示時は等高線も含みます。</p><label className="stack-field">ファイル形式<select value={format} onChange={e => setFormat(e.target.value as 'png' | 'svg')}><option value="png">PNG画像</option><option value="svg">SVG（拡大しても鮮明）</option></select></label>{format === 'png' && <label className="stack-field">画像サイズ<select value={exportWidth} onChange={e => setExportWidth(Number(e.target.value))}>{[2048, 4096, 8192].map(width => <option key={width} value={width}>{width} × {Math.round(width * (map?.height ?? 3000) / (map?.width ?? 4000))} px</option>)}</select></label>}<Toggle label="GM用ピンを含める" value={includeSecrets} onChange={setIncludeSecrets} icon={<EyeOff size={17} />} /><p className="export-note">実在の地図画像は使用していません。セッション資料や配信などに自由にお使いいただけます。</p></div><div className="dialog-footer"><span className="muted">{map?.config.name}</span><button className="primary" disabled={exporting} onClick={() => void exportImage()}>{exporting ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}{exporting ? '書き出し中…' : 'ダウンロード'}</button></div></Dialog>}
-    {dialog === 'help' && <Dialog title="使い方" onClose={() => setDialog(null)}><div className="dialog-body help-content"><p>街の成り立ちと地形を選び、「生成」で地図を作成します。</p><p><b>地図を探索</b>ドラッグで移動、ホイールや＋／−で拡大縮小。建物をクリックすると種類や面積を確認できます。キーボードの矢印キーでも移動できます。</p><p><b>等高線と3D</b>地図上部で表示を切り替えます。等高線は保存された標高から描画し、3Dは同じ地形と建物を立体表示します。3Dではドラッグで回転、右ドラッグで移動できます。建物の高さは階数からの仮定で、標高がない旧地図は平面地形で表示します。画像出力は2D地図です。</p><p><b>ピンを追加</b>ピンのツールで場所をクリックし、名前・メモを保存できます。GM用ピンは公開画像から除けます。</p><p><b>画像と地図を保存</b>PNG・SVGで地図全体を書き出せます。「保存」で地図の形・シード・表示・ピンをファイルに保存し、「開く」から読み込めます。地図はこのブラウザにも自動保存します。保存済みの地図は再生成せず復元します。旧形式（バージョン1）は設定とピンのみのため、現在のエンジンで生成します。</p><p><b>街の成り立ち</b>成立期から鉄道整備、郊外拡大までの成長過程を、地形・道路への接続・需要に基づく簡略モデルで扱います。一度の生成で建替えや道路・農地の変更を記録し、年代スライダーで保存済みの歴史を表示します。履歴のない旧地図は「生成」で履歴を作成できます。現実の人口動態・土地所有・水利・制度を網羅するものではなく、実在都市の再現や都市計画の検証には使えません。</p>{Boolean(displayedMap?.unplacedFacilities?.length) && <section className="unplaced-facilities"><h3>成立しなかった施設</h3><dl>{displayedMap!.unplacedFacilities!.map((facility, index) => <div key={`${facility.kind}-${index}`}><dt>{FACILITY_NAMES[facility.kind]}</dt><dd>{facility.reason}</dd></div>)}</dl></section>}{displayedMap?.terrainSimulation && <TerrainCalculation simulation={displayedMap.terrainSimulation} />}<p><b>生成エンジン</b>現行 {GENERATOR_VERSION}。表示中の地図：{displayedMap?.generatorVersion ?? '版情報なし'}{displayedMap?.year !== undefined ? `、${displayedMap.year}年` : ''}。再生成すると現在の規則で作り直し、ピンをリセットします。</p>{Boolean(displayedMap?.growthLog?.length) && <p><b>この地図の発展記録</b>{displayedMap!.growthLog!.map((stage, index) => <span key={`${stage.phase}-${index}`} style={{ display: 'block' }}>{stage.year !== undefined ? `${stage.year}年 · ` : ''}{({ regional: '街道の成立', oldtown: '旧市街の発展', railway: '鉄道開通と駅前の発展', suburban: '郊外への拡大', industrial: '産業地の発展' } as Record<string, string>)[stage.phase] ?? stage.phase}：道路 {stage.roadsAdded}本{stage.reason ? `（${stage.reason}）` : ''}</span>)}</p>}<a href="https://github.com/Liesegang/machitsumugi" target="_blank" rel="noreferrer">ソースコード・生成ルールについて</a></div></Dialog>}
+    {dialog === 'report' && project.snapshot && <Dialog title="生成結果" onClose={() => setDialog(null)}><GenerationReport map={project.snapshot} onSettings={() => { setDialog(null); setTab('create'); setSidebarOpen(true) }} /></Dialog>}
+    {dialog === 'help' && <Dialog title="使い方" onClose={() => setDialog(null)}><div className="dialog-body help-content"><p>街の成り立ちと地形を選び、「生成」で地図を作成します。</p><p><b>地図を探索</b>ドラッグで移動、ホイールや＋／−で拡大縮小。建物をクリックすると種類や面積を確認できます。キーボードの矢印キーでも移動できます。</p><p><b>等高線と3D</b>地図上部で表示を切り替えます。等高線は保存された標高から描画し、3Dは同じ地形と建物を立体表示します。3Dではドラッグで回転、右ドラッグで移動できます。建物の高さは階数からの仮定で、標高がない旧地図は平面地形で表示します。画像出力は2D地図です。</p><p><b>ピンを追加</b>ピンのツールで場所をクリックし、名前・メモを保存できます。GM用ピンは公開画像から除けます。</p><p><b>画像と地図を保存</b>PNG・SVGで地図全体を書き出せます。「保存」で地図の形・シード・表示・ピンをファイルに保存し、「開く」から読み込めます。地図はこのブラウザにも自動保存します。保存済みの地図は再生成せず復元します。旧形式（バージョン1）は設定とピンのみのため、現在のエンジンで生成します。</p><p><b>街の成り立ち</b>成立期から鉄道整備、郊外拡大までの成長過程を、地形・道路への接続・需要に基づく簡略モデルで扱います。一度の生成で建替えや道路・農地の変更を記録し、年代スライダーで保存済みの歴史を表示します。履歴のない旧地図は「生成」で履歴を作成できます。現実の人口動態・土地所有・水利・制度を網羅するものではなく、実在都市の再現や都市計画の検証には使えません。</p><a href="https://github.com/Liesegang/machitsumugi" target="_blank" rel="noreferrer">ソースコード・生成ルールについて</a></div></Dialog>}
   </div>
 }
 export default App

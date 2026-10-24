@@ -1,4 +1,6 @@
 import type { Point, TerrainSurface } from '../domain/types'
+import { createDrawingSurface } from './drawing-surface'
+import type { DrawingCanvas } from './drawing-surface'
 
 export type SeaStyle = 'standard' | 'mono' | 'night'
 const stops = [0, 5, 20, 80, 200, 800]
@@ -25,14 +27,13 @@ export function sampleSurface(surface: TerrainSurface, p: Point) {
   return (surface.elevations[i]! * (1 - u) + surface.elevations[i + 1]! * u) * (1 - v) + (surface.elevations[i + surface.columns]! * (1 - u) + surface.elevations[i + surface.columns + 1]! * u) * v
 }
 
-const rasterCache = new WeakMap<TerrainSurface, Map<SeaStyle, HTMLCanvasElement>>()
+const rasterCache = new WeakMap<TerrainSurface, Map<SeaStyle, DrawingCanvas>>()
 export function seaDepthRaster(surface: TerrainSurface, style: SeaStyle) {
   let variants = rasterCache.get(surface)
   if (!variants) { variants = new Map(); rasterCache.set(surface, variants) }
   const cached = variants.get(style)
   if (cached) return cached
-  const canvas = document.createElement('canvas'); canvas.width = surface.columns; canvas.height = surface.rows
-  const context = canvas.getContext('2d')!, pixels = context.createImageData(canvas.width, canvas.height)
+  const { canvas, context } = createDrawingSurface(surface.columns, surface.rows), pixels = context.createImageData(canvas.width, canvas.height)
   for (let i = 0; i < surface.elevations.length; i++) {
     const rgb = seaDepthRgb(-surface.elevations[i]!, style)
     pixels.data.set([...rgb, 255], i * 4)

@@ -6,6 +6,8 @@ import { seaDepthRaster, seaDepthRgb } from './bathymetry'
 import { landPaintGroups } from './land-paint'
 import { subwayInk, SUBWAY_DASH, SUBWAY_LINE_WIDTH } from './railway-style'
 import { woodlandCrowns, WOODLAND_TEXTURE_MIN_SCALE } from './woodland-texture'
+import { createDrawingSurface } from './drawing-surface'
+import type { DrawingCanvas, DrawingContext } from './drawing-surface'
 
 export type LayerSettings = {
   buildings: boolean
@@ -69,7 +71,7 @@ export function buildingColor(building: Building, style: MapStyle): string {
   return PALETTES[style][building.kind]
 }
 
-export function tracePath(ctx: CanvasRenderingContext2D, points: Point[], close = false) {
+export function tracePath(ctx: DrawingContext, points: Point[], close = false) {
   if (!points.length) return
   ctx.beginPath()
   ctx.moveTo(points[0].x, points[0].y)
@@ -77,7 +79,7 @@ export function tracePath(ctx: CanvasRenderingContext2D, points: Point[], close 
   if (close) ctx.closePath()
 }
 
-export function traceRegion(ctx: CanvasRenderingContext2D, region: Pick<Area, 'polygon' | 'holes'>) {
+export function traceRegion(ctx: DrawingContext, region: Pick<Area, 'polygon' | 'holes'>) {
   ctx.beginPath()
   for (const ring of [region.polygon, ...region.holes ?? []]) {
     if (!ring.length) continue
@@ -100,7 +102,7 @@ export function areaColor(area: Area, style: MapStyle): string {
   return colors[style][area.landUse]
 }
 
-function terrainTexture(ctx: CanvasRenderingContext2D, regions: Pick<Area, 'polygon' | 'holes'>[], color: string, dark: string, scale: number, sparse = false) {
+function terrainTexture(ctx: DrawingContext, regions: Pick<Area, 'polygon' | 'holes'>[], color: string, dark: string, scale: number, sparse = false) {
   // Woodland is a continuous land cover at neighbourhood/city scales. Canopy
   // detail appears only close up and stays quieter than streets and buildings.
   if (!regions.length || scale < WOODLAND_TEXTURE_MIN_SCALE) return
@@ -121,13 +123,14 @@ function terrainTexture(ctx: CanvasRenderingContext2D, regions: Pick<Area, 'poly
 
 type LabelBox = { x: number; y: number; width: number; height: number }
 
-const reliefCache = new WeakMap<object, HTMLCanvasElement>()
-function renderRelief(ctx: CanvasRenderingContext2D, map: CityMap) {
+const reliefCache = new WeakMap<object, DrawingCanvas>()
+function renderRelief(ctx: DrawingContext, map: CityMap) {
   const surface = map.terrainSurface!
   let canvas = reliefCache.get(surface)
   if (!canvas) {
-    canvas = document.createElement('canvas'); canvas.width = surface.columns; canvas.height = surface.rows
-    const raster = canvas.getContext('2d')!, pixels = raster.createImageData(canvas.width, canvas.height), z = surface.elevations
+    const surfaceCanvas = createDrawingSurface(surface.columns, surface.rows)
+    canvas = surfaceCanvas.canvas
+    const raster = surfaceCanvas.context, pixels = raster.createImageData(canvas.width, canvas.height), z = surface.elevations
     for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
       const i = y * canvas.width + x, h = z[i]!, dx = (z[y * canvas.width + Math.min(canvas.width - 1, x + 1)]! - z[y * canvas.width + Math.max(0, x - 1)]!) / (surface.cellSize * 2), dy = (z[Math.min(canvas.height - 1, y + 1) * canvas.width + x]! - z[Math.max(0, y - 1) * canvas.width + x]!) / (surface.cellSize * 2)
       const shade = Math.max(.45, Math.min(1.22, .88 + (-dx * .7 - dy * .7) * 3)), t = Math.min(1, Math.max(0, h / 650))
@@ -139,7 +142,7 @@ function renderRelief(ctx: CanvasRenderingContext2D, map: CityMap) {
   }
   ctx.save(); ctx.imageSmoothingEnabled = true; ctx.drawImage(canvas, 0, 0, map.width, map.height); ctx.restore()
 }
-function renderContours(ctx: CanvasRenderingContext2D, map: CityMap, scale: number, style: MapStyle) {
+function renderContours(ctx: DrawingContext, map: CityMap, scale: number, style: MapStyle) {
   if (!map.terrainSurface) return
   const lines = terrainContours(map.terrainSurface, map.areas.some(area => area.id === 'sea' || area.id.startsWith('sea-')))
   ctx.save(); ctx.lineJoin = 'round'; ctx.lineCap = 'round'
@@ -157,7 +160,7 @@ function renderContours(ctx: CanvasRenderingContext2D, map: CityMap, scale: numb
   }
   ctx.restore()
 }
-function renderCrop(ctx: CanvasRenderingContext2D, map: CityMap, scale: number) {
+function renderCrop(ctx: DrawingContext, map: CityMap, scale: number) {
   if (!map.previewCrop?.length) return
   ctx.save(); ctx.beginPath(); ctx.rect(0, 0, map.width, map.height)
   const crop = map.previewCrop; ctx.moveTo(crop[0]!.x, crop[0]!.y); for (const p of crop.slice(1)) ctx.lineTo(p.x, p.y); ctx.closePath()
@@ -165,7 +168,7 @@ function renderCrop(ctx: CanvasRenderingContext2D, map: CityMap, scale: number) 
   const centre = crop.reduce((p, q) => ({ x: p.x + q.x / crop.length, y: p.y + q.y / crop.length }), { x: 0, y: 0 })
   ctx.font = `600 ${12 / scale}px ${MAP_FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.strokeStyle = '#233c45'; ctx.lineWidth = 3 / scale; ctx.strokeText('地図を生成する範囲', centre.x, centre.y); ctx.fillStyle = '#ffffff'; ctx.fillText('地図を生成する範囲', centre.x, centre.y); ctx.restore()
 }
-export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: RenderOptions): void {
+export function renderMap(ctx: DrawingContext, map: CityMap, options: RenderOptions): void {
   if (map.terrainSurface && (map.previewPhase === 'landscape' || map.previewPhase === 'erosion')) { renderRelief(ctx, map); if (options.contours) renderContours(ctx, map, Math.max(.01, options.scale), options.style); renderCrop(ctx, map, Math.max(.01, options.scale)); return }
   const { layers, style, annotations, showSecrets } = options
   const scale = Math.max(.01, options.scale)

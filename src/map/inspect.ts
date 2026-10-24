@@ -27,9 +27,12 @@ export function featureSummary(feature: MapFeature): string {
     const b = feature.item
     return `${b.height}階 · ${Math.round(polygonArea(b.polygon))} m²${b.guestRooms === undefined ? '' : ` · 客室${b.guestRooms}室`}${b.builtYear === undefined ? '' : ` · ${b.builtYear}年建築`}`
   }
-  if (feature.type === 'road') return `幅員${feature.item.width} m${feature.item.builtYear === undefined ? '' : ` · ${feature.item.builtYear}年開通`}`
+  if (feature.type === 'road') {
+    const road = feature.item
+    return `幅員${road.width} m${road.builtYear === undefined ? '' : ` · ${road.builtYear}年成立`}${road.modifiedYear !== undefined && road.modifiedYear !== road.builtYear ? ` · ${road.modifiedYear}年改良` : ''}`
+  }
   if (feature.type === 'railway') return feature.item.builtYear === undefined ? '地域鉄道' : `${feature.item.builtYear}年開業`
-  if (feature.type === 'district') return `${feature.item.kind === 'ward' ? '区' : '町の区域'}${feature.item.foundedYear === undefined ? '' : ` · 区域内最古の記録 ${feature.item.foundedYear}年`}`
+  if (feature.type === 'district') return `${feature.item.kind === 'ward' ? '区' : '町の区域'}${feature.item.foundedYear === undefined ? '' : ` · ${feature.item.foundedYear}年から敷地の記録あり`}`
   return ''
 }
 /** Read recorded events, including previous buildings on the same parcel. */
@@ -61,7 +64,8 @@ export function featureHistory(map: CityMap, feature: MapFeature): GrowthEvent[]
   // An explicit construction year is a stored fact, even for a landmark whose
   // creation predates the current event log. Never invent a historical story.
   const year = 'builtYear' in feature.item ? feature.item.builtYear : undefined
-  if (year !== undefined && !recorded.some(event => event.year === year)) recorded.unshift({ id: `recorded-${feature.item.id}`, entityId: feature.item.id, year, kind: feature.type === 'railway' ? 'railway' : feature.type === 'road' ? 'road' : 'construction', reason: feature.type === 'road' ? feature.item.reason || '道路の開通年' : feature.type === 'railway' ? '路線の開業年' : '建物の建築年' })
+  if (year !== undefined && !recorded.some(event => event.year === year)) recorded.unshift({ id: `recorded-${feature.item.id}`, entityId: feature.item.id, year, kind: feature.type === 'railway' ? 'railway' : feature.type === 'road' ? 'road' : 'construction', reason: feature.type === 'road' ? '道の成立' : feature.type === 'railway' ? '路線の開業年' : '建物の建築年' })
+  if (feature.type === 'road' && feature.item.modifiedYear !== undefined && feature.item.modifiedYear !== year && !recorded.some(event => event.year === feature.item.modifiedYear)) recorded.push({ id: `recorded-modification-${feature.item.id}`, entityId: feature.item.id, year: feature.item.modifiedYear, kind: 'road', reason: feature.item.reason || '道路の改良' })
   return recorded.sort((a, b) => a.year - b.year)
 }
 

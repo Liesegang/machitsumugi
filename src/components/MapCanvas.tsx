@@ -3,7 +3,7 @@ import { LocateFixed, Minus, Plus } from 'lucide-react'
 import type { CityMap, Point } from '../domain/types'
 import { createMapInspector, featureSummary, featureTitle } from '../map/inspect'
 import type { MapFeature } from '../map/inspect'
-import { renderMap } from '../map/render'
+import { ViewportRenderer } from '../map/viewport-renderer'
 import type { Annotation, RenderOptions } from '../map/render'
 export interface MapHandle { zoom: (factor: number) => void; fit: () => void; center: (point: Point) => void; getCenter: () => Point }
 interface Props { map: CityMap; options: RenderOptions; pinMode: boolean; editPoints?: Point[]; editPolygon?: boolean; onPick: (point: Point, feature?: MapFeature) => void; onAnnotationPick: (pin: Annotation) => void }
@@ -11,6 +11,7 @@ interface View { x: number; y: number; scale: number }
 export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, options, pinMode, editPoints = [], editPolygon = false, onPick, onAnnotationPick }, ref) {
   const container = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLCanvasElement>(null)
+  const renderer = useRef<ViewportRenderer | null>(null)
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 1 })
   const [fittedFor, setFittedFor] = useState('')
@@ -56,11 +57,13 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
     element.addEventListener('wheel', wheel, { passive: false }); return () => element.removeEventListener('wheel', wheel)
   }, [zoomAt])
   useLayoutEffect(() => {
-    const element = canvas.current; if (!element || !size.width || !size.height) return
-    const ratio = window.devicePixelRatio || 1; element.width = Math.round(size.width * ratio); element.height = Math.round(size.height * ratio)
-    const ctx = element.getContext('2d'); if (!ctx) return
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.fillStyle = options.style === 'night' ? '#202f37' : '#eef0ea'; ctx.fillRect(0, 0, size.width, size.height)
-    ctx.translate(view.x, view.y); ctx.scale(view.scale, view.scale); renderMap(ctx, map, { ...options, scale: view.scale })
+    const element = canvas.current
+    if (!element) return
+    const drawing = new ViewportRenderer(element); renderer.current = drawing
+    return () => { drawing.dispose(); if (renderer.current === drawing) renderer.current = null }
+  }, [])
+  useLayoutEffect(() => {
+    renderer.current?.update(map, options, { ...size, view, ratio: window.devicePixelRatio || 1 })
   }, [map, options, view, size])
   function pick(client: Point) {
     const rect = canvas.current!.getBoundingClientRect(), point = { x: (client.x - rect.left - view.x) / view.scale, y: (client.y - rect.top - view.y) / view.scale }

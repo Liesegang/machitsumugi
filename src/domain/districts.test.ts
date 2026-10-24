@@ -93,8 +93,8 @@ describe('street- and parcel-derived district territories', () => {
     const districts = buildDistricts(input)
     expect(districts).toHaveLength(1)
     expect(districts[0]!.foundedYear).toBe(1650)
-    expect(districts[0]!.nameOrigin).toContain('敷地記録')
-    expect(districts[0]!.nameOrigin).not.toContain('設置')
+    expect(districts[0]!.namingSource).toBe('provisional')
+    expect(districts[0]!.nameOrigin).toBeUndefined()
   })
 
   it('adds upper wards only for metropolitan catchments and preserves the exact town territories', () => {

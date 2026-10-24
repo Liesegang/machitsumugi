@@ -9,9 +9,11 @@ interface Props {
   dirty: boolean
   onGenerate: () => void
   onCancel: () => void
+  unplacedCount?: number
+  onReport?: () => void
 }
 
-export function SettingsPanel({ config, onChange, generating, dirty, onGenerate, onCancel }: Props) {
+export function SettingsPanel({ config, onChange, generating, dirty, onGenerate, onCancel, unplacedCount = 0, onReport }: Props) {
   function update<K extends keyof CityConfig>(key: K, value: CityConfig[K]) {
     onChange({ ...config, [key]: value, ...(key === 'era' ? { targetYear: undefined } : {}) })
   }
@@ -50,7 +52,7 @@ export function SettingsPanel({ config, onChange, generating, dirty, onGenerate,
       </div></details>
       <details className="setting-section facility-details"><summary>施設{config.facilities.length > 0 && <span>{config.facilities.length}件</span>}</summary><div className="setting-content facility-choices">{(Object.entries(FACILITY_NAMES) as [FacilityKind, string][]).map(([kind, name]) => <label key={kind}><input type="checkbox" checked={config.facilities.includes(kind)} onChange={event => update('facilities', event.target.checked ? [...config.facilities, kind] : config.facilities.filter(item => item !== kind))} />{name}</label>)}</div></details>
     </div>
-    <div className="generate-footer">{(dirty || generating) && <span className="settings-state">{dirty ? '未反映の変更があります' : '生成中も設定を変更できます'}</span>}{generating && <button className="secondary full" onClick={onCancel}>生成を中止</button>}<button className="primary generate" disabled={!config.name.trim() || !config.seed.trim()} onClick={onGenerate}>{generating ? dirty ? '変更して再生成' : '最初から再生成' : '生成'}</button></div>
+    <div className="generate-footer">{!generating && unplacedCount > 0 && <div className="generation-issue"><span>前回の生成では{unplacedCount}種の施設を配置できていません。</span><button className="text-button" onClick={onReport}>結果を確認</button></div>}{(dirty || generating) && <span className="settings-state">{dirty ? '未反映の変更があります' : '生成中も設定を変更できます'}</span>}{generating && <button className="secondary full" onClick={onCancel}>生成を中止</button>}<button className="primary generate" disabled={!config.name.trim() || !config.seed.trim()} onClick={onGenerate}>{generating ? dirty ? '変更して再生成' : '最初から再生成' : '生成'}</button></div>
   </>
 }
 

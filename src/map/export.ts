@@ -111,7 +111,9 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
       parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
       if (map.terrainSurface && (area.id === 'sea' || area.id.startsWith('sea-'))) {
         const surface = map.terrainSurface, id = `sea-depth-${seaSerial++}`
-        const raster = seaDepthRaster(surface, options.style).toDataURL('image/png')
+        const canvas = seaDepthRaster(surface, options.style)
+        if (!('toDataURL' in canvas)) throw new Error('SVGの書き出しにはブラウザの描画領域が必要です')
+        const raster = canvas.toDataURL('image/png')
         parts.push(`<defs><clipPath id="${id}"><path d="${d}" clip-rule="evenodd"/></clipPath></defs><image href="${raster}" x="${-surface.cellSize / 2}" y="${-surface.cellSize / 2}" width="${surface.columns * surface.cellSize}" height="${surface.rows * surface.cellSize}" preserveAspectRatio="none" clip-path="url(#${id})"/>`)
       }
     }
