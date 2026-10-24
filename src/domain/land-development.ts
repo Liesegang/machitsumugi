@@ -10,7 +10,7 @@ import { developmentClimbMinutes, surveyDevelopmentSite } from './development-te
 import type { DevelopmentSiteSurvey } from './development-terrain'
 import { isConstructionYear, simulationEndYear, simulationYears } from './simulation-calendar'
 
-export const GENERATOR_VERSION = '2.2.0'
+export const GENERATOR_VERSION = '2.3.0'
 export { EPOCH_YEAR } from './simulation-calendar'
 
 interface Candidate {

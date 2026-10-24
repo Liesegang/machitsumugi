@@ -1,21 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { writeFileSync } from 'node:fs'
 import { DEFAULT_CONFIG, generateCity } from './generator'
 import type { TerrainModel } from './terrain'
 import type { UrbanGrowthInput } from './urban-growth'
 import { erodeTerrain } from './hydrology'
-import { corridorPolygon, distanceToSegment, polygonArea, polygonOverlapsRegion, polygonsOverlap } from './geometry'
+import { corridorPolygon, distanceToSegment, pointInRegion, polygonArea, polygonOverlapsRegion, polygonsOverlap, rectangle, regionArea } from './geometry'
 
-const fixture = vi.hoisted(() => ({ cut: null as null | { x: number; y: number }, parks: false }))
-afterEach(() => { fixture.cut = null; fixture.parks = false })
+const fixture = vi.hoisted(() => ({ cut: null as null | { x: number; y: number }, cutYear: 1955, parks: false, woodedHill: false, lateStreet: false }))
+afterEach(() => { fixture.cut = null; fixture.cutYear = 1955; fixture.parks = false; fixture.woodedHill = false; fixture.lateStreet = false })
 
 vi.mock('./urban-growth', async importOriginal => {
   const original = await importOriginal<typeof import('./urban-growth')>()
   return { ...original, simulateUrbanGrowth: (input: UrbanGrowthInput) => {
     if (fixture.parks) for (const year of [1955, 1960]) if (year <= (input.untilYear ?? 2025)) input.onCivicPopulation?.(year, [500, 1150, 2300].map(y => ({ point: { x: 1100, y }, households: 500 })))
     const roads = [
-      { id: 'old-street', points: [{ x: 1100, y: 100 }, { x: 1100, y: 2900 }], kind: 'arterial' as const, width: 10, role: 'highway' as const, builtYear: 1650, reason: 'inherited street', phase: 'historic', constructionCost: 1 },
-      ...((input.untilYear ?? 2025) >= 1900 ? [{ id: 'future-avenue', points: [{ x: 1600, y: 100 }, { x: 1600, y: 2900 }], kind: 'arterial' as const, width: 10, role: 'highway' as const, builtYear: 1900, reason: 'later street', phase: 'railway', constructionCost: 1 }] : []),
-      ...((input.untilYear ?? 2025) >= 1955 && fixture.cut ? [{ id: 'school-acquisition-road', points: [{ x: 1100, y: fixture.cut.y - 180 }, { x: fixture.cut.x, y: fixture.cut.y - 80 }, { x: fixture.cut.x, y: fixture.cut.y + 80 }, { x: 1100, y: fixture.cut.y + 180 }], kind: 'local' as const, width: 8, role: 'collector' as const, builtYear: 1955, reason: 'later public street', phase: 'suburban', constructionCost: 1 }] : []),
+      ...(!fixture.lateStreet || (input.untilYear ?? 2025) >= 1975 ? [{ id: 'old-street', points: [{ x: 1100, y: 100 }, { x: 1100, y: 2900 }], kind: 'arterial' as const, width: 10, role: 'highway' as const, builtYear: fixture.lateStreet ? 1975 : 1650, reason: 'inherited street', phase: 'historic', constructionCost: 1 }] : []),
+      ...((input.untilYear ?? 2025) >= (fixture.lateStreet ? 1975 : 1900) ? [{ id: 'future-avenue', points: [{ x: 1600, y: 100 }, { x: 1600, y: 2900 }], kind: 'arterial' as const, width: 10, role: 'highway' as const, builtYear: fixture.lateStreet ? 1975 : 1900, reason: 'later street', phase: 'railway', constructionCost: 1 }] : []),
+      ...((input.untilYear ?? 2025) >= fixture.cutYear && fixture.cut ? [{ id: 'school-acquisition-road', points: [{ x: 1100, y: fixture.cut.y - 180 }, { x: fixture.cut.x, y: fixture.cut.y - 80 }, { x: fixture.cut.x, y: fixture.cut.y + 80 }, { x: 1100, y: fixture.cut.y + 180 }], kind: 'local' as const, width: 8, role: 'collector' as const, builtYear: fixture.cutYear, reason: 'later public street', phase: 'suburban', constructionCost: 1 }] : []),
     ]
     return { roads, roadHistory: roads.map(road => ({ from: road.builtYear, value: { ...road, points: road.points.map(point => ({ ...point })) } })), centers: [{ point: { x: 1100, y: 1500 }, kind: 'historic' as const, weight: 1, activeYear: 1650, catchment: 500 }], developmentCells: [], demandSchedule: [], growthLog: [], blocks: [],
     }
@@ -28,7 +29,7 @@ function flatSurvey(): TerrainModel {
     extent: 6000, columns: 4, rows: 4, resolution: 2000, seed: 1, ocean: new Uint8Array(16),
     cropOrigin: { x: 0, y: 0 }, frame: { worldAnchor: { x: 0, y: 0 }, localAnchor: { x: 0, y: 0 }, angle: 0, mirrored: false },
     localResolution: 2000, localColumns: 4, localRows: 4, localDEM: raw, channelEvolution: [], oxbows: [], depressionLakes: [] }
-  return { areas: [], elevation: () => 5, slope: () => 0, waterAt: () => false, cityOrigin: { x: 1800, y: 1500 }, landform: () => 'terrace', wetness: () => .2,
+  return { areas: fixture.woodedHill ? [{ id: 'forest-hill', kind: 'forest', polygon: rectangle(800, 100, 1600, 2800), name: '丘の林' }] : [], elevation: p => 5 + (fixture.woodedHill ? (p.x - 1100) * .06 : 0), slope: () => fixture.woodedHill ? .06 : 0, waterAt: () => false, cityOrigin: { x: 1800, y: 1500 }, landform: () => 'terrace', wetness: () => .2,
     terrainCost: () => 1, cultivable: () => false, bankDistance: () => Infinity, channelAt: () => null, rivers: [], bridgeSites: [], bridgeCandidates: [], hydrology }
 }
 
@@ -60,7 +61,10 @@ describe('facility construction uses its own historical street survey', () => {
     // Facility geometry is actually acquired, not a label-only correction.
     const campus = earlier.areas.find(area => area.id === 'facility-lot-shrine')!.polygon
     expect(polygonArea(campus)).toBeGreaterThan(4500)
-    expect(earlier.buildings.every(building => !polygonsOverlap(building.polygon, campus))).toBe(true)
+    const shrine = earlier.buildings.find(building => building.id === 'facility-building-shrine')!
+    expect(shrine.builtYear).toBe(1650)
+    expect(polygonOverlapsRegion(shrine.polygon, { polygon: campus })).toBe(true)
+    expect(earlier.buildings.filter(building => building.id !== shrine.id).every(building => !polygonsOverlap(building.polygon, campus))).toBe(true)
   })
 
   it('records later transport acquisition and a contemporaneous replacement without rewriting the old school', { timeout: 60000 }, () => {
@@ -98,5 +102,55 @@ describe('facility construction uses its own historical street survey', () => {
     }
     const police = later.buildings.find(building => building.id.startsWith('facility-building-police'))!
     for (const road of later.roads.filter(road => road.id.startsWith('neighbourhood-park-'))) for (let i = 1; i < road.points.length; i++) expect(polygonOverlapsRegion(police.polygon, { polygon: corridorPolygon(road.points[i - 1]!, road.points[i]!, road.width / 2) })).toBe(false)
+  })
+
+  it('places an explicitly requested university and a wooded park without clearing their entire hillside', { timeout: 30000 }, () => {
+    fixture.woodedHill = true
+    const map = generateCity({ ...DEFAULT_CONFIG, type: 'newtown', density: 0, railway: false, forest: 100, targetYear: 2025, facilities: ['university', 'park'] }, undefined, undefined, flatSurvey)
+    expect(map.facilities.some(f => f.kind === 'university')).toBe(true)
+    expect(map.facilities.some(f => f.kind === 'park')).toBe(true)
+    const university = map.buildings.filter(building => building.id.startsWith('facility-building-university'))
+    expect(university.length).toBeGreaterThanOrEqual(3)
+    expect(map.roads.filter(road => road.id.startsWith('facility-access-university-internal-')).length).toBe(university.length + 1)
+    const forest = map.areas.filter(area => area.kind === 'forest')
+    expect(forest.reduce((sum, area) => sum + regionArea(area), 0)).toBeGreaterThan(1600 * 2800 * .97)
+    for (const building of university) expect(forest.every(area => !polygonOverlapsRegion(building.polygon, area))).toBe(true)
+    const oldForest = map.timeline!.areas.filter(version => version.value.kind === 'forest' && version.from <= 1950 && (version.to === undefined || 1950 < version.to))
+    expect(oldForest.some(version => pointInRegion(university[0]!.polygon[0]!, version.value))).toBe(true)
+    expect(map.timeline!.buildings.filter(version => version.value.id.startsWith('facility-building-university')).every(version => version.from >= 1965)).toBe(true)
+    if (process.env.CIVIC_CAPTURE_PATH) writeFileSync(process.env.CIVIC_CAPTURE_PATH, JSON.stringify(map))
+  })
+
+  it('retries a failed university survey when a later street provides real access', { timeout: 30000 }, () => {
+    fixture.woodedHill = true; fixture.lateStreet = true
+    const map = generateCity({ ...DEFAULT_CONFIG, type: 'newtown', density: 0, railway: false, targetYear: 2025, facilities: ['university'] }, undefined, undefined, flatSurvey)
+    const university = map.buildings.filter(building => building.id.startsWith('facility-building-university'))
+    expect(university.length).toBeGreaterThanOrEqual(3)
+    expect(university.every(building => building.builtYear === 1975)).toBe(true)
+    expect(map.unplacedFacilities).toEqual([])
+  })
+
+  it('does not create a university when it was not requested', { timeout: 30000 }, () => {
+    const map = generateCity({ ...DEFAULT_CONFIG, type: 'newtown', density: 0, railway: false, targetYear: 2025, facilities: [] }, undefined, undefined, flatSurvey)
+    expect(map.facilities.some(facility => facility.kind === 'university')).toBe(false)
+    expect(map.buildings.some(building => building.id.startsWith('facility-building-university'))).toBe(false)
+  })
+
+  it('archives every acquired university building and internal path before relocating the campus', { timeout: 30000 }, () => {
+    fixture.woodedHill = true
+    const config = { ...DEFAULT_CONFIG, type: 'newtown' as const, density: 0, railway: false, facilities: ['university' as const] }
+    const before = generateCity({ ...config, targetYear: 1975 }, undefined, undefined, flatSurvey)
+    fixture.cut = before.facilities.find(f => f.kind === 'university')!.point; fixture.cutYear = 1985
+    const after = generateCity({ ...config, targetYear: 2025 }, undefined, undefined, flatSurvey)
+    expect(after.buildings.filter(building => building.id.startsWith('facility-building-university-relocation-')).length).toBeGreaterThanOrEqual(3)
+    for (const building of before.buildings.filter(building => building.id.startsWith('facility-building-university'))) {
+      expect(after.buildings.some(current => current.id === building.id)).toBe(false)
+      expect(after.timeline!.buildings.some(version => version.value.id === building.id && version.to === 1985)).toBe(true)
+      expect(after.events!.some(event => event.entityId === building.id && event.kind === 'acquisition' && event.year === 1985)).toBe(true)
+    }
+    for (const road of before.roads.filter(road => road.id.startsWith('facility-access-university'))) {
+      expect(after.roads.some(current => current.id === road.id)).toBe(false)
+      expect(after.timeline!.roads.some(version => version.value.id === road.id && version.to === 1985)).toBe(true)
+    }
   })
 })

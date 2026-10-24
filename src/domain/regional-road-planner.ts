@@ -24,6 +24,12 @@ export class RegionalRoadPlanner {
     this.railwayCorridors = corridors.slice()
     this.planner.setRailwayCorridors(corridors.map(corridor => ({ ...corridor, points: corridor.points.map(p => ({ x: p.x + this.padding, y: p.y + this.padding })) })))
   }
+  setRailwayRoadNetwork(roads: readonly import('./types').Road[]) {
+    this.planner.setRailwayRoadNetwork(roads.map(road => ({ ...road, points: road.points.map(point => ({ x: point.x + this.padding, y: point.y + this.padding })) })))
+  }
+  railwayAllows(points: Point[], role: import('./road-graph').RoadRole) {
+    return this.planner.railwayAllows(points.map(point => ({ x: point.x + this.padding, y: point.y + this.padding })), role)
+  }
   constructor(environment: PlanningEnvironment, padding = 450) {
     const continuation = environment.terrain?.continuationTerrain
     if (!continuation) throw new Error('Regional roads require actual surrounding terrain samples')
@@ -58,6 +64,12 @@ export class RegionalRoadPlanner {
     const route = this.planner.plan(this.move(start), this.move(goal), { ...options, ...(options.through ? { through: this.move(options.through) } : {}) })
     const local = (p: Point): Point => ({ x: p.x - this.padding, y: p.y - this.padding })
     return route ? { ...route, points: route.points.map(local), ...(route.surveyedBridgeSpans ? { surveyedBridgeSpans: route.surveyedBridgeSpans.map(span => ({ bankA: local(span.bankA), bankB: local(span.bankB) })) } : {}) } : null
+  }
+  /** Existing relative construction-credit proxy over the surveyed terrain;
+   * this is neither currency nor the A* priority/heuristic. */
+  cost(points: Point[], role: import('./road-graph').RoadRole, surveyedBridge = false): PlannedRoute {
+    const route = this.planner.cost(points.map(point => this.move(point)), role, surveyedBridge)
+    return { ...route, points: route.points.map(point => ({ x: point.x - this.padding, y: point.y - this.padding })) }
   }
   /** A real surveyed endpoint beyond the displayed edge, shared by regional programmes. */
   beyondBoundary(edgeSite: Point, offset = 0): Point {

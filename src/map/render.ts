@@ -4,6 +4,8 @@ import { waterGeometry } from './water-surfaces'
 import { areaLabelPoint } from './area-labels'
 import { seaDepthRaster, seaDepthRgb } from './bathymetry'
 import { landPaintGroups } from './land-paint'
+import { subwayInk, SUBWAY_DASH, SUBWAY_LINE_WIDTH } from './railway-style'
+import { woodlandCrowns, WOODLAND_TEXTURE_MIN_SCALE } from './woodland-texture'
 
 export type LayerSettings = {
   buildings: boolean
@@ -56,7 +58,7 @@ export const PALETTES = {
 } as const
 
 export const FACILITY_SYMBOLS: Record<string, string> = {
-  castle: '城', shrine: '社', school: '文', hospital: '+', police: '交', shop: '店', park: '公', port: '港', onsen: '湯',
+  castle: '城', shrine: '社', school: '文', university: '大', hospital: '+', police: '交', shop: '店', park: '公', port: '港', onsen: '湯',
 }
 
 export const MAP_FONT = '"Noto Sans JP", "Yu Gothic", "Hiragino Kaku Gothic ProN", sans-serif'
@@ -91,40 +93,28 @@ export function areaColor(area: Area, style: MapStyle): string {
   if (area.id.startsWith('castle-courtyard-')) return style === 'standard' ? '#e2dfce' : style === 'mono' ? '#e5e5e5' : '#4b5146'
   if (!area.landUse || area.landUse === 'farmland') return PALETTES[style][area.kind]
   const colors = {
-    standard: { meadow: '#dfe7d5', wetland: '#cdded5', vacant: '#e8eadd', paddy: '#cbdab8', 'dry-field': '#e2d9b9' },
-    mono: { meadow: '#ededed', wetland: '#e1e1e1', vacant: '#f2f2f2', paddy: '#dadada', 'dry-field': '#e7e7e7' },
-    night: { meadow: '#394c3c', wetland: '#344e47', vacant: '#3e4940', paddy: '#415744', 'dry-field': '#5a523d' },
+    standard: { meadow: '#e7ebd7', woodland: '#d6e1c4', wetland: '#cdded5', vacant: '#e8eadd', paddy: '#cbdab8', 'dry-field': '#e2d9b9' },
+    mono: { meadow: '#f0f0f0', woodland: '#e3e3e3', wetland: '#e1e1e1', vacant: '#f2f2f2', paddy: '#dadada', 'dry-field': '#e7e7e7' },
+    night: { meadow: '#414e3d', woodland: '#354f3e', wetland: '#344e47', vacant: '#3e4940', paddy: '#415744', 'dry-field': '#5a523d' },
   }
   return colors[style][area.landUse]
 }
 
-function noise(x: number, y: number) {
-  const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123
-  return n - Math.floor(n)
-}
-
-function terrainTexture(ctx: CanvasRenderingContext2D, polygon: Point[], color: string, dark: string, scale: number, holes?: Point[][]) {
+function terrainTexture(ctx: CanvasRenderingContext2D, regions: Pick<Area, 'polygon' | 'holes'>[], color: string, dark: string, scale: number, sparse = false) {
   // Woodland is a continuous land cover at neighbourhood/city scales. Canopy
   // detail appears only close up and stays quieter than streets and buildings.
-  if (!polygon.length || scale < .8) return
-  const minX = Math.min(...polygon.map(p => p.x))
-  const maxX = Math.max(...polygon.map(p => p.x))
-  const minY = Math.min(...polygon.map(p => p.y))
-  const maxY = Math.max(...polygon.map(p => p.y))
+  if (!regions.length || scale < WOODLAND_TEXTURE_MIN_SCALE) return
   ctx.save()
-  traceRegion(ctx, { polygon, holes })
+  ctx.beginPath()
+  for (const region of regions) for (const ring of [region.polygon, ...region.holes ?? []]) {
+    if (!ring.length) continue
+    ctx.moveTo(ring[0]!.x, ring[0]!.y); for (const p of ring.slice(1)) ctx.lineTo(p.x, p.y); ctx.closePath()
+  }
   ctx.clip('evenodd')
   // Tree crowns are fixed in world space, so panning and exporting keep the same woodland.
-  const spacing = 45
-  for (let x = Math.floor(minX / spacing) * spacing; x < maxX; x += spacing) {
-    for (let y = Math.floor(minY / spacing) * spacing; y < maxY; y += spacing) {
-      const v = noise(x, y)
-      ctx.fillStyle = v > .5 ? color : dark
-      ctx.globalAlpha = .05 + v * .035
-      ctx.beginPath()
-      ctx.arc(x + noise(x + 5, y) * spacing, y + noise(x, y + 7) * spacing, 6 + v * 7, 0, Math.PI * 2)
-      ctx.fill()
-    }
+  for (const crown of woodlandCrowns(regions, sparse)) {
+    ctx.fillStyle = crown.dark ? dark : color; ctx.globalAlpha = crown.opacity
+    ctx.beginPath(); ctx.arc(crown.x, crown.y, crown.radius, 0, Math.PI * 2); ctx.fill()
   }
   ctx.restore()
 }
@@ -204,7 +194,9 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
       ctx.fillStyle = areaColor(area, style)
       ctx.fill('evenodd')
       if (area.kind === 'forest') {
-        terrainTexture(ctx, area.polygon, colors.tree, colors.treeDark, scale, area.holes)
+        terrainTexture(ctx, group, colors.tree, colors.treeDark, scale)
+      } else if (area.landUse === 'woodland') {
+        terrainTexture(ctx, group, colors.tree, colors.treeDark, scale, true)
       }
     }
     const water = waterGeometry(map.areas)
@@ -217,7 +209,10 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
         ctx.restore()
       }
     }
-    ctx.lineWidth = .6 / scale; ctx.strokeStyle = colors.waterEdge
+    // A fixed screen-space casing doubles the apparent width of sub-pixel
+    // tributaries at regional scale. Keep their surveyed water footprint and
+    // cap the bank casing in metres, matching the vector export.
+    ctx.lineWidth = Math.min(.6 / scale, 1.5); ctx.strokeStyle = colors.waterEdge
     for (const shoreline of water.shorelines) { traceRegion(ctx, shoreline); ctx.stroke() }
   }
 
@@ -288,8 +283,16 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
   }
 
   if (layers.railway) {
+    if (layers.buildings) for (const station of map.stations) if (station.buildingPolygon) {
+      tracePath(ctx, station.buildingPolygon, true); ctx.fillStyle = colors.public; ctx.fill(); ctx.strokeStyle = colors.buildingEdge; ctx.lineWidth = .6 / scale; ctx.stroke()
+    }
     for (const rail of map.railways) {
       tracePath(ctx, rail.points)
+      if (rail.mode === 'subway') {
+        ctx.strokeStyle = colors.halo; ctx.lineWidth = (SUBWAY_LINE_WIDTH + 2) / scale; ctx.stroke()
+        ctx.strokeStyle = subwayInk(style); ctx.lineWidth = SUBWAY_LINE_WIDTH / scale; ctx.setLineDash(SUBWAY_DASH.map(value => value / scale)); ctx.stroke(); ctx.setLineDash([])
+        continue
+      }
       ctx.strokeStyle = colors.railwayInner
       ctx.lineWidth = 5.5 / scale
       ctx.stroke()
@@ -337,6 +340,12 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
   if (layers.railway) {
     for (const station of map.stations) {
       const p = station.point
+      if (station.mode === 'subway') {
+        const ink = subwayInk(style)
+        ctx.beginPath(); ctx.arc(p.x, p.y, 6 / scale, 0, Math.PI * 2); ctx.fillStyle = colors.halo; ctx.fill(); ctx.strokeStyle = ink; ctx.lineWidth = 2 / scale; ctx.stroke()
+        if (layers.labels) label(station.name, p, ink, 11, 700, true, 16 / scale)
+        continue
+      }
       const w = 11 / scale
       ctx.fillStyle = colors.halo
       ctx.fillRect(p.x - w / 2 - 1 / scale, p.y - w / 2 - 1 / scale, w + 2 / scale, w + 2 / scale)

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Area, Point } from './types'
 import { RoadPlanner } from './road-planner'
 import { RegionalRoadPlanner } from './regional-road-planner'
@@ -35,6 +35,22 @@ function fixture(blockDownstream = false, headInside = false, elevatedBridge = f
 }
 
 describe('regional through-road in a small mountain settlement', () => {
+  it('declines a physical route when section-level construction credits exceed the regional appropriation', () => {
+    const { planner, regionalPlanner } = fixture(), evaluate = regionalPlanner.cost.bind(regionalPlanner)
+    const credits = vi.spyOn(regionalPlanner, 'cost').mockImplementation((points, role, bridge) => ({ ...evaluate(points, role, bridge), cost: 1_000_000 }))
+    expect(planValleyThroughRoad({ width, height, origin, river, planner, regionalPlanner })).toBeNull()
+    expect(credits).toHaveBeenCalled()
+  })
+  it('checks railway crossings again over both assembled regional legs', () => {
+    const { planner, regionalPlanner } = fixture()
+    const guard = vi.spyOn(regionalPlanner, 'railwayAllows').mockReturnValue(false)
+    expect(planValleyThroughRoad({ width, height, origin, river, planner, regionalPlanner })).toBeNull()
+    expect(guard).toHaveBeenCalled()
+    const points = guard.mock.calls[0]![0]
+    expect(points.some(point => Math.hypot(point.x - origin.x, point.y - origin.y) < .01)).toBe(true)
+    expect(points[0]!.y).toBeLessThan(0)
+    expect(points.at(-1)!.y).toBeGreaterThan(height)
+  })
   it('funds one continuous modern national road independently of village population and the local historical lanes', () => {
     const { input, regionalPlanner } = fixture()
     const without = simulateUrbanGrowth({ ...input, arterial: false }), withRoad = simulateUrbanGrowth({ ...input, arterial: true })

@@ -2,6 +2,8 @@ import type { Point } from './types'
 
 interface CoastalWindowInput {
   width: number; height: number; extent: number; margin: number; mirrored: boolean
+  preferredBearing?: number
+  landform?: 'peninsula'
   candidates: { index: number; point: Point; score: number }[]
   seaAt(p: Point): boolean
   usableAt(p: Point): boolean
@@ -26,28 +28,47 @@ export function coastalWindow(input: CoastalWindowInput): CoastalWindow | null {
       const angle = j * Math.PI / 8, p = { x: site.point.x + Math.cos(angle) * radius, y: site.point.y + Math.sin(angle) * radius }
       if (input.seaAt(p)) { seaX += Math.cos(angle); seaY += Math.sin(angle) }
     }
-    const facing = Math.hypot(seaX, seaY) > .1 ? Math.atan2(seaY, seaX) - Math.PI / 2 : 0
+    const seaBearing = Math.hypot(seaX, seaY) > .1 ? Math.atan2(seaY, seaX) : Math.PI / 2
+    const facing = seaBearing - Math.PI / 2
     // At a regional corner the locally coast-facing frame can be pushed far
     // inland by the support margin. Survey other bearings before accepting an
     // inland window; the actual coastline and terrain remain unchanged.
     const bearings = [facing, facing - .18, facing + .18, ...Array.from({ length: 16 }, (_, i) => i * Math.PI / 8)]
     for (const angle of bearings) for (const fraction of [.56, .70, .82]) {
-      const localAnchor = { x: width * .5, y: height * fraction }, c = Math.cos(angle), s = Math.sin(angle)
+      const c = Math.cos(angle), s = Math.sin(angle)
+      // Place the coast toward its actual seaward side of this bearing. A
+      // fixed x=.5/y>.5 anchor forced the sea to the bottom of every map.
+      const normal = seaBearing - angle, offsetFraction = fraction - .5
+      const localAnchor = { x: width * (.5 + mirror * Math.cos(normal) * offsetFraction), y: height * (.5 + Math.sin(normal) * offsetFraction) }
       const offset = (p: Point) => ({ x: c * mirror * (p.x - localAnchor.x) - s * (p.y - localAnchor.y), y: s * mirror * (p.x - localAnchor.x) + c * (p.y - localAnchor.y) })
       const corners = [{ x: -margin, y: -margin }, { x: width + margin, y: -margin }, { x: -margin, y: height + margin }, { x: width + margin, y: height + margin }].map(offset)
       const minX = 100 - Math.min(...corners.map(p => p.x)), maxX = extent - 100 - Math.max(...corners.map(p => p.x)), minY = 100 - Math.min(...corners.map(p => p.y)), maxY = extent - 100 - Math.max(...corners.map(p => p.y))
       if (minX > maxX || minY > maxY) continue
       const worldAnchor = { x: clamp(site.point.x, minX, maxX), y: clamp(site.point.y, minY, maxY) }
-      let sea = 0, usable = 0
+      let sea = 0, usable = 0, wrappingRows = 0, wrappingColumns = 0
+      const columnPrevious = new Uint8Array(16), columnTransitions = new Uint8Array(16)
+      let rowTransitions = 0, rowPrevious = false
       for (let y = 0; y < 12; y++) for (let x = 0; x < 16; x++) {
         const p = offset({ x: width * (x + .5) / 16, y: height * (y + .5) / 12 }), q = { x: worldAnchor.x + p.x, y: worldAnchor.y + p.y }
-        if (input.seaAt(q)) sea++
+        const wet = input.seaAt(q)
+        if (wet) sea++
         else if (input.usableAt(q)) usable++
+        if (input.landform === 'peninsula') {
+          if (!x) rowTransitions = 0
+          else if (wet !== rowPrevious) rowTransitions++
+          if (y && Number(wet) !== columnPrevious[x]) columnTransitions[x]++
+          columnPrevious[x] = Number(wet); rowPrevious = wet
+          if (x === 15 && rowTransitions >= 2) wrappingRows++
+          if (y === 11 && columnTransitions[x]! >= 2) wrappingColumns++
+        }
       }
       const seaFraction = sea / 192, usableFraction = usable / 192
       // Balanced framing is a map-selection preference, not a target supplied
       // to the erosion or sea-level calculation. Keep useful land and real sea.
-      const cost = site.score * .1 + Math.abs(seaFraction - .3) * 3 + Math.max(0, .12 - seaFraction) * 35 + Math.max(0, seaFraction - .65) * 20 - usableFraction + Math.hypot(worldAnchor.x - site.point.x, worldAnchor.y - site.point.y) / 800
+      const targetSea = input.landform === 'peninsula' ? .45 : .3
+      const wrapping = input.landform === 'peninsula' ? Math.max(wrappingRows / 12, wrappingColumns / 16) * .45 : 0
+      const bearingCost = input.preferredBearing === undefined ? 0 : (1 - Math.cos(angle - input.preferredBearing)) * .08
+      const cost = site.score * .1 + Math.abs(seaFraction - targetSea) * 3 + Math.max(0, .12 - seaFraction) * 35 + Math.max(0, seaFraction - .65) * 20 - usableFraction - wrapping + bearingCost + Math.hypot(worldAnchor.x - site.point.x, worldAnchor.y - site.point.y) / 800
       if (cost < bestCost) { bestCost = cost; best = { index: site.index, worldAnchor, localAnchor, angle, seaFraction, usableFraction } }
     }
   }

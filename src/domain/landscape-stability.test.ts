@@ -17,17 +17,35 @@ describe('landscape numerical stability', () => {
   it('respects the discrete maximum principle at the capped four-face diffusion coefficient', () => {
     const n = 23, raw = Float32Array.from({ length: n * n }, (_, i) => 240 * Math.sin(i * 17.31) - 120 * Math.cos(i * 3.15))
     const result = transportHillslope({ elevation: raw, alluvium: new Float64Array(raw.length), columns: n, rows: n, cellSize: 50, coefficient: 10, seaLevel: 0 })
-    for (let y = 1; y < n - 1; y++) for (let x = 1; x < n - 1; x++) {
-      const i = y * n + x, neighbors = [raw[i]!, raw[i - 1]!, raw[i + 1]!, raw[i - n]!, raw[i + n]!]
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      const i = y * n + x, neighbors = [raw[i]!]
+      if (x) neighbors.push(raw[i - 1]!)
+      if (x + 1 < n) neighbors.push(raw[i + 1]!)
+      if (y) neighbors.push(raw[i - n]!)
+      if (y + 1 < n) neighbors.push(raw[i + n]!)
       expect(result.elevation[i]).toBeGreaterThanOrEqual(Math.min(...neighbors))
       expect(result.elevation[i]).toBeLessThanOrEqual(Math.max(...neighbors))
       expect(result.alluvium[i]).toBeGreaterThanOrEqual(0)
     }
-    for (let i = 0; i < n; i++) {
-      expect(result.elevation[i]).toBe(raw[i])
-      expect(result.elevation[(n - 1) * n + i]).toBe(raw[(n - 1) * n + i])
-      expect(result.elevation[i * n]).toBe(raw[i * n])
-    }
+    // Perimeter cells exchange through their real interior faces. Only the
+    // domain's exterior has zero flux; it cannot create a reservoir or drain.
+    expect(result.elevation[0]).not.toBe(raw[0])
+    const cellArea = 50 ** 2, initialVolume = raw.reduce((sum, z) => sum + z * cellArea, 0), finalVolume = result.elevation.reduce((sum, z) => sum + z * cellArea, 0)
+    const f32Roundoff = raw.length * Math.max(...Array.from(raw, Math.abs)) * 2 ** -23 * cellArea
+    expect(Math.abs(finalVolume - initialVolume)).toBeLessThanOrEqual(f32Roundoff)
+    expect(result.netTerrainVolume).toBeCloseTo(finalVolume - initialVolume, 5)
+    const looseVolume = result.alluvium.reduce((sum, z) => sum + z * cellArea, 0)
+    expect(Math.abs(looseVolume - result.bedrockSourceVolume)).toBeLessThan(Math.max(1, result.bedrockSourceVolume) * 1e-12)
+  })
+
+  it('preserves a constant surface and its loose layer through every boundary face', () => {
+    const columns = 11, rows = 7, elevation = new Float32Array(columns * rows).fill(25), alluvium = new Float64Array(elevation.length).fill(3)
+    const result = transportHillslope({ elevation, alluvium, columns, rows, cellSize: 50, coefficient: 10, seaLevel: 0 })
+    expect(result.elevation).toEqual(elevation)
+    expect(result.alluvium).toEqual(alluvium)
+    expect(result.transferredVolume).toBe(0)
+    expect(result.bedrockSourceVolume).toBe(0)
+    expect(result.netTerrainVolume).toBe(0)
   })
 
   it('routes f32-quantized near-flats to open boundaries without numerical cycles', () => {

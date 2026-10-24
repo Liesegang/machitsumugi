@@ -16,7 +16,7 @@ export function civicTransportAcquisitions(roads: Road[], railways: Railway[], u
   }
   for (const route of [
     ...roads.filter(road => !road.bridge && (road.level ?? 0) === 0).map(road => ({ ...road, mode: 'road' as const })),
-    ...railways.map(railway => ({ ...railway, width: 15, mode: 'railway' as const })),
+    ...railways.filter(railway => railway.mode !== 'subway').map(railway => ({ ...railway, width: 15, mode: 'railway' as const })),
   ]) {
     const year = route.builtYear ?? (route.mode === 'road' ? 1650 : 1900)
     if (year > untilYear) continue

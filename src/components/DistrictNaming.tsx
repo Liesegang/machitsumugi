@@ -23,10 +23,10 @@ export function DistrictNaming({ map, disabled, onApply }: { map: CityMap; disab
     } catch (err) { if (!request.signal.aborted) setFailure({ map, message: err instanceof Error ? err.message : '命名できませんでした。' }) }
     finally { if (controller.current === request) { controller.current = null; setActiveMap(null) } }
   }
-  return <section className="district-naming"><h2>区域と地名</h2><p className="muted">道路と集落から区域を分けます。地理条件に合う架空の地名候補を作り、小型LLMが区域の特徴に合わせて選びます。</p>
-    <p className="panel-footnote">Qwen3 1.7Bをブラウザ内で実行します。初回は約1GBのモデルを取得します。WebGPU対応のGPUが必要です。</p>
+  return <section className="district-naming"><details><summary>地名の提案</summary><p className="muted">区域の特徴に合う地名を、ブラウザ内の小型LLMで提案します。</p>
+    <p className="panel-footnote">初回に約1GBをダウンロードします。WebGPUが必要です。</p>
     {busy ? <><p role="status">{progress}</p><button className="secondary full" onClick={() => controller.current?.abort()}>命名を中止</button></> : <button className="secondary full" disabled={disabled || !map.districts.length} onClick={() => { void propose() }}>小型LLMで地名を提案</button>}
     {error && <p role="alert">{error}</p>}
     {!!proposals.length && <><p className="muted">区域の特徴と地名案を確認してから、表示中の年代の地図に反映できます。架空の命名です。</p><div className="name-proposals">{proposals.map(proposal => <label key={proposal.id}><input aria-label={`${proposal.id}の地名案`} maxLength={16} value={proposal.name} onChange={event => setBatch(old => old?.map === map ? { map, items: old.items.map(p => p.id === proposal.id ? { ...p, name: event.target.value, source: 'edited', reason: p.reason.replace('架空の候補から小型LLMが選びました。', '架空の候補をもとに利用者が編集しました。') } : p) } : old)} /><small>{proposal.reason}</small></label>)}</div><button className="primary full" disabled={disabled} onClick={() => { if (onApply(proposals)) setBatch(null) }}>地図に反映</button></>}
-  </section>
+  </details></section>
 }

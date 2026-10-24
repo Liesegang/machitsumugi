@@ -9,7 +9,7 @@ export type MapFeature =
   | { type: 'district'; item: District }
   | { type: 'area'; item: Area }
 const buildingNames = { residential: '住宅', commercial: '商業施設', public: '公共施設', industrial: '工業・倉庫' }
-const facilityNames = { castle: '城跡', shrine: '神社', school: '学校', hospital: '病院', police: '交番', shop: '商店街', park: '公園', port: '港', onsen: '共同浴場' }
+const facilityNames = { castle: '城跡', shrine: '神社', school: '学校', university: '大学', hospital: '病院', police: '交番', shop: '商店街', park: '公園', port: '港', onsen: '共同浴場' }
 export function featureTitle(feature: MapFeature): string {
   const item = feature.item
   if (feature.type === 'building') {
@@ -19,7 +19,7 @@ export function featureTitle(feature: MapFeature): string {
   if ('name' in item && item.name) return item.name
   if (feature.type === 'facility') return facilityNames[feature.item.kind]
   if (feature.type === 'road') return feature.item.role === 'expressway' ? '高速道路' : feature.item.bridge ? '橋梁' : feature.item.kind === 'arterial' ? '主要道路' : feature.item.role === 'farm' ? '農道' : '街路'
-  if (feature.type === 'area') return feature.item.landUse === 'paddy' ? '水田' : feature.item.landUse === 'dry-field' ? '畑' : feature.item.kind === 'forest' ? '森林' : feature.item.kind === 'water' ? '水域' : '土地'
+  if (feature.type === 'area') return feature.item.landUse === 'paddy' ? '水田' : feature.item.landUse === 'dry-field' ? '畑' : feature.item.landUse === 'woodland' ? '疎林' : feature.item.landUse === 'meadow' ? '草地' : feature.item.kind === 'forest' ? '森林' : feature.item.kind === 'water' ? '水域' : '土地'
   return '地区'
 }
 export function featureSummary(feature: MapFeature): string {
@@ -48,7 +48,7 @@ export function featureHistory(map: CityMap, feature: MapFeature): GrowthEvent[]
   if (feature.type === 'facility') {
     if (feature.item.id === `facility-${feature.item.kind}` || feature.item.id === 'origin') {
       const stems = [`facility-building-${feature.item.kind}`, `facility-lot-${feature.item.kind}`, `facility-access-${feature.item.kind}`]
-      const belongs = (id: string) => stems.some(stem => id === stem || id.startsWith(`${stem}-relocation-`))
+      const belongs = (id: string) => stems.some(stem => id === stem || id.startsWith(`${stem}-`))
       for (const event of map.events ?? []) if (belongs(event.entityId)) ids.add(event.entityId)
       for (const b of map.buildings) if (belongs(b.id) || feature.item.kind === 'castle' && b.id.startsWith('castle-')) ids.add(b.id)
     }

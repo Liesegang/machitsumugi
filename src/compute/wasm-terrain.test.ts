@@ -47,6 +47,45 @@ describe('deterministic terrain WASM', () => {
     expect(actual).toEqual(expected)
     expect(accelerated).toEqual(reference)
   })
+  it('matches shallow coastal filling and preserves actual supplied sediment across the marine capacity transition', () => {
+    const columns = 23, rows = 25
+    const raw = Float32Array.from({ length: columns * rows }, (_, i) => {
+      const x = i % columns, y = Math.floor(i / columns)
+      return y < 9 ? 1 + (9 - y) * 2 + Math.abs(x - 11) * 2 : -.05 - (y - 9) * .001
+    })
+    const options = { passes: 8, timeStepYears: 4000, sediment: true, diffusivity: 0 }
+    const actual = wasmErodeTerrain(raw, columns, rows, 50, options)!, reference = erodeTerrainJs(raw, columns, rows, 50, options)
+    expect(actual).toEqual(reference)
+    expect(actual.sediment.marineDepositedVolume).toBeGreaterThan(0)
+    expect(actual.sediment.exportedVolume).toBeGreaterThan(0)
+    expect(Math.abs(actual.sediment.massBalanceError) / actual.sediment.erodedSourceVolume).toBeLessThan(1e-12)
+  })
+
+  it('matches uplift on every perimeter cell, including underwater and single-row/column domains', () => {
+    for (const [columns, rows] of [[1, 1], [1, 7], [8, 1], [7, 9]]) {
+      const raw = new Float32Array(columns! * rows!).fill(-10), uplift = new Float32Array(raw.length).fill(.001)
+      const settings = { passes: 5, timeStepYears: 100, uplift, diffusivity: 0 }
+      const actual = wasmErodeTerrain(raw, columns!, rows!, 50, settings)!, reference = erodeTerrainJs(raw, columns!, rows!, 50, settings)
+      expect(actual).toEqual(reference)
+      for (const z of actual.rawDEM) expect(z).toBeCloseTo(-9.5, 5)
+      expect(actual.erosion.upliftVolume).toBeCloseTo(raw.length * .5 * 2500, 2)
+      expect(actual.erosion.erodedVolume).toBe(0)
+      expect(actual.erosion.terrainBalanceError).toBeCloseTo(0, 0)
+    }
+  })
+  it('matches conservative perimeter-to-interior hillslope faces instead of trapping uplifted boundary walls', () => {
+    for (const [columns, rows] of [[1, 3], [3, 1], [7, 9]]) {
+      const raw = new Float32Array(columns! * rows!), uplift = new Float32Array(raw.length).fill(.001)
+      raw[0] = 10
+      const settings = { passes: 8, timeStepYears: 100, uplift, diffusivity: 2.5, erodibility: new Float32Array(raw.length), sediment: true }
+      const actual = wasmErodeTerrain(raw, columns!, rows!, 50, settings)!, reference = erodeTerrainJs(raw, columns!, rows!, 50, settings)
+      expect(actual).toEqual(reference)
+      expect(actual.rawDEM[0]).toBeLessThan(raw[0]!)
+      expect(actual.rawDEM[1]).toBeGreaterThan(raw[1]!)
+      expect(actual.sediment.hillslopeTransferredVolume).toBeGreaterThan(0)
+      expect(Math.abs(actual.sediment.massBalanceError)).toBeLessThan(1e-7)
+    }
+  })
 
   it('owns returned arrays and does not mutate source fields or retained previews', () => {
     const raw = grid(13, 11, 5), source = raw.slice(), first = wasmRouteDrainage(raw, 13, 11, 100)!

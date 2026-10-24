@@ -85,7 +85,9 @@ export function transportSediment(input: SedimentInput): SedimentStep {
     // that drop as fill capacity let a newly emerged coast receive >100m in one
     // explicit step. Limit dry-cell aggradation per update; excess sediment
     // continues downstream and the next routing pass can move the mouth.
-    const accommodation = !marine[i] && lakeDepth > .01 ? lakeDepth : Math.max(cellSize * .025, marine[i] ? sea - elevation[i]! + .15 : 0)
+    // The dry-channel minimum must not overfill centimetres-deep sea by a
+    // whole 1.25m at 50m resolution. Marine capacity follows its actual bed.
+    const accommodation = marine[i] ? Math.max(0, sea - elevation[i]! + .15) : lakeDepth > .01 ? lakeDepth : cellSize * .025
     const settled = Math.min(volume * attenuation, accommodation * cellArea)
     deposition[i] = settled / cellArea
     depositedVolume += settled

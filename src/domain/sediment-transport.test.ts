@@ -44,6 +44,19 @@ describe('conservative erosion, transport and deposition', () => {
     expect(submergedRaised).toBeCloseTo(result.marineDepositedVolume, 5)
     expect(result.depositedVolume + result.exportedVolume).toBeCloseTo(220_000, 5)
   })
+  it.each([10, 50, 100])('limits very shallow marine aggradation to water accommodation at %sm resolution', (cellSize) => {
+    const n = 7, centre = 3 * n + 3, source = new Float64Array(n * n)
+    source[centre] = 10_000_000_000
+    for (const depth of [0, .05, .5, 1, 50]) {
+      const elevation = Float32Array.from({ length: n * n }, (_, i) => -depth - Math.floor(i / n) * .0001)
+      const drainage = routeDrainage(elevation, n, n, cellSize)
+      const result = transportSediment({ elevation, hydroElevation: drainage.hydroDEM, flowTo: drainage.flowTo, order: drainage.order, sourceVolume: source, columns: n, rows: n, cellSize })
+      expect(result.deposition[centre]).toBeCloseTo(-elevation[centre]! + .15, 8)
+      for (let i = 0; i < elevation.length; i++) expect(elevation[i]! + result.deposition[i]!).toBeLessThanOrEqual(.15 + 1e-10)
+      expect(result.exportedVolume).toBeGreaterThan(0)
+      expect(Math.abs(result.massBalanceError) / result.sourceVolume).toBeLessThan(1e-12)
+    }
+  })
   it('feeds actual incision into sediment, reroutes aggraded terrain and conserves the loose layer', () => {
     const columns = 31, rows = 51, raw = new Float32Array(columns * rows)
     for (let y = 0; y < rows; y++) for (let x = 0; x < columns; x++) raw[y * columns + x] = y < 25 ? 30 + (25 - y) * 2 + Math.abs(x - 15) * 2 : 30 - (y - 25) * .15

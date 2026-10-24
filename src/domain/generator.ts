@@ -29,6 +29,14 @@ import { buildDistricts } from './districts'
 import { civicTransportAcquisitions } from './civic-transport'
 import { resolveGenerationConfig } from './generation-config'
 import type { RegionalPreview } from './regional-terrain'
+import { planSubway } from './subway'
+import { surveyStationArchitecture } from './station-architecture'
+import { surveyUniversityCampus } from './civic-campus'
+import type { CampusProposal } from './civic-campus'
+import { civicWoodlandHistory } from './civic-woodland'
+import type { WoodlandClearing } from './civic-woodland'
+import { surveyDevelopmentSite } from './development-terrain'
+import { naturalWoodlandContours } from './natural-cover'
 
 export const DEFAULT_CONFIG: CityConfig = {
   name: '水杜市', seed: 'minato-2026', type: 'castle', terrain: 'river', relief: 'hills', density: 65, forest: 30,
@@ -42,8 +50,8 @@ export const CITY_PRESETS: { id: CityType; name: string; description: string }[]
   { id: 'post', name: '宿場町', description: '旧街道沿いの宿と商業から、細長い市街地が生まれます。' },
   { id: 'onsen', name: '温泉町', description: '谷の通り道と湯の周辺に、旅館街と集落が育ちます。' },
 ]
-const facilityNames: Record<FacilityKind, string> = { shrine: '八幡神社', school: '第一小学校', hospital: '市民病院', police: '中央交番', shop: '中央商店街', park: 'ふれあい公園', castle: '城跡公園', port: '港・魚市場', onsen: '共同浴場' }
-const facilityInception: Record<FacilityKind, number> = { shrine: 1650, school: 1875, hospital: 1920, police: 1880, shop: 1700, park: 1955, castle: 1650, port: 1650, onsen: 1650 }
+const facilityNames: Record<FacilityKind, string> = { shrine: '八幡神社', school: '第一小学校', university: '地域大学', hospital: '市民病院', police: '中央交番', shop: '中央商店街', park: 'ふれあい公園', castle: '城跡公園', port: '港・魚市場', onsen: '共同浴場' }
+const facilityInception: Record<FacilityKind, number> = { shrine: 1650, school: 1875, university: 1965, hospital: 1920, police: 1880, shop: 1700, park: 1955, castle: 1650, port: 1650, onsen: 1650 }
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
 function stationSiteSuitable(point: Point, terrain: ReturnType<typeof createTerrainModel>, areas: Area[]) {
@@ -168,6 +176,11 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     const name = kind === 'castle' ? `${config.name.replace(/[市町村]$/, '')}城跡` : '水明大社'
     areas.push({ id: 'historic-core', polygon: core, kind: 'park', name: selected ? name : undefined })
     if (selected) facilities.push({ id: 'origin', point: castle?.point ?? origin, kind, name })
+    if (kind === 'shrine' && selected) {
+      const polygon = rectangle(origin.x - 24, origin.y - 15, 48, 30)
+      const samples = [...polygon, origin, ...polygon.map((p, i) => ({ x: (p.x + polygon[(i + 1) % polygon.length]!.x) / 2, y: (p.y + polygon[(i + 1) % polygon.length]!.y) / 2 }))]
+      if (samples.every(p => pointInPolygon(p, core) && !naturalTerrain.waterAt(p) && naturalTerrain.slope(p) < .15 && !naturalTerrain.areas.some(area => area.kind !== 'field' && pointInRegion(p, area)))) buildings.push({ id: 'origin-shrine-building', polygon, kind: 'public', height: 2, builtYear: 1650, name })
+    }
     if (kind === 'castle') {
       areas.push(...castle!.areas, ...castle!.grounds)
       if (selected) buildings.push(...castle!.structures)
@@ -182,7 +195,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     const demand = scenarioDemandAtYear(config, 1900), totalWeight = historic.reduce((sum, center) => sum + center.weight, 0)
     const hubs = historic.map(center => ({ point: center.point, demand: (demand.households + demand.jobs * (config.type === 'port' ? 2 : .6)) * center.weight / Math.max(.1, totalWeight), reason: config.type === 'port' ? '既存港と地域鉄道を結ぶ旅客・荷役輸送' : '旧街道沿いの市場集落への鉄道接続' }))
     const railTerrain = { ...terrain, areas }
-    const railwayPlan = planRailway({ width: W, height: H, seed: config.seed, origin, terrain: railTerrain, core, settlements: hubs, inheritedRoads: inherited.roads, allowTerminus: config.terrain === 'coast' || config.type === 'port' })
+    const railwayPlan = planRailway({ width: W, height: H, seed: config.seed, origin, terrain: railTerrain, core, settlements: hubs, inheritedRoads: inherited.roads, allowTerminus: config.terrain === 'coast' || config.type === 'port' || config.type === 'onsen' })
     if (!railwayPlan) throw new Error('この地形では鉄道の勾配・曲率条件を満たす経路を確保できませんでした。鉄道を外すか、シードを変更してください。')
     onProgress?.('駅用地と既存街路への接続を確認中…')
     const points = railwayPlan.points
@@ -215,9 +228,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     for (const [i, point] of mainSites.entries()) {
       const dx = point.x - centralPoint.x, dy = point.y - centralPoint.y, direction = Math.abs(dx) > Math.abs(dy) ? dx < 0 ? '西' : '東' : dy < 0 ? '北' : '南'
       const name = i === centerStation ? `${base}駅` : `${direction}${base}${mainCount > 3 && i > 0 && i < mainCount - 1 ? '本町' : ''}駅`
-      stations.push({ id: `station-${i}`, name, point })
+      stations.push({ id: `station-${i}`, name, point, railwayId: 'railway-main', builtYear: 1900 })
     }
-    for (const [i, point] of branchStations.entries()) stations.push({ id: `station-${mainCount + i}`, name: `${base}${config.type === 'port' ? '港' : i ? '本町' : '中央'}駅`, point })
+    for (const [i, point] of branchStations.entries()) stations.push({ id: `station-${mainCount + i}`, name: `${base}${config.type === 'port' ? '港' : i ? '本町' : '中央'}駅`, point, railwayId: `railway-branch-${i}`, builtYear: 1900 })
     for (const station of stations) { const route = stationAccess(station.point, stationSurvey); if (route) stationAccessProjects.push({ station: station.point, route }) }
     preview(inherited.roads, railways, stations, buildings, 'railway')
     return { stationPoints: stations.map(s => s.point), stationAccessProjects, railwayCorridors: railways }
@@ -225,9 +238,10 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   const civicPopulations = new Map<number, { point: Point; households: number }[]>()
   const growth = simulateUrbanGrowth({ ...config, width: W, height: H, seed: config.seed, type: config.type, center: origin, core, areas, arterial: config.arterial, railway: config.railway && year >= 1900, stationPoints: [], onRailwayPlanning: config.railway && year >= 1900 ? configureRailway : undefined, terrainModel: terrain, bridgeSites: terrain.bridgeSites, untilYear: year, era: config.era, density: config.density, onProgress: year => onProgress?.(`街路・土地利用を計算 · ${year}年`), onPreview: (roads, asOf) => preview(roads, railways, stations, buildings, 'roads', asOf), onCivicPopulation: config.facilities.includes('park') ? (asOf, population) => civicPopulations.set(asOf, population) : undefined })
   const roads: Road[] = growth.roads
+  const retiredCivicRoads: TimelineVersion<Road>[] = []
   const growthRoadIds = new Set(growth.roadHistory.map(version => version.value.id))
-  const roadsAt = (asOf: number): Road[] => [...growth.roadHistory.filter(version => version.from <= asOf && (version.to === undefined || asOf < version.to)).map(version => version.value), ...roads.filter(road => !growthRoadIds.has(road.id) && (road.builtYear ?? 1650) <= asOf)]
-  const routeVersions = () => [...new Set([...roads, ...growth.roadHistory.map(version => version.value)])]
+  const roadsAt = (asOf: number): Road[] => [...growth.roadHistory.filter(version => version.from <= asOf && (version.to === undefined || asOf < version.to)).map(version => version.value), ...retiredCivicRoads.filter(version => version.from <= asOf && asOf < version.to!).map(version => version.value), ...roads.filter(road => !growthRoadIds.has(road.id) && (road.builtYear ?? 1650) <= asOf)]
+  const routeVersions = () => [...new Set([...roads, ...growth.roadHistory.map(version => version.value), ...retiredCivicRoads.map(version => version.value)])]
   const ensureRoadJunction = (id: string, point: Point) => {
     for (const road of routeVersions().filter(road => road.id === id)) {
       if (road.points.some(p => distance(p, point) < 1e-7)) continue
@@ -261,7 +275,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       for (const junction of junctions) if (distance(points.at(-1)!, junction.point) > 1e-7) points.push(junction.point)
       if (distance(points.at(-1)!, b) > 1e-7) points.push(b)
     }
-    roads.push({ ...road, points })
+    const connected = { ...road, points }
+    roads.push(connected)
+    return connected
   }
   if (castle) {
     const approach = surveyCastleAccess({ castle, width: W, height: H, roads: roadsAt(1650), areas, terrain })
@@ -308,32 +324,32 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
 
   type Segment = { a: Point; b: Point; pad: number; bounds: Bounds; year: number; to?: number }
   const transport = spatialIndex<Segment>()
-  const datedRoads = (): TimelineVersion<Road>[] => [...growth.roadHistory, ...roads.filter(road => !growthRoadIds.has(road.id)).map(road => ({ from: road.builtYear ?? 1650, value: road }))]
-  for (const version of [...datedRoads(), ...railways.map(railway => ({ from: railway.builtYear ?? 1900, value: { ...railway, width: 15 }, to: undefined }))]) for (let i = 1; i < version.value.points.length; i++) {
+  const datedRoads = (): TimelineVersion<Road>[] => [...growth.roadHistory, ...retiredCivicRoads, ...roads.filter(road => !growthRoadIds.has(road.id)).map(road => ({ from: road.builtYear ?? 1650, value: road }))]
+  for (const version of [...datedRoads(), ...railways.filter(railway => railway.mode !== 'subway').map(railway => ({ from: railway.builtYear ?? 1900, value: { ...railway, width: 15 }, to: undefined }))]) for (let i = 1; i < version.value.points.length; i++) {
     const road = version.value
     const a = road.points[i - 1]!, b = road.points[i]!, pad = road.width / 2 + 2
     const bounds = boundsOf([a, b]); bounds.minX -= pad; bounds.maxX += pad; bounds.minY -= pad; bounds.maxY += pad
     transport.add({ a, b, pad, bounds, year: version.from, to: version.to })
   }
-  const obstacle = (area: Area, year = 0) => ({ polygon: area.polygon, holes: area.holes, bounds: boundsOf(area.polygon), year })
+  const obstacle = (area: Area, year = 0) => ({ polygon: area.polygon, holes: area.holes, bounds: boundsOf(area.polygon), year, kind: area.kind })
   const obstacles = areas.filter(a => a.kind !== 'field').map(a => obstacle(a))
   const footprints = spatialIndex<{ building: Building; bounds: Bounds }>()
   const reserves: { polygon: Point[]; bounds: Bounds; year: number }[] = []
   const landRetired = new Map<Point[], number>(), buildingRetired = new Map<string, number>()
   const reserveActive = (reserve: (typeof reserves)[number], asOf: number) => reserve.year <= asOf && (landRetired.get(reserve.polygon) ?? Infinity) > asOf
-  const canBuild = (polygon: Point[], checkReserve = true, asOf: number = year) => {
+  const canBuild = (polygon: Point[], checkReserve = true, asOf: number = year, allowWoodland = false) => {
     const bounds = boundsOf(polygon)
     if (harbor && asOf < harbor.constructionYear && harbor.reclaimedRegions.some(region => polygonOverlapsRegion(polygon, region))) return false
     if (harbor && asOf < harbor.constructionYear && preHarborWoodland.some(region => polygonOverlapsRegion(polygon, region))) return false
     if (bounds.minX < 18 || bounds.maxX > W - 18 || bounds.minY < 18 || bounds.maxY > H - 18 || (checkReserve && reserves.some(b => reserveActive(b, asOf) && overlaps(b.bounds, bounds) && polygonsOverlap(polygon, b.polygon)))) return false
-    if (obstacles.some(o => o.year <= asOf && (landRetired.get(o.polygon) ?? Infinity) > asOf && overlaps(bounds, o.bounds) && polygonOverlapsRegion(polygon, o))) return false
+    if (obstacles.some(o => (!allowWoodland || o.kind !== 'forest') && o.year <= asOf && (landRetired.get(o.polygon) ?? Infinity) > asOf && overlaps(bounds, o.bounds) && polygonOverlapsRegion(polygon, o))) return false
     for (const record of footprints.query(bounds)) if ((record.building.builtYear ?? 1700) <= asOf && (buildingRetired.get(record.building.id) ?? Infinity) > asOf && polygonsOverlap(polygon, record.building.polygon)) return false
     for (const s of transport.query(bounds)) if (s.year <= asOf && (s.to === undefined || asOf < s.to) && (pointInPolygon(s.a, polygon) || pointInPolygon(s.b, polygon) || polygon.some((p, i) => segmentsCross(p, polygon[(i + 1) % polygon.length]!, s.a, s.b) || distanceToSegment(p, s.a, s.b) < s.pad || distanceToSegment(s.a, p, polygon[(i + 1) % polygon.length]!) < s.pad || distanceToSegment(s.b, p, polygon[(i + 1) % polygon.length]!) < s.pad))) return false
     return true
   }
-  const addBuilding = (building: Building, checkReserve = true, asOf: number = year) => {
+  const addBuilding = (building: Building, checkReserve = true, asOf: number = year, allowWoodland = false) => {
     building.polygon = building.polygon.map(p => ({ x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 }))
-    if (!canBuild(building.polygon, checkReserve, asOf)) return false
+    if (!canBuild(building.polygon, checkReserve, asOf, allowWoodland)) return false
     buildings.push(building); footprints.add({ building, bounds: boundsOf(building.polygon) }); return true
   }
 
@@ -353,7 +369,27 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       if (polygon.every(p => pointInRegion(p, yard)) && addBuilding({ id: `harbor-warehouse-${i}`, polygon, kind: 'industrial', height: 1, builtYear: 1920 }, false)) break
     }
   }
-  const availableAt = (asOf: number, reach = 120) => candidates.filter(p => naturalTerrain.slope(p) < .18 && canBuild(rectangle(p.x - 32, p.y - 32, 64, 64), false, asOf)).map(point => ({ point, access: nearestRoad(point, asOf) })).filter(c => c.access && c.access.distance < reach && c.access.distance > 36)
+  const availableAt = (asOf: number, reach = 120, allowWoodland = false) => {
+    const streets = roadsAt(asOf).filter(road => !road.bridge && !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && road.role !== 'farm')
+    if (!streets.length) return []
+    const segments = spatialIndex<{ road: Road; a: Point; b: Point; segment: number; bounds: Bounds }>()
+    const streetBounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity }
+    for (const road of streets) for (let i = 1; i < road.points.length; i++) {
+      const a = road.points[i - 1]!, b = road.points[i]!, bounds = boundsOf([a, b])
+      segments.add({ road, a, b, bounds, segment: i - 1 }); streetBounds.minX = Math.min(streetBounds.minX, bounds.minX); streetBounds.minY = Math.min(streetBounds.minY, bounds.minY); streetBounds.maxX = Math.max(streetBounds.maxX, bounds.maxX); streetBounds.maxY = Math.max(streetBounds.maxY, bounds.maxY)
+    }
+    const sites: { point: Point; access: NonNullable<ReturnType<typeof nearestRoad>> }[] = []
+    for (const point of candidates) {
+      if (point.x < streetBounds.minX - reach || point.x > streetBounds.maxX + reach || point.y < streetBounds.minY - reach || point.y > streetBounds.maxY + reach || naturalTerrain.slope(point) >= .18) continue
+      let access: NonNullable<ReturnType<typeof nearestRoad>> | undefined
+      for (const segment of segments.query({ minX: point.x - reach, minY: point.y - reach, maxX: point.x + reach, maxY: point.y + reach })) {
+        const p = projectPoint(point, segment.a, segment.b), d = distance(point, p)
+        if (!access || d < access.distance) access = { road: segment.road, point: p, segment: segment.segment, distance: d }
+      }
+      if (access && access.distance > 36 && access.distance < reach && canBuild(rectangle(point.x - 32, point.y - 32, 64, 64), false, asOf, allowWoodland)) sites.push({ point, access })
+    }
+    return sites
+  }
   const reserveCostAt = (asOf: number) => {
     const active = reserves.filter(reserve => reserveActive(reserve, asOf))
     return (point: Point) => active.some(reserve => point.x >= reserve.bounds.minX && point.x <= reserve.bounds.maxX && point.y >= reserve.bounds.minY && point.y <= reserve.bounds.maxY && pointInPolygon(point, reserve.polygon)) ? Infinity : 0
@@ -363,31 +399,34 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     return reserves.filter(reserve => reserveActive(reserve, asOf) && overlaps(bounds, reserve.bounds)).every(reserve => !polygonOverlapsRegion(polygon, reserve))
   })
   const facilityLot = (kind: FacilityKind, point: Point, access: NonNullable<ReturnType<typeof nearestRoad>>, neighbourhood = false) => {
-    const width = neighbourhood ? 48 : kind === 'school' || kind === 'port' ? 108 : kind === 'hospital' ? 88 : kind === 'police' ? 46 : 74
-    const depth = neighbourhood ? 42 : kind === 'school' ? 88 : kind === 'port' ? 80 : kind === 'hospital' ? 70 : kind === 'police' ? 48 : 68
+    const width = neighbourhood ? 48 : kind === 'university' ? 220 : kind === 'park' ? 144 : kind === 'school' || kind === 'port' ? 108 : kind === 'hospital' ? 88 : kind === 'police' ? 46 : 74
+    const depth = neighbourhood ? 42 : kind === 'university' ? 180 : kind === 'park' ? 116 : kind === 'school' ? 88 : kind === 'port' ? 80 : kind === 'hospital' ? 70 : kind === 'police' ? 48 : 68
     const nx = (point.x - access.point.x) / access.distance, ny = (point.y - access.point.y) / access.distance
     const tr = (x: number, y: number) => ({ x: point.x + ny * x + nx * y, y: point.y - nx * x + ny * y })
     const rect = (x: number, y: number, w: number, h: number) => rectangle(x, y, w, h).map(p => tr(p.x, p.y))
     const building = kind === 'school' ? [{ x: -40, y: -24 }, { x: 40, y: -24 }, { x: 40, y: -5 }, { x: 0, y: -5 }, { x: 0, y: 19 }, { x: -40, y: 19 }].map(p => tr(p.x, p.y)) : kind === 'port' ? rect(-40, -22, 80, 44) : kind === 'hospital' ? rect(-32, -23, 64, 46) : kind === 'police' ? rect(-13, -11, 26, 22) : rect(-22, -17, 44, 34)
-    return { campus: rect(-width / 2, -depth / 2, width, depth), building, entrance: tr(0, -depth / 2 + 3), schoolYard: rect(4, 4, 44, 32) }
+    return { campus: rect(-width / 2, -depth / 2, width, depth), building, entrance: tr(0, -depth / 2 + 3), schoolYard: rect(4, 4, 44, 32), along: { x: ny, y: -nx }, across: { x: nx, y: ny } }
   }
   // The requested kind's target bearing is stable when the selected end year
   // makes additional facilities eligible. Site and access surveys use only the
   // roads/constraints present when that facility was first constructed.
   const facilityOrder = [...new Set(config.facilities)].filter(kind => kind !== 'shop' && !(hasCore && kind === (config.type === 'castle' ? 'castle' : 'shrine')))
   type CivicIdentity = { id: string; name: string; neighbourhood: boolean }
-  type CivicSite = { kind: FacilityKind; year: number; version: number; point: Point; facility: Facility; lot: ReturnType<typeof facilityLot>; accessRoad: Road; building?: Building; areas: Area[]; active: boolean; identity?: CivicIdentity }
+  type CivicSite = { kind: FacilityKind; year: number; version: number; point: Point; facility: Facility; lot: ReturnType<typeof facilityLot>; accessRoad: Road; paths: Road[]; buildings: Building[]; areas: Area[]; active: boolean; identity?: CivicIdentity }
   const civicSites: CivicSite[] = [], civicEvents: GrowthEvent[] = [], facilityDates = new Map<Facility, number>(), civicUnavailable = new Map<FacilityKind, string>()
+  const woodlandClearings: WoodlandClearing[] = []
+  const civicRouteRecords = new Map<string, Segment[]>()
   let historicThermalCenter: Point | undefined
   const placedYear = (facility: Facility) => facilityDates.get(facility) ?? (facility.id === 'facility-port' && harbor ? 1920 : facilityInception[facility.kind])
   const placeFacility = (kind: FacilityKind, constructionYear: number, version = 0, relocationTarget?: Point, identity?: CivicIdentity): CivicSite | null => {
+    const allowWoodland = kind === 'park' || kind === 'university'
     const index = facilityOrder.indexOf(kind)
     const visibleAreas = areas.filter(area => (obstacles.find(obstacle => obstacle.polygon === area.polygon)?.year ?? 0) <= constructionYear && (landRetired.get(area.polygon) ?? Infinity) > constructionYear)
     const planningAreas = harbor && constructionYear < 1920 ? [...naturalTerrain.areas, ...visibleAreas.filter(area => area.kind !== 'water' && area.kind !== 'forest')] : visibleAreas
     const facilityPlanner = new RoadPlanner({ width: W, height: H, areas: planningAreas, core, terrain: harbor && constructionYear < 1920 ? naturalTerrain : terrain, landCost: reserveCostAt(constructionYear) })
-    facilityPlanner.setRailwayCorridors(railways.filter(railway => (railway.builtYear ?? 1900) <= constructionYear))
+    facilityPlanner.setRailwayCorridors(railways.filter(railway => railway.mode !== 'subway' && (railway.builtYear ?? 1900) <= constructionYear))
     const target = relocationTarget ?? (kind === 'port' ? { x: origin.x + 240, y: origin.y } : kind === 'shop' && stations.length ? stations[Math.floor(stations.length / 2)]!.point : { x: origin.x + Math.cos(index * 2.4) * 520, y: origin.y + Math.sin(index * 2.4) * 460 })
-    const sites = availableAt(constructionYear, kind === 'port' ? 1600 : 120)
+    const sites = availableAt(constructionYear, kind === 'port' ? 1600 : kind === 'university' ? 420 : kind === 'park' && !identity?.neighbourhood ? 280 : 120, allowWoodland)
     const population = civicPopulations.get(constructionYear) ?? civicPopulations.get([...civicPopulations.keys()].filter(date => date <= constructionYear).at(-1) ?? 0) ?? []
     const served = identity?.neighbourhood ? new Map(sites.map(site => [site.point, population.reduce((sum, cell) => distance(cell.point, site.point) < 320 ? sum + cell.households : sum, 0)])) : undefined
     const ranked = sites.filter(c => facilities.filter(f => placedYear(f) <= constructionYear).every(f => distance(f.point, c.point) > 155)).filter(c => !identity?.neighbourhood || facilities.filter(f => f.kind === 'park').every(f => distance(f.point, c.point) > 430) && naturalTerrain.slope(c.point) < .08 && (served?.get(c.point) ?? 0) >= 45).filter(c => {
@@ -403,45 +442,114 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
         const samples = [...campus, ...campus.map((p, i) => ({ x: (p.x + campus[(i + 1) % campus.length]!.x) / 2, y: (p.y + campus[(i + 1) % campus.length]!.y) / 2 })), c.point], levels = samples.map(p => naturalTerrain.elevation(p))
         if (Math.max(...levels) - Math.min(...levels) > 3 || samples.some(p => naturalTerrain.slope(p) > .08 || naturalTerrain.wetness(p) > .52 || (() => { const channel = naturalTerrain.channelAt(p); return channel !== null && channel.bankDistance < 90 && naturalTerrain.elevation(p) - channel.surfaceElevation < 3 })())) return false
       }
-      return canBuild(campus, false, constructionYear) && (!harbor || constructionYear < 1920 || !polygonsOverlap(campus, harbor.platform))
+      return canBuild(campus, true, constructionYear, allowWoodland) && (!harbor || constructionYear < 1920 || !polygonsOverlap(campus, harbor.platform))
     }).sort((a, b) => (!version && served ? served.get(b.point)! - served.get(a.point)! : 0) || distance(a.point, target) - distance(b.point, target))
-    let accessPath: Point[] | null = null
-    const chosen = ranked.slice(0, version ? 96 : 24).find(c => {
+    let accessPath: Point[] | null = null, accessCost = 0
+    let campusProposal: CampusProposal | undefined, parkPlaza: PolygonRegion | undefined, parkPath: PlannedRoute | undefined
+    const suffix = version ? `-relocation-${constructionYear}-${version}` : ''
+    const name = identity?.name ?? (kind === 'school' ? `${config.name.replace(/[市町村]$/, '')}第一小学校` : kind === 'university' ? `${config.name.replace(/[市町村]$/, '')}大学` : facilityNames[kind])
+    const chosen = ranked.slice(0, version ? 96 : kind === 'university' ? 12 : 24).find(c => {
       if (!c.access) return false
-      const entrance = facilityLot(kind, c.point, c.access, identity?.neighbourhood).entrance
-      const route = facilityPlanner.plan(c.access.point, entrance, { role: 'access', width: 3.5, maxNodes: 6000 })
+      const proposedLot = facilityLot(kind, c.point, c.access, identity?.neighbourhood), entrance = proposedLot.entrance
+      const route = facilityPlanner.plan(c.access.point, entrance, { role: 'access', width: 3.5, maxNodes: 6000, ...(allowWoodland ? { maximumGrade: .14 } : {}) })
       if (!route || !Number.isFinite(route.cost) || !accessAvoidsReserves(route.points, 3.5, constructionYear)) return false
+      const localBounds = boundsOf(proposedLot.campus), offset = { x: localBounds.minX - 10, y: localBounds.minY - 10 }, local = (p: Point) => ({ x: p.x - offset.x, y: p.y - offset.y }), global = (p: Point) => ({ x: p.x + offset.x, y: p.y + offset.y })
+      const woodedSite = planningAreas.some(area => area.kind === 'forest' && polygonOverlapsRegion(proposedLot.campus, area)), reserveCost = reserveCostAt(constructionYear)
+      let cachedInternal: { structures: Building[]; planner: RoadPlanner } | undefined
+      const internalRoute = (a: Point, b: Point, structures: Building[]) => {
+        // Campus paths need a few hundred metres of actual terrain, not another
+        // pair of 12km-wide survey arrays for every individual lecture hall.
+        if (!cachedInternal || cachedInternal.structures !== structures) cachedInternal = { structures, planner: new RoadPlanner({ width: localBounds.maxX - localBounds.minX + 20, height: localBounds.maxY - localBounds.minY + 20, areas: [], core: null,
+          terrain: { elevation: p => naturalTerrain.elevation(global(p)), slope: p => naturalTerrain.slope(global(p)), waterAt: p => naturalTerrain.waterAt(global(p)), bridgeSites: [] },
+          landCost: p => { const q = global(p); return !pointInPolygon(q, proposedLot.campus) || structures.some(building => pointInPolygon(q, building.polygon)) ? Infinity : reserveCost(q) + (woodedSite ? 2.4 : 0) },
+        }) }
+        const route = cachedInternal.planner.plan(local(a), local(b), { role: 'access', width: 2.8, alignment: 'planned', maximumGrade: .14, maxNodes: 1800 })
+        return route ? { ...route, points: route.points.map(global) } : null
+      }
+      if (kind === 'university') {
+        const budget = clamp(scenarioDemandAtYear(config, constructionYear).households * 4, 6500, 60000) - route.cost
+        const proposal = surveyUniversityCampus({ campus: proposedLot.campus, center: c.point, entrance, along: proposedLot.along, across: proposedLot.across, year: constructionYear, name, suffix,
+          elevation: naturalTerrain.elevation, slope: naturalTerrain.slope, waterAt: naturalTerrain.waterAt, canPlace: polygon => canBuild(polygon, true, constructionYear, true), budget,
+          plan: internalRoute,
+        })
+        if (!proposal) return false
+        campusProposal = proposal
+      }
+      if (kind === 'park') {
+        const plaza = { polygon: rectangle(-8, -7, 16, 14).map(p => ({ x: c.point.x + proposedLot.along.x * p.x + proposedLot.across.x * p.y, y: c.point.y + proposedLot.along.y * p.x + proposedLot.across.y * p.y })) }
+        const formation = surveyDevelopmentSite(naturalTerrain, c.point, plaza.polygon)
+        if (!formation.viable) return false
+        const path = internalRoute(entrance, c.point, [])
+        if (!path || !accessAvoidsReserves(path.points, 2.8, constructionYear)) return false
+        const budget = clamp(scenarioDemandAtYear(config, constructionYear).households * .8, 1000, 12000)
+        if (route.cost + path.cost + formation.formationCost > budget) return false
+        parkPlaza = plaza; parkPath = path
+      }
       accessPath = route.points
+      accessCost = route.cost
       return true
     }); if (!chosen || !chosen.access) return null
     const { point } = chosen
     // Earlier facility junctions subdivide this route; cached segment indices are stale.
     const access = nearestRoad(point, constructionYear)!
     const lot = facilityLot(kind, point, access, identity?.neighbourhood)
-    const suffix = version ? `-relocation-${constructionYear}-${version}` : ''
     const driveway: Road = { id: `${identity ? `${identity.id}-access` : `facility-access-${kind}`}${suffix}`, points: accessPath!, kind: 'local', width: 3.5, role: 'access', builtYear: constructionYear, reason: version ? '交通用地取得に伴う公共施設の移転先への接道' : '公共施設用地の接道' }
     ensureRoadJunction(access.road.id, access.point)
     roads.push(driveway)
     for (let i = 1; i < driveway.points.length; i++) {
       const a = driveway.points[i - 1]!, b = driveway.points[i]!, drivewayBounds = boundsOf([a, b]), pad = 3
-      transport.add({ a, b, pad, bounds: { minX: drivewayBounds.minX - pad, minY: drivewayBounds.minY - pad, maxX: drivewayBounds.maxX + pad, maxY: drivewayBounds.maxY + pad }, year: driveway.builtYear! })
+      const record = { a, b, pad, bounds: { minX: drivewayBounds.minX - pad, minY: drivewayBounds.minY - pad, maxX: drivewayBounds.maxX + pad, maxY: drivewayBounds.maxY + pad }, year: driveway.builtYear! }
+      transport.add(record); const records = civicRouteRecords.get(driveway.id) ?? []; records.push(record); civicRouteRecords.set(driveway.id, records)
     }
-    const name = identity?.name ?? (kind === 'school' ? `${config.name.replace(/[市町村]$/, '')}第一小学校` : facilityNames[kind])
     const facility: Facility = { id: identity?.id ?? `facility-${kind}`, point, name, kind }
     facilities.push(facility); facilityDates.set(facility, constructionYear)
-    const site: CivicSite = { kind, year: constructionYear, version, point, facility, lot, accessRoad: driveway, areas: [], active: true, identity }
+    const site: CivicSite = { kind, year: constructionYear, version, point, facility, lot, accessRoad: driveway, paths: [driveway], buildings: [], areas: [], active: true, identity }
     reserves.push({ polygon: lot.campus, bounds: boundsOf(lot.campus), year: driveway.builtYear! })
-    if (kind === 'shrine' || kind === 'park') {
-      const area: Area = { id: `${identity?.id ?? `facility-lot-${kind}`}${suffix}`, kind: 'park', polygon: lot.campus, name: kind === 'park' ? name : undefined }
+    for (let i = 1; i < driveway.points.length; i++) woodlandClearings.push({ polygon: corridorPolygon(driveway.points[i - 1]!, driveway.points[i]!, driveway.width / 2 + .25), year: constructionYear })
+    const internalPaths = campusProposal?.paths ?? (parkPath ? [parkPath] : [])
+    for (const [i, route] of internalPaths.entries()) {
+      const road: Road = { id: `${identity?.id ?? `facility-access-${kind}`}-internal-${i}${suffix}`, points: route.points, kind: 'local', width: 2.8, role: 'access', builtYear: constructionYear, reason: kind === 'university' ? '丘の等高線に沿って講義棟・図書館を接続する学内通路' : '樹林を残した公園の入口と小広場を結ぶ園路' }
+      const connected = insertConnectedRoad(road)
+      site.paths.push(connected)
+      for (let n = 1; n < connected.points.length; n++) {
+        const a = connected.points[n - 1]!, b = connected.points[n]!, pad = road.width / 2 + .25, polygon = corridorPolygon(a, b, pad), bounds = boundsOf(polygon)
+        const record = { a, b, pad, bounds, year: constructionYear }
+        transport.add(record); const records = civicRouteRecords.get(road.id) ?? []; records.push(record); civicRouteRecords.set(road.id, records); woodlandClearings.push({ polygon, year: constructionYear })
+      }
+    }
+    if (kind === 'shrine') {
+      const building: Building = { id: `facility-building-shrine${suffix}`, polygon: lot.building, kind: 'public', height: 2, builtYear: constructionYear, name }
+      if (!addBuilding(building, false, constructionYear)) throw new Error('神社の敷地調査と建築判定が一致しません。')
+      site.buildings.push(building)
+    }
+    if (kind === 'university' && campusProposal) {
+      for (const building of campusProposal.buildings) {
+        if (!addBuilding(building, false, constructionYear, true)) throw new Error('大学の敷地調査と建築判定が一致しません。')
+        site.buildings.push(building)
+      }
+      for (const building of site.buildings) {
+        const center = building.polygon.reduce((sum, p) => ({ x: sum.x + p.x / building.polygon.length, y: sum.y + p.y / building.polygon.length }), { x: 0, y: 0 })
+        // A narrow maintenance verge includes the rounded surveyed facade;
+        // clearing must not retain centimetre slivers of forest under a wall.
+        woodlandClearings.push({ polygon: building.polygon.map(p => ({ x: center.x + (p.x - center.x) * 1.04, y: center.y + (p.y - center.y) * 1.04 })), year: constructionYear })
+      }
+      woodlandClearings.push(...campusProposal.clearings.slice(campusProposal.buildings.length).map(region => ({ polygon: region.polygon, year: constructionYear })))
+      const area: Area = { id: `facility-lot-university${suffix}`, kind: 'park', polygon: campusProposal.plaza.polygon }
+      areas.push(area); obstacles.push(obstacle(area, constructionYear)); site.areas.push(area)
+    } else if (kind === 'shrine' || kind === 'park') {
+      const wooded = kind === 'park' && planningAreas.some(area => area.kind === 'forest' && polygonOverlapsRegion(lot.campus, area))
+      const polygon = wooded && parkPlaza ? parkPlaza.polygon : lot.campus
+      const area: Area = { id: `${identity?.id ?? `facility-lot-${kind}`}${suffix}`, kind: 'park', polygon, name: kind === 'park' ? name : undefined }
       areas.push(area); obstacles.push(obstacle(area, driveway.builtYear)); site.areas.push(area)
+      if (kind === 'park' && parkPlaza) woodlandClearings.push({ polygon: parkPlaza.polygon, year: constructionYear })
     } else {
       const building: Building = { id: `facility-building-${kind}${suffix}`, polygon: lot.building, kind: kind === 'port' ? 'industrial' : kind === 'shop' ? 'commercial' : 'public', height: kind === 'hospital' ? 5 : kind === 'school' ? 3 : 2, builtYear: driveway.builtYear }
       if (!addBuilding(building, false, constructionYear)) throw new Error('公共施設の敷地調査と建築判定が一致しません。')
-      site.building = building
+      site.buildings.push(building)
       if (kind === 'school') { const yard: Area = { id: `school-yard${suffix}`, kind: 'park', polygon: lot.schoolYard }; areas.push(yard); obstacles.push(obstacle(yard, driveway.builtYear)); site.areas.push(yard) }
     }
     civicSites.push(site)
-    civicEvents.push({ id: `civic-construction-${facility.id}-${constructionYear}-${version}`, kind: 'construction', year: constructionYear, entityId: site.building?.id ?? site.areas[0]!.id, reason: version ? `交通用地取得に伴う${name}の移転・再建` : `${name}の敷地取得・建設` })
+    for (const [i, entity] of (site.buildings.length ? site.buildings : site.areas).entries()) civicEvents.push({ id: `civic-construction-${facility.id}-${constructionYear}-${version}-${i}`, kind: 'construction', year: constructionYear, entityId: entity.id, reason: version ? `交通用地取得に伴う${name}の移転・再建` : kind === 'university' ? `${name}の個別建築床・学内通路整備（地域整備枠、用地・建築・造成・通路費${Math.round(campusProposal!.cost + accessCost)}）` : `${name}の敷地取得・建設` })
     if (kind === 'onsen' && !version) historicThermalCenter = point
     return site
   }
@@ -461,7 +569,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   // A later road acquires the site then; relocation cannot alter the1875survey.
   const acquisitionAt = civicTransportAcquisitions(datedRoads().map(version => ({ ...version.value, builtYear: version.from })), railways, year)
   const founding = [...facilityOrder].filter(kind => facilityInception[kind] <= year && !facilities.some(facility => facility.kind === kind)).sort((a, b) => facilityInception[a] - facilityInception[b] || facilityOrder.indexOf(a) - facilityOrder.indexOf(b))
-  const civicYears = [...new Set([...founding.map(kind => facilityInception[kind]), ...civicPopulations.keys()])].sort((a, b) => a - b)
+  const firstFacilityYear = Math.min(...founding.map(kind => facilityInception[kind]))
+  const civicYears = [...new Set([...founding.map(kind => facilityInception[kind]), ...civicPopulations.keys(), ...datedRoads().map(version => version.from).filter(date => date >= firstFacilityYear && date <= year), ...(Number.isFinite(firstFacilityYear) ? [year] : [])])].sort((a, b) => a - b)
+  const attemptedNetworks = new Map<FacilityKind, string>()
   let civicCursor = 0, acquisitions = 0
   while (true) {
     const nextYear = civicYears[civicCursor] ?? Infinity
@@ -470,17 +580,49 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       if (++acquisitions > 1024) throw new Error('交通用地取得に伴う公共施設の移転が収束しません。')
       const { site, acquisition } = next
       site.active = false; landRetired.set(site.lot.campus, acquisition.year)
+      for (const road of site.paths) {
+        const index = roads.indexOf(road); if (index >= 0) roads.splice(index, 1)
+        retiredCivicRoads.push({ from: road.builtYear ?? site.year, to: acquisition.year, value: road })
+        for (const record of civicRouteRecords.get(road.id) ?? []) record.to = acquisition.year
+      }
       for (const area of site.areas) { landRetired.set(area.polygon, acquisition.year); const index = areas.indexOf(area); if (index >= 0) areas.splice(index, 1) }
-      if (site.building) { buildingRetired.set(site.building.id, acquisition.year); const index = buildings.indexOf(site.building); if (index >= 0) buildings.splice(index, 1) }
+      for (const building of site.buildings) { buildingRetired.set(building.id, acquisition.year); const index = buildings.indexOf(building); if (index >= 0) buildings.splice(index, 1) }
       const index = facilities.indexOf(site.facility); if (index >= 0) facilities.splice(index, 1)
-      civicEvents.push({ id: `civic-acquisition-${site.facility.id}-${site.year}-${site.version}-${acquisition.year}`, kind: 'acquisition', year: acquisition.year, entityId: site.building?.id ?? site.areas[0]!.id, reason: `${acquisition.routeId}の${acquisition.mode === 'road' ? '道路' : '鉄道'}用地として${site.facility.name}の旧敷地を取得・撤去` })
+      for (const [i, entity] of (site.buildings.length ? site.buildings : site.areas).entries()) civicEvents.push({ id: `civic-acquisition-${site.facility.id}-${site.year}-${site.version}-${acquisition.year}-${i}`, kind: 'acquisition', year: acquisition.year, entityId: entity.id, reason: `${acquisition.routeId}の${acquisition.mode === 'road' ? '道路' : '鉄道'}用地として${site.facility.name}の旧敷地を取得・撤去` })
       if (!placeFacility(site.kind, acquisition.year, site.version + 1, site.point, site.identity)) civicUnavailable.set(site.kind, `${acquisition.year}年の交通用地取得で旧敷地を撤去しましたが、地盤・接道条件を満たす移転先を確保できませんでした。`)
       continue
     }
     if (!Number.isFinite(nextYear)) break
-    for (const kind of founding.filter(kind => facilityInception[kind] === nextYear)) placeFacility(kind, nextYear)
+    for (const kind of founding.filter(kind => facilityInception[kind] <= nextYear && !facilities.some(facility => facility.kind === kind))) {
+      const network = roadsAt(nextYear).map(road => `${road.id}:${road.modifiedYear ?? road.builtYear}:${road.width}`).join('|')
+      if (attemptedNetworks.get(kind) === network) continue
+      attemptedNetworks.set(kind, network)
+      const previous = civicSites.filter(site => site.kind === kind).at(-1)
+      if (placeFacility(kind, nextYear, previous ? previous.version + 1 : 0, previous?.point, previous?.identity)) civicUnavailable.delete(kind)
+    }
     if (civicPopulations.has(nextYear)) placeNeighbourhoodParks(nextYear)
     civicCursor++
+  }
+  const woodlandSource: TimelineVersion<Area>[] = []
+  const finalWoodland = new Map(areas.filter(area => area.kind === 'forest').map(area => [area.id, area]))
+  for (const before of preHarborAreas.filter(area => area.kind === 'forest')) {
+    const after = finalWoodland.get(before.id)
+    if (harbor && (!after || before.polygon !== after.polygon || before.holes !== after.holes)) {
+      woodlandSource.push({ from: 1650, to: 1920, value: before }); if (after) woodlandSource.push({ from: 1920, value: after })
+    } else woodlandSource.push({ from: 1650, value: after ?? before })
+    finalWoodland.delete(before.id)
+  }
+  for (const value of finalWoodland.values()) woodlandSource.push({ from: harbor ? 1920 : 1650, value })
+  const woodlandVersions = civicWoodlandHistory(woodlandSource, woodlandClearings, year)
+  areas.splice(0, areas.length, ...areas.filter(area => area.kind !== 'forest'), ...woodlandVersions.filter(version => version.from <= year && (version.to === undefined || year < version.to)).map(version => version.value))
+  for (const site of civicSites.filter(site => site.kind === 'university' || site.kind === 'park')) {
+    const trees = woodlandVersions.filter(version => version.from <= site.year && (version.to === undefined || site.year < version.to)).map(version => version.value)
+    const paths = site.paths.flatMap(road => road.points.slice(1).map((b, i) => ({ polygon: corridorPolygon(road.points[i]!, b, road.width / 2 + .25) })))
+    const grass = subtractRegions({ polygon: site.lot.campus }, [...trees, ...site.buildings.map(building => ({ polygon: building.polygon })), ...site.areas, ...paths])
+    for (const [i, region] of grass.entries()) {
+      const area: Area = { id: `${site.facility.id}-grass-${site.version}-${i}`, kind: 'field', landUse: 'meadow', ...region }
+      site.areas.push(area); if (site.active) areas.push(area)
+    }
   }
   onProgress?.('敷地と住宅・建替えを計算中…')
   const development = developLand({ config, roads, roadHistory: datedRoads(), center: origin, thermalCenter: historicThermalCenter, stations, centers: growth.centers,
@@ -489,6 +631,11 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     buildings.push(building)
     footprints.add({ building, bounds: boundsOf(building.polygon) })
   }
+  const subway = planSubway({ config, throughYear: year, roads: datedRoads(), buildings: development.history.buildings, stations, terrain: naturalTerrain })
+  if (subway) { railways.push(subway.railway); stations.push(...subway.stations) }
+  stations.splice(0, stations.length, ...surveyStationArchitecture({ stations, railways, roads: routeVersions(), width: W, height: H,
+    buildingVersions: [...development.history.buildings, ...civicSites.flatMap(site => site.buildings.map(building => ({ from: site.year, value: building })))], buildings,
+    waterAt: naturalTerrain.waterAt, slope: naturalTerrain.slope, elevation: naturalTerrain.elevation }))
   const shopHistory = config.facilities.includes('shop') ? shoppingStreetHistory({ buildings: development.history.buildings, parcels: development.history.parcels, roads: datedRoads(), name: facilityNames.shop, throughYear: year }) : []
   for (const version of shopHistory) if (version.to === undefined || year < version.to) facilities.push(version.value)
   preview(roads, railways, stations, buildings, 'development')
@@ -507,7 +654,8 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   }
   for (const reserve of reserves) if (reserveActive(reserve, year)) addOccupied(reserve)
   for (const b of buildings) if (!b.parcelId) addOccupied(b)
-  for (const route of [...roads, ...railways.map(r => ({ ...r, width: 15 }))]) for (let i = 1; i < route.points.length; i++) {
+  for (const station of stations) if (station.buildingPolygon) addOccupied({ polygon: station.buildingPolygon })
+  for (const route of [...roads, ...railways.filter(r => r.mode !== 'subway').map(r => ({ ...r, width: 15 }))]) for (let i = 1; i < route.points.length; i++) {
     if (distance(route.points[i - 1]!, route.points[i]!) < .01) continue
     const polygon = corridorPolygon(route.points[i - 1]!, route.points[i]!, route.width / 2 + 1)
     addOccupied({ polygon })
@@ -537,8 +685,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   for (const version of development.history.parcels) if (!acquiredParcelIds.has(version.value.id)) { acquiredParcelIds.add(version.value.id); farmAcquisitions.push({ polygon: version.value.polygon, year: version.value.createdYear }) }
   for (const site of civicSites) farmAcquisitions.push({ polygon: site.lot.campus, year: site.year })
   for (const building of buildings.filter(building => !building.parcelId)) farmAcquisitions.push({ polygon: building.polygon, year: building.builtYear ?? 1650 })
+  for (const station of stations) if (station.buildingPolygon) farmAcquisitions.push({ polygon: station.buildingPolygon, year: station.builtYear ?? 1900 })
   if (harbor) farmAcquisitions.push({ polygon: harbor.platform, year: 1920 })
-  for (const version of [...datedRoads(), ...railways.map(railway => ({ from: railway.builtYear ?? 1900, value: { ...railway, width: 15 } }))]) {
+  for (const version of [...datedRoads(), ...railways.filter(railway => railway.mode !== 'subway').map(railway => ({ from: railway.builtYear ?? 1900, value: { ...railway, width: 15 } }))]) {
     const route = version.value
     for (let i = 1; i < route.points.length; i++) if (distance(route.points[i - 1]!, route.points[i]!) >= .01) farmAcquisitions.push({ polygon: corridorPolygon(route.points[i - 1]!, route.points[i]!, route.width / 2 + 1), year: version.from })
   }
@@ -546,11 +695,12 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     const pastParcels = development.history.parcels.filter(version => version.from <= asOf && (version.to === undefined || asOf < version.to)).map(version => version.value)
     const density = settlementDensity(pastParcels)
     const visibleTerrain = harbor && asOf >= 1920 ? terrain : naturalTerrain
-    const pastAreas = (harbor && asOf >= 1920 ? areas : preHarborAreas).filter(area => area.kind === 'water' || area.kind === 'forest' || area.id === 'historic-core' || area.id.startsWith('castle-') || area.id.startsWith('moat-'))
+    const pastAreas = [...(harbor && asOf >= 1920 ? areas : preHarborAreas).filter(area => area.kind === 'water' || area.id === 'historic-core' || area.id.startsWith('castle-') || area.id.startsWith('moat-')), ...woodlandVersions.filter(version => version.from <= asOf && (version.to === undefined || asOf < version.to)).map(version => version.value)]
     const pastSites = civicSites.filter(site => site.year <= asOf && (landRetired.get(site.lot.campus) ?? Infinity) > asOf)
     const access = agriculturalAccessSurvey(roadsAt(asOf), visibleTerrain, [
       ...pastAreas, ...pastParcels, ...pastSites.map(site => ({ polygon: site.lot.campus })), ...wetlands,
-      ...railways.filter(railway => (railway.builtYear ?? 1900) <= asOf).flatMap(railway => railway.points.slice(1).flatMap((b, i) => distance(railway.points[i]!, b) > .01 ? [{ polygon: corridorPolygon(railway.points[i]!, b, 8.5) }] : [])),
+      ...stations.filter(station => station.buildingPolygon && (station.builtYear ?? 1900) <= asOf).map(station => ({ polygon: station.buildingPolygon! })),
+      ...railways.filter(railway => railway.mode !== 'subway' && (railway.builtYear ?? 1900) <= asOf).flatMap(railway => railway.points.slice(1).flatMap((b, i) => distance(railway.points[i]!, b) > .01 ? [{ polygon: corridorPolygon(railway.points[i]!, b, 8.5) }] : [])),
     ])
     return (region, originalArea) => {
       const center = region.polygon.reduce((sum, p) => ({ x: sum.x + p.x / region.polygon.length, y: sum.y + p.y / region.polygon.length }), { x: 0, y: 0 })
@@ -565,7 +715,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   // Unbuilt land still has a physical cover. Continuous contours follow occupation
   // and wet lowlands; small clipping tiles bound complexity but are never outlined.
   let coverSerial = 0
-  const emitCover = (sources: PolygonRegion[], landUse: 'meadow' | 'wetland' | 'vacant', masks: ReturnType<typeof spatialIndex<LandMask>>) => {
+  const emitCover = (sources: PolygonRegion[], landUse: 'meadow' | 'woodland' | 'wetland' | 'vacant', masks: ReturnType<typeof spatialIndex<LandMask>>) => {
     for (const source of sources) {
       const bounds = boundsOf(source.polygon)
       for (let x = Math.max(0, Math.floor(bounds.minX / 400) * 400); x < Math.min(W, bounds.maxX); x += 400) for (let y = Math.max(0, Math.floor(bounds.minY / 400) * 400); y < Math.min(H, bounds.maxY); y += 400) {
@@ -579,6 +729,10 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   emitCover(wetlands, 'wetland', occupied)
   for (const region of wetlands) occupied.add({ ...region, bounds: boundsOf(region.polygon) })
   for (const parcel of development.parcels.filter(p => !p.developedYear)) emitCover([parcel], 'vacant', occupied)
+  const sparseWoodland = naturalWoodlandContours({ width: W, height: H, seed: config.seed, forest: config.forest, settlement: config.settlement, origin,
+    elevation: naturalTerrain.elevation, slope: naturalTerrain.slope, wetness: naturalTerrain.wetness })
+  emitCover(sparseWoodland, 'woodland', convertedLand)
+  for (const region of sparseWoodland) convertedLand.add({ ...region, bounds: boundsOf(region.polygon) })
   emitCover([mapBoundary], 'meadow', convertedLand)
   const districts = buildDistricts({ width: W, height: H, config, roads, blocks, parcels: development.parcels, areas, stations, facilities })
   const originalRoads = new Map<string, TimelineVersion<Road>>()
@@ -592,7 +746,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     events: [
       ...roads.map(r => ({ id: `event-${r.id}`, year: r.builtYear ?? 1650, kind: 'road' as const, entityId: r.id, reason: originalRoads.get(r.id)?.value.reason ?? r.reason ?? '初期の広域街道' })),
       ...growth.roadHistory.filter(version => version.value.modifiedYear === version.from).map(version => ({ id: `event-road-renewal-${version.value.id}-${version.from}`, year: version.from, kind: 'road' as const, entityId: version.value.id, reason: version.value.reason })),
-      ...railways.map(r => ({ id: `event-${r.id}`, year: 1900, kind: 'railway' as const, entityId: r.id, reason: '地域鉄道の開通' })),
+      ...railways.map(r => ({ id: `event-${r.id}`, year: r.builtYear ?? 1900, kind: 'railway' as const, entityId: r.id, reason: r.mode === 'subway' ? '既存市街地・乗換駅の需要に基づく地下鉄の開通' : '地域鉄道の開通' })),
       ...civicEvents,
       ...development.events,
       ...(harbor ? [{ id: 'event-harbor-reclamation', year: 1920, kind: 'acquisition' as const, entityId: 'harbor-yard', reason: `既存岸へ接続する港湾用地の取得と約${(harbor.reclaimedArea / 10000).toFixed(2)}haの埋立造成` }] : []),
@@ -609,21 +763,22 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     areaVersions.push({ from, value: area })
   }
   if (harbor) {
-    const finalNatural = areas.filter(area => area.kind === 'water' || area.kind === 'forest')
+    const finalNatural = areas.filter(area => area.kind === 'water')
     const finalById = new Map(finalNatural.map(area => [area.id, area]))
-    for (const before of preHarborAreas.filter(area => area.kind === 'water' || area.kind === 'forest')) {
+    for (const before of preHarborAreas.filter(area => area.kind === 'water')) {
       const after = finalById.get(before.id)
       if (after && before.polygon === after.polygon && before.holes === after.holes) areaVersions.push({ from: 1650, value: after })
       else { areaVersions.push({ from: 1650, to: 1920, value: before }); if (after) areaVersions.push({ from: 1920, value: after }) }
       finalById.delete(before.id)
     }
     for (const value of finalById.values()) areaVersions.push({ from: 1920, value })
-  } else for (const value of areas.filter(area => area.kind === 'water' || area.kind === 'forest')) areaVersions.push({ from: 1650, value })
+  } else for (const value of areas.filter(area => area.kind === 'water')) areaVersions.push({ from: 1650, value })
+  areaVersions.push(...woodlandVersions)
   for (const value of preHarborAreas.filter(area => area.kind !== 'water' && area.kind !== 'forest')) areaVersions.push({ from: 1650, value })
   for (const site of civicSites) for (const value of site.areas) areaVersions.push({ ...through(site.year, landRetired.get(site.lot.campus)), value })
   if (harbor) for (const value of areas.filter(area => area.id === 'harbor-yard')) areaVersions.push({ from: 1920, value })
   areaVersions.push(...agriculturalVersions)
-  const civicBuildingHistory = civicSites.flatMap(site => site.building ? [{ ...through(site.year, buildingRetired.get(site.building.id)), value: site.building }] : [])
+  const civicBuildingHistory = civicSites.flatMap(site => site.buildings.map(building => ({ ...through(site.year, buildingRetired.get(building.id)), value: building })))
   const civicFacilityHistory = [...civicSites.map(site => ({ ...through(site.year, landRetired.get(site.lot.campus)), value: site.facility })), ...shopHistory]
   const suppliedFacilityIds = new Set(civicFacilityHistory.map(version => version.value.id))
   for (const value of facilities) if (!suppliedFacilityIds.has(value.id)) civicFacilityHistory.push({ from: value.id === 'facility-port' && harbor ? 1920 : facilityInception[value.kind], value })

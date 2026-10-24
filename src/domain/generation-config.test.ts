@@ -20,4 +20,9 @@ describe('shared worker and simulator configuration', () => {
     expect(result.config.targetYear).toBeUndefined()
     expect(result.terrainInput).toMatchObject({ width: 8000, height: 6000, terrain: 'plain' })
   })
+  it('passes the peninsula geology to the physical regional simulation', () => {
+    const result = resolveGenerationConfig({ ...config, coastType: 'peninsula' })
+    expect(result.config.coastType).toBe('peninsula')
+    expect(result.terrainInput).toMatchObject({ terrain: 'coast', coastType: 'peninsula' })
+  })
 })

@@ -48,6 +48,15 @@ describe('saved projects', () => {
     expect(parseProject(JSON.stringify(sample()))).toEqual(sample())
   })
 
+  it('restores a peninsula scenario without regenerating its saved geometry', () => {
+    const project = withSnapshot()
+    project.config.terrain = 'coast'; project.config.coastType = 'peninsula'
+    project.snapshot!.config.terrain = 'coast'; project.snapshot!.config.coastType = 'peninsula'
+    const restored = parseProject(JSON.stringify(project))
+    expect(restored.config.coastType).toBe('peninsula')
+    expect(restored.snapshot).toEqual(project.snapshot)
+  })
+
   it('reconstructs independent values and strips unknown imported properties', () => {
     const input = { ...sample(), extra: 'ignore' }
     const output = validateProject(input)

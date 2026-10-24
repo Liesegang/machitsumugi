@@ -1,16 +1,16 @@
 :root {
-  font-family: "Yu Gothic UI", "Meiryo", "Hiragino Kaku Gothic ProN", system-ui, sans-serif;
-  color: #26343d;
+  font-family: "BIZ UDPGothic", "Yu Gothic UI", "Meiryo", "Hiragino Kaku Gothic ProN", sans-serif;
+  color: #29343b;
   background: #fff;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --color-accent: #2f5366;
-  --color-accent-hover: #254554;
-  --color-text: #26343d;
-  --color-muted: #64717a;
-  --color-border: #c9cfd4;
-  --color-tint: #eaf0f3;
+  --color-accent: #355c68;
+  --color-accent-hover: #284b55;
+  --color-text: #29343b;
+  --color-muted: #657079;
+  --color-border: #d6dce0;
+  --color-tint: #edf3f5;
   --color-paper: #fff;
 }
 * { box-sizing: border-box; }
@@ -24,7 +24,7 @@ button, a, input, select, textarea, summary { outline-offset: 2px; }
 button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 button svg { pointer-events: none; }
 svg { flex-shrink: 0; }
-input[type="checkbox"], input[type="range"] { accent-color: #365d73; }
+input[type="checkbox"], input[type="range"] { accent-color: var(--color-accent); }
 a { color: #2f5366; text-underline-offset: 3px; }
 ::selection { background: #dbe8f0; }
 * { scrollbar-width: thin; scrollbar-color: #b9c2c8 transparent; }

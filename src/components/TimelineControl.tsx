@@ -2,6 +2,6 @@ export function TimelineControl({ year, generating, available = true, onCommit }
   return <section className="timeline-control" aria-label="地図の年代">
     <label htmlFor="map-year">表示年代 <output htmlFor="map-year">{year}年</output></label>
     <input id="map-year" aria-label="地図の表示年代" type="range" min={1650} max={2025} step={1} value={year} disabled={!available && !generating} onChange={event => onCommit(Number(event.target.value))} />
-    <div><span>1650</span><small>{generating ? '歴史を計算中・完了後の表示年を選択' : available ? '保存した歴史から表示' : '年代履歴なし・「街を生成」で作成'}</small><span>2025</span></div>
+    <div><span>1650</span>{(generating || !available) && <small>{generating ? '計算中 · 完了後の表示年を選択' : '年代履歴なし · 生成して表示'}</small>}<span>2025</span></div>
   </section>
 }

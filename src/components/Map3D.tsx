@@ -8,6 +8,9 @@ import type { TerrainWaterFragment } from '../map/scene-geometry'
 import type { PolygonRegion } from '../domain/geometry'
 import { waterGeometry, waterSurfaceElevation } from '../map/water-surfaces'
 import { seaDepthRgb } from '../map/bathymetry'
+import { buildingArchitecture, castleWallArchitecture, stationArchitecture, stationArchitectureLayout } from '../map/landmark-geometry'
+import type { ArchitectureTriangle } from '../map/landmark-geometry'
+import { surveyStationArchitecture } from '../domain/station-architecture'
 import './Map3D.css'
 
 interface TerrainSurface { columns: number; rows: number; cellSize: number; elevations: number[] }
@@ -68,6 +71,14 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
     return normal.normalize()
   }
   const water = new TriangleBatch(), roads = new TriangleBatch(), buildings = new TriangleBatch(), rail = new TriangleBatch()
+  const architecturalColors = new Map<string, THREE.Color>()
+  const architecture = (triangles: ArchitectureTriangle[]) => {
+    for (const triangle of triangles) {
+      let color = architecturalColors.get(triangle.color)
+      if (!color) { color = new THREE.Color(triangle.color); architecturalColors.set(triangle.color, color) }
+      buildings.triangle(...triangle.points.map(p => world(p, p.elevation)) as [THREE.Vector3, THREE.Vector3, THREE.Vector3], color)
+    }
+  }
   const triangulate = (region: PolygonRegion) => {
     const outer = cleanRing(region.polygon), holes = (region.holes ?? []).map(cleanRing).filter(ring => ring.length >= 3)
     if (outer.length < 3) return { points: [], faces: [] }
@@ -151,6 +162,7 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
   }
   for (const parcel of map.parcels ?? []) if (parcel.developedYear && parcel.retiredYear === undefined && parcel.access?.length) ribbon(roads, parcel.access, 2.8, new THREE.Color('#f1eee5'), p => height(p) + .18)
   for (const line of map.railways) {
+    if (line.mode === 'subway') continue
     const levels = (p: Point, i: number, t: number) => (line.elevations ? line.elevations[i - 1]! * (1 - t) + line.elevations[i]! * t : height(p)) + .9
     ribbon(rail, line.points, 5, new THREE.Color('#938f80'), levels)
     ribbon(rail, line.points, 1.4, new THREE.Color('#434b48'), (p, i, t) => levels(p, i, t) + .12)
@@ -159,6 +171,19 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
     const polygon = cleanRing(building.polygon)
     if (polygon.length < 3) continue
     const floor = Math.max(...polygon.map(height)) + .3, top = floor + Math.max(1, building.height) * FLOORS_TO_METRES
+    const landmark = buildingArchitecture(building, floor)
+    if (landmark) {
+      // A level foundation meets each terrain corner; a detailed roof never
+      // requires lifting the whole landmark into the air on a hillside.
+      const foundation = new THREE.Color('#a7a69a')
+      for (let i = 0; i < polygon.length; i++) {
+        const a = polygon[i]!, b = polygon[(i + 1) % polygon.length]!
+        buildings.triangle(world(a, height(a) + .12), world(b, height(b) + .12), world(a, floor), foundation)
+        buildings.triangle(world(b, height(b) + .12), world(b, floor), world(a, floor), foundation)
+      }
+      architecture(landmark)
+      continue
+    }
     const color = new THREE.Color(building.occupancy === 'vacant' ? '#a49d8e' : building.kind === 'industrial' ? '#bcb5a0' : building.kind === 'public' ? '#a6b6b8' : building.kind === 'commercial' ? '#c4ad9e' : '#d3cebf'), roof = color.clone().multiplyScalar(.83)
     for (let i = 0; i < polygon.length; i++) {
       const a = polygon[i]!, b = polygon[(i + 1) % polygon.length]!, pa = world(a, height(a) + .2), pb = world(b, height(b) + .2), pc = world(a, top), pd = world(b, top)
@@ -166,6 +191,15 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
     }
     const faces = THREE.ShapeUtils.triangulateShape(polygon.map(p => new THREE.Vector2(p.x, p.y)), [])
     for (const face of faces) buildings.triangle(...face.map(i => world(polygon[i]!, top)) as [THREE.Vector3, THREE.Vector3, THREE.Vector3], roof)
+  }
+  for (const area of map.areas) if (area.id.startsWith('castle-wall-')) architecture(castleWallArchitecture(area, height))
+  const architecturalStations = surveyStationArchitecture({ stations: map.stations, railways: map.railways, roads: map.roads, buildings: map.buildings, width: map.width, height: map.height, waterAt, elevation: height, slope: p => {
+    const normal = groundNormal(p)
+    return Math.hypot(normal.x, normal.z) / Math.max(.001, normal.y)
+  } })
+  for (const station of architecturalStations) {
+    const layout = stationArchitectureLayout(map, station, height)
+    if (layout) architecture(stationArchitecture(layout, height))
   }
   for (const [batch, unlit] of [[water, true], [roads, true], [rail, true], [buildings, false]] as const) if (batch.positions.length) {
     const material = unlit ? new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }) : new THREE.MeshStandardMaterial({ vertexColors: true, roughness: .9, side: THREE.DoubleSide })
@@ -232,11 +266,11 @@ export function Map3D({ map, className = '' }: Map3DProps) {
     <div ref={host} className="map-3d-canvas" />
     {status === 'loading' && <div className="map-3d-status" role="status">地形と建物を立ち上げています…</div>}
     {status === 'unsupported' && <div className="map-3d-status" role="status">この環境では3Dを表示できません。2D表示をご利用ください。</div>}
-    {status === 'ready' && <>
-      <div className="map-3d-note"><strong>地形と建物の高さ</strong><span>建物高は1階あたり約3.2mの仮定です</span>{!surface && <span>この保存地図には標高がないため平面地形で表示</span>}</div>
-      <div className="map-3d-controls" aria-label="地図の視点操作">{buttons.map(button => <button key={button.action} type="button" aria-label={button.label} title={button.label} onClick={() => actions.current(button.action)}>{button.icon}</button>)}<button className="map-3d-reset" type="button" onClick={() => actions.current('reset')}>視点を戻す</button></div>
-      <p className="map-3d-help">ドラッグで回転 · 右ドラッグで移動 · ホイールで拡大縮小</p>
-    </>}
+    {status === 'ready' && <details className="map-3d-tools">
+      <summary>3D操作</summary>
+      <div className="map-3d-controls" aria-label="地図の視点操作">{buttons.map(button => <button key={button.action} type="button" aria-label={button.label} title={button.label} onClick={() => actions.current(button.action)}>{button.icon}</button>)}<button className="map-3d-reset" type="button" aria-label="視点を戻す" onClick={() => actions.current('reset')}>視点を戻す</button></div>
+      <p className="map-3d-help">ドラッグで回転、右ドラッグ・矢印キーで移動。ホイールで拡大縮小。</p>
+    </details>}
   </section>
 }
 export default Map3D

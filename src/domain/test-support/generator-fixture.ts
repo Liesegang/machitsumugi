@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_CONFIG, generateCity } from '../generator';
 import type { Building, CityType, FacilityKind } from '../types';
 import { bounds, contains, overlapsRegion, pointLineDistance, segmentCross } from './map-geometry';
+import { ownReligiousPrecinct } from './precinct-audit';
 
 const fixtures = new Map<string, ReturnType<typeof generateCity>>();
 export function fixture(config: Parameters<typeof generateCity>[0]) {
@@ -53,7 +54,7 @@ export function registerCityTypeCases(type: CityType) {
     for (const seed of ['minase-2026', 'trpg-42']) {
       it(`${preset.id} / ${seed}: footprints avoid water, streets, forest and railway rights of way`, () => {
         const map = fixture({ ...DEFAULT_CONFIG, type: preset.id, era: 'railway', terrain: preset.id === 'port' ? 'coast' : 'river', seed });
-        const obstacles = map.areas.filter(a => ['water', 'forest', 'park'].includes(a.kind)).map(a => ({ polygon: a.polygon, holes: a.holes, ...bounds(a.polygon) }));
+        const obstacles = map.areas.filter(a => ['water', 'forest', 'park'].includes(a.kind)).map(a => ({ ...a, ...bounds(a.polygon) }));
         const segments = [...map.roads, ...map.railways.map(r => ({ ...r, width: 15 }))].flatMap(r => r.points.slice(1).map((b, i) => ({ a: r.points[i]!, b, radius: r.width / 2, ...bounds([r.points[i]!, b]) })));
         const failures: string[] = [];
         for (const building of map.buildings) {
@@ -62,6 +63,7 @@ export function registerCityTypeCases(type: CityType) {
           for (const obstacle of obstacles) {
             // Castle keeps and gates stand inside their own reserved bailey land.
             if (building.id.startsWith('castle-') && map.areas.some(a => a.id === 'historic-core' && a.polygon === obstacle.polygon)) continue;
+            if (ownReligiousPrecinct(building, obstacle, map)) continue;
             if (bb.x1 < obstacle.x0 || bb.x0 > obstacle.x1 || bb.y1 < obstacle.y0 || bb.y0 > obstacle.y1) continue;
             if (overlapsRegion(p, obstacle)) failures.push(`${building.id}: ${obstacle.polygon.length}-point land exclusion`);
           }

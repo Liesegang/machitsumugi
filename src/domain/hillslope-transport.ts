@@ -1,5 +1,6 @@
-/** Conservative linear hillslope creep on cell faces. Boundary cells are fixed
- * with zero diffusive flux; fluvial export is handled by sediment transport.
+/** Conservative linear hillslope creep on cell faces. Only faces outside the
+ * domain have zero flux; perimeter cells still exchange with interior neighbours.
+ * Fluvial export is handled by sediment transport.
  * Marine beds do not erode through this closure, but receive land-derived soil.
  * The loose layer moves with the solid material instead of staying behind at
  * the old coordinate when the terrain is diffused.
@@ -13,10 +14,10 @@ export function transportHillslope(input: { elevation: Float32Array; alluvium: F
     const transfer = coefficient * (elevation[from]! - elevation[to]!)
     outgoing[from] += transfer; incoming[to] += transfer
   }
-  for (let y = 1; y < rows - 1; y++) for (let x = 1; x < columns - 1; x++) {
+  for (let y = 0; y < rows; y++) for (let x = 0; x < columns; x++) {
     const i = y * columns + x
-    if (x + 1 < columns - 1) face(i, i + 1)
-    if (y + 1 < rows - 1) face(i, i + columns)
+    if (x + 1 < columns) face(i, i + 1)
+    if (y + 1 < rows) face(i, i + columns)
   }
   const next = new Float32Array(elevation), loose = new Float64Array(alluvium)
   let bedrockSourceVolume = 0, transferredVolume = 0, netTerrainVolume = 0

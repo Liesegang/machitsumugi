@@ -127,6 +127,7 @@ function planNorthSouth(input: RailwayPlanInput & { terminalTarget?: Point; star
       edgeCost[col * headings + heading] = length * (nodeCost[i]! + nodeCost[before]!) * .5 + Math.max(0, grade - .02) ** 2 * length * 1000 + waterCount * 100 + streetCost.edgeCost(a, b)
     }
     const current = new Float64Array(stride).fill(Infinity), maxLevelDelta = MAX_GRADE * dy / elevationStep
+    let reached = false
     for (let col = 0; col < columns; col++) for (let heading = 0; heading < headings; heading++) {
       const routeCost = edgeCost[col * headings + heading]!
       if (!Number.isFinite(routeCost)) continue
@@ -147,8 +148,12 @@ function planNorthSouth(input: RailwayPlanInput & { terminalTarget?: Point; star
           }
         }
         current[target] = best; parents[row * stride + target] = bestParent
+        if (bestParent >= 0) reached = true
       }
     }
+    // Every transition comes from the preceding row. Once no engineering
+    // state is reachable, later rows cannot revive the same alignment.
+    if (!reached) return null
     previous = current
   }
   const endings: { state: number; cost: number; col: number }[] = []
@@ -248,7 +253,7 @@ function planNorthSouth(input: RailwayPlanInput & { terminalTarget?: Point; star
 export function planRailway(input: RailwayPlanInput): RailwayPlan | null {
   if (input.settlements?.length || input.terrain.channelAt) {
     const corridors = railwayCorridors({ ...input, settlements: input.settlements?.length ? input.settlements : [{ point: input.origin, demand: 1 }] })
-    for (const corridor of corridors) {
+    for (const corridor of corridors.filter(corridor => !corridor.terminus)) {
       const length = distance(corridor.from, corridor.to)
       if (length < 1200) continue
       const axis = { x: (corridor.to.x - corridor.from.x) / length, y: (corridor.to.y - corridor.from.y) / length }, normal = { x: axis.y, y: -axis.x }

@@ -14,5 +14,8 @@ export default function RegionalContext({ map }: { map: CityMap }) {
     renderMap(ctx, { ...map, width: context.extent, height: context.extent, terrainSurface: context.surface, previewPhase: 'erosion', previewCrop: context.crop }, { layers: DEFAULT_LAYERS, annotations: [], showSecrets: false, style: 'standard', scale: size / context.extent })
   }, [context, map])
   if (!context) return null
-  return <figure className="regional-context" aria-label="広域地形の中の生成区域"><canvas ref={canvas} role="img" aria-label="白い枠がこの地図の生成区域" /><figcaption>広域 {context.extent / 1000} km <span>白枠が表示範囲</span></figcaption></figure>
+  return <details className="regional-context" open={!!map.previewPhase}>
+    <summary>広域</summary>
+    <figure aria-label="広域地形の中の生成区域"><canvas ref={canvas} role="img" aria-label="白い枠がこの地図の生成区域" /><figcaption>{context.extent / 1000} km 四方 <span>白枠が表示範囲</span></figcaption></figure>
+  </details>
 }

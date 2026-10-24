@@ -70,17 +70,56 @@ function surveyValleyBoundary(input: ValleyBoundaryInput): { directions: Point[]
 
 export function valleyBoundaryPortals(input: ValleyBoundaryInput): Point[][] { return surveyValleyBoundary(input).directions }
 
+interface ValleyRoadSection { points: Point[]; bridge: boolean; length: number }
 export interface ValleyThroughRoad {
   route: PlannedRoute; width: number; fundingLimit: number
+  /** The survey walk may visit a shared bridge twice. Construction counts each
+   * physical deck once, while retaining both surveyed city approaches. */
+  constructionLength: number; constructionCost: number
   attachment: Point
   headwaterPass: boolean
-  sections: { points: Point[]; bridge: boolean; length: number }[]
+  sections: (ValleyRoadSection & { constructionCost: number })[]
+}
+
+/** Two destinations can share the same surveyed bridge near the town. They
+ * form a road network, not two decks laid over each other. Only exact surveyed
+ * bank-pair identity permits sharing; nearby parallel bridges stay distinct. */
+export function shareValleyBridgeDecks(sections: ValleyRoadSection[], spans: NonNullable<PlannedRoute['surveyedBridgeSpans']>) {
+  const result = sections.map(section => ({ ...section, points: section.points.map(p => ({ ...p })) }))
+  const decks = new Map<string, typeof result[number]>(), omitted = new Set<number>()
+  const key = (p: Point) => `${p.x.toFixed(4)},${p.y.toFixed(4)}`
+  for (const [index, section] of result.entries()) {
+    if (!section.bridge) continue
+    const first = section.points[0]!, last = section.points.at(-1)!
+    const span = spans.find(({ bankA, bankB }) => {
+      const length = distance(bankA, bankB)
+      if (length < 1) return false
+      const ends = Math.min(Math.max(distance(first, bankA), distance(last, bankB)), Math.max(distance(first, bankB), distance(last, bankA)))
+      return ends <= 1.5 && section.points.every(p => Math.abs((bankB.x - bankA.x) * (p.y - bankA.y) - (bankB.y - bankA.y) * (p.x - bankA.x)) / length < .04)
+    })
+    if (!span) continue
+    const identity = [key(span.bankA), key(span.bankB)].sort().join('|'), existing = decks.get(identity)
+    if (!existing) { decks.set(identity, section); continue }
+    const before = result[index - 1], after = result[index + 1]
+    if (!before || before.bridge || !after || after.bridge) continue
+    const a = existing.points[0]!, b = existing.points.at(-1)!
+    const reverse = distance(first, b) + distance(last, a) < distance(first, a) + distance(last, b)
+    const entry = reverse ? b : a, exit = reverse ? a : b
+    if (distance(first, entry) > 2 || distance(last, exit) > 2) continue
+    // Wet/dry splitting samples at 1m; two traversals can differ by a fraction
+    // of a metre. Both approaches use the first surveyed deck's exact nodes.
+    before.points[before.points.length - 1] = { ...entry }
+    after.points[0] = { ...exit }
+    omitted.add(index)
+  }
+  return result.filter((_, index) => !omitted.has(index)).map(section => ({ ...section, length: section.points.slice(1).reduce((sum, p, i) => sum + distance(section.points[i]!, p), 0) }))
 }
 
 /** Rebuilding an inherited bridge is one funded modification, not a second
  * bridge drawn over the old deck. Its junctions and earlier width stay dated. */
 export function commitValleyThroughRoad(graph: PlanarRoadGraph, project: ValleyThroughRoad, input: { year: number; reason: string; nextId: () => string }) {
-  if (!graph.nearest(project.attachment, .2)) return null
+  const totalCost = project.sections.reduce((sum, section) => sum + section.constructionCost, 0)
+  if (!graph.nearest(project.attachment, .2) || !Number.isFinite(project.constructionCost) || !Number.isFinite(totalCost) || totalCost < 0 || totalCost > project.fundingLimit || Math.abs(totalCost - project.constructionCost) > 1e-6 || project.sections.some(section => section.constructionCost < 0)) return null
   const projects: RoadProject[] = []
   for (const section of project.sections) {
     const inherited = section.bridge ? graph.roads.filter(road => road.bridge && road.width < project.width && road.points.every(point => section.points.slice(1).some((end, i) => distance(point, projectOnRoadSegment(point, section.points[i]!, end).point) < .04))) : []
@@ -88,7 +127,7 @@ export function commitValleyThroughRoad(graph: PlanarRoadGraph, project: ValleyT
     // retire one or bypass the ordinary duplicate-corridor check.
     if (inherited.length > 1) return null
     const existing = inherited[0]
-    projects.push({ points: section.points, metadata: { id: existing?.id ?? input.nextId(), builtYear: input.year, phase: 'suburban', role: section.bridge ? 'bridge' : 'highway', bridge: section.bridge, reason: input.reason, width: project.width, kind: 'arterial', constructionCost: project.route.cost * section.length / project.route.length, boundaryContinuation: true, preserveEndpoint: true }, requireConnection: false, ...(existing ? { modifies: existing.id } : {}) })
+    projects.push({ points: section.points, metadata: { id: existing?.id ?? input.nextId(), builtYear: input.year, phase: 'suburban', role: section.bridge ? 'bridge' : 'highway', bridge: section.bridge, reason: input.reason, width: project.width, kind: 'arterial', constructionCost: section.constructionCost, boundaryContinuation: true, preserveEndpoint: true }, requireConnection: false, ...(existing ? { modifies: existing.id } : {}) })
   }
   return graph.addBatch(projects)
 }
@@ -163,12 +202,12 @@ function planValleyConnection(input: ValleyThroughRoadInput): ValleyThroughRoad 
     }
     if (!second || pairFirst.cost + second.cost > fundingLimit || !gradeAllowed(second)) continue
     const points = pairFirst.points.slice().reverse().concat(second.points.slice(1))
-    if (alignmentDiagnostics(points).minimumRadius < 85 || !regionalPlanner.validate(points, width, pairFirst.bridgeLength + second.bridgeLength > 0)) continue
+    if (alignmentDiagnostics(points).minimumRadius < 85 || !regionalPlanner.validate(points, width, pairFirst.bridgeLength + second.bridgeLength > 0) || !regionalPlanner.railwayAllows(points, 'highway')) continue
     const spans = [...(pairFirst.surveyedBridgeSpans ?? []), ...(second.surveyedBridgeSpans ?? [])]
     const route: PlannedRoute = { ...pairFirst, points, length: pairFirst.length + second.length, cost: pairFirst.cost + second.cost, bridgeLength: pairFirst.bridgeLength + second.bridgeLength, boundaryContinuation: true, ...(spans.length ? { surveyedBridgeSpans: spans } : {}) }
     // Keep the same canonical alignment and the physical abutment-to-abutment
     // decks. Clipping the deck to the water mask would lose dry bank approaches.
-    const sections: ValleyThroughRoad['sections'] = []
+    const sections: ValleyRoadSection[] = []
     let run: Point[] = [points[0]!], bridge: boolean | undefined, runLength = 0
     for (let i = 1; i < points.length; i++) {
       const a = points[i - 1]!, b = points[i]!, n = Math.max(1, Math.ceil(distance(a, b)))
@@ -184,8 +223,16 @@ function planValleyConnection(input: ValleyThroughRoadInput): ValleyThroughRoad 
       }
     }
     if (run.length > 1) sections.push({ points: run, bridge: bridge ?? false, length: runLength })
-    if (sections.some(section => !regionalPlanner.validate(section.points, width, section.bridge))) continue
-    return { route, width, fundingLimit, attachment: origin, sections, headwaterPass: survey.headwaterPass || firstGoal.pass || goal.pass }
+    const network = shareValleyBridgeDecks(sections, spans)
+    if (network.some(section => !regionalPlanner.validate(section.points, width, section.bridge) || !gradeAllowed({ ...route, points: section.points }) || !regionalPlanner.railwayAllows(section.points, 'highway'))) continue
+    // Re-evaluate each physical section with the same location-dependent
+    // construction-credit proxy used by the route survey. A global length
+    // ratio would spread a shared bridge's fixed/water cost over mountain land.
+    const costed = network.map(section => ({ ...section, constructionCost: regionalPlanner.cost(section.points, 'highway', section.bridge).cost }))
+    const constructionCost = costed.reduce((sum, section) => sum + section.constructionCost, 0)
+    if (!Number.isFinite(constructionCost) || constructionCost > fundingLimit) continue
+    const constructionLength = network.reduce((sum, section) => sum + section.length, 0)
+    return { route, width, fundingLimit, attachment: origin, sections: costed, constructionLength, constructionCost, headwaterPass: survey.headwaterPass || firstGoal.pass || goal.pass }
     }
   }
   return null

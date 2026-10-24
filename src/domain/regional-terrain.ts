@@ -1,5 +1,6 @@
 import { erodeTerrain, routeDrainage } from './hydrology.ts'
 import { initialLandscape } from './initial-landscape.ts'
+import { coastalSeaLevel } from './coastal-landform.ts'
 import type { ErosionDiagnostics, LandscapeOptions, SedimentDiagnostics } from './hydrology.ts'
 import type { CityConfig, TerrainSurface } from './types'
 import { MARINE_PHYSICS_VERSION, prepareMarineReworking, reworkMarineCPU } from '../compute/webgpu-marine-sediment'
@@ -10,7 +11,7 @@ export type RegionalComputeOptions = Pick<MarineReworkingOptions, 'mode' | 'sign
   /** Diagnostic observer of the actual erosion grid, before preview decimation. */
   onFluvialStep?: LandscapeOptions['onStep']
 }
-export const REGIONAL_PHYSICS_VERSION = `landscape-v6:481x481:50m:256x4000y:marine-washload-v1:${MARINE_PHYSICS_VERSION}`
+export const REGIONAL_PHYSICS_VERSION = `landscape-v12:481x481:50m:256x4000y:marine-washload-v1:${MARINE_PHYSICS_VERSION}`
 
 export interface RegionalTerrain {
   extent: number
@@ -92,12 +93,12 @@ export function buildRegionalBase(input: RegionalRequest, onPreview?: (frame: Re
   const extent = 24_000, resolution = 50, columns = extent / resolution + 1, rows = columns, count = columns * rows
   const seed = terrainSeed(`${input.seed}:uplift-v1`), coastType = input.coastType ?? 'bay', relief = input.relief ?? 'hills'
   const initial = initialLandscape({ columns, resolution, extent, noise: terrainNoise, seed, coastType, relief })
-  const seaAt = (iteration: number, iterations: number) => coastType === 'ria' ? -40 * (1 - clamp((iteration - iterations + 16) / 16)) : 0
+  const seaAt = (iteration: number, iterations: number) => coastalSeaLevel(coastType, iteration, iterations)
   const eroded = erodeTerrain(initial.elevation, columns, rows, resolution, {
     passes: 256, timeStepYears: 4000, uplift: initial.uplift, erodibility: initial.erodibility,
     diffusivity: .15, sediment: true,
-    // Drowned valleys result from a late base-level rise over the previously
-    // eroded terrain. No ria outline or river-mouth trumpet is stamped on it.
+    // Drowned valleys and island-margin bays result from a late base-level
+    // rise over the eroded terrain, never a stamped outline or restored mask.
     seaLevel: seaAt,
     onStep: state => { previewFrame({ columns, rows, resolution }, state.elevation, state.iteration, state.iterations, state.seaLevel, onPreview); onFluvialStep?.(state) },
   })

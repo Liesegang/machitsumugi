@@ -6,6 +6,8 @@ import { waterGeometry } from './water-surfaces'
 import { areaLabelPoint } from './area-labels'
 import { seaDepthRaster } from './bathymetry'
 import { landPaintGroups } from './land-paint'
+import { subwayInk, SUBWAY_DASH, SUBWAY_LINE_WIDTH } from './railway-style'
+import { woodlandCrowns, WOODLAND_TEXTURE_MIN_SCALE } from './woodland-texture'
 
 function filename(map: CityMap, extension: string) {
   return `${map.config.name.replace(/[\\/:*?"<>|]/g, '_') || 'machitsumugi'}-${map.config.seed.replace(/[^\w\u3000-\u9fff-]/g, '_').slice(0, 48)}.${extension}`
@@ -89,13 +91,18 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
   const text = (name: string, p: Point, color: string, size = 12, weight = 500) => `<text x="${p.x.toFixed(2)}" y="${p.y.toFixed(2)}" text-anchor="middle" dominant-baseline="central" font-size="${size * px}" font-weight="${weight}" fill="${color}" stroke="${c.halo}" stroke-width="${3 * px}" paint-order="stroke" stroke-linejoin="round">${escapeXml(name)}</text>`
   parts.push(`<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="4096" height="${Math.round(4096 * map.height / map.width)}" viewBox="0 0 ${map.width} ${map.height}" font-family="Noto Sans JP,Yu Gothic,Hiragino Kaku Gothic ProN,sans-serif"><title>${escapeXml(map.config.name)} — 架空日本地図ジェネレーター</title><desc>架空都市地図。seed: ${escapeXml(map.config.seed)}</desc><defs><clipPath id="bounds"><rect width="${map.width}" height="${map.height}"/></clipPath></defs><rect width="${map.width}" height="${map.height}" fill="${c.ground}"/><g clip-path="url(#bounds)" stroke-linejoin="round" stroke-linecap="round">`)
   if (layers.terrain) {
+    let woodlandSerial = 0
     for (const group of landPaintGroups(map.areas)) {
       if (options.contours && map.terrainSurface) continue
       const area = group[0]!
       const d = group.flatMap(part => [part.polygon, ...part.holes ?? []]).map(ring => path(ring, true)).join(' ')
       parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
-      // The portable full-city view uses the same continuous woodland fill as
-      // the canvas overview; individual tree texture belongs to close zooms.
+      if ((area.kind === 'forest' || area.landUse === 'woodland') && 1 / px >= WOODLAND_TEXTURE_MIN_SCALE) {
+        const clipId = `woodland-texture-${woodlandSerial++}`
+        parts.push(`<defs><clipPath id="${clipId}"><path d="${d}" clip-rule="evenodd"/></clipPath></defs><g clip-path="url(#${clipId})">`)
+        for (const crown of woodlandCrowns(group, area.landUse === 'woodland')) parts.push(`<circle cx="${crown.x.toFixed(3)}" cy="${crown.y.toFixed(3)}" r="${crown.radius.toFixed(3)}" fill="${crown.dark ? c.treeDark : c.tree}" opacity="${crown.opacity.toFixed(6)}"/>`)
+        parts.push('</g>')
+      }
     }
     const water = waterGeometry(map.areas)
     let seaSerial = 0
@@ -125,6 +132,10 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
     }
   }
   if (layers.railway) for (const rail of map.railways) {
+    if (rail.mode === 'subway') {
+      parts.push(`<path data-mode="subway" d="${path(rail.points)}" fill="none" stroke="${c.halo}" stroke-width="${(SUBWAY_LINE_WIDTH + 2) * px}"/><path data-mode="subway" d="${path(rail.points)}" fill="none" stroke="${subwayInk(options.style)}" stroke-width="${SUBWAY_LINE_WIDTH * px}" stroke-dasharray="${SUBWAY_DASH.map(value => value * px).join(' ')}"/>`)
+      continue
+    }
     parts.push(`<path d="${path(rail.points)}" fill="none" stroke="${c.railwayInner}" stroke-width="${5.5 * px}"/><path d="${path(rail.points)}" fill="none" stroke="${c.railway}" stroke-width="${3.1 * px}"/><path d="${path(rail.points)}" fill="none" stroke="${c.railwayInner}" stroke-width="${1.55 * px}" stroke-dasharray="${5 * px} ${4 * px}"/>`)
   }
   if (layers.grid) {
@@ -139,6 +150,12 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
   }
   if (layers.railway) for (const station of map.stations) {
     const { x, y } = station.point
+    if (layers.buildings && station.buildingPolygon) parts.push(`<path d="${path(station.buildingPolygon, true)}" fill="${c.public}" stroke="${c.buildingEdge}" stroke-width="${.6 * px}"/>`)
+    if (station.mode === 'subway') {
+      parts.push(`<circle data-mode="subway" cx="${x}" cy="${y}" r="${6 * px}" fill="${c.halo}" stroke="${subwayInk(options.style)}" stroke-width="${2 * px}"/>`)
+      if (layers.labels) parts.push(text(station.name, { x, y: y + 16 * px }, subwayInk(options.style), 11, 700))
+      continue
+    }
     parts.push(`<rect x="${x - 6 * px}" y="${y - 6 * px}" width="${12 * px}" height="${12 * px}" rx="${px}" fill="${c.station}" stroke="${c.halo}" stroke-width="${px}"/><path d="M${x - 3 * px} ${y - 3 * px}h${6 * px}v${5 * px}h${-6 * px}z M${x - 2.5 * px} ${y + 4 * px}h${5 * px}" stroke="${c.halo}" stroke-width="${px}" fill="none"/>`)
     if (layers.labels) parts.push(text(station.name, { x, y: y + 17 * px }, c.station, 12, 700))
   }

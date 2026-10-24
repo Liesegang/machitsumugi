@@ -127,8 +127,8 @@ fn hillslope(z: &[f32], loose: &[f64], columns: usize, rows: usize, cell: f64, c
         if z[from] as f64 <= sea { return; }
         let transfer = coefficient * (z[from] as f64 - z[to] as f64); outgoing[from] += transfer; incoming[to] += transfer;
     };
-    for y in 1..rows.saturating_sub(1) { for x in 1..columns.saturating_sub(1) { let i = y * columns + x;
-        if x + 1 < columns - 1 { face(i,i+1); } if y + 1 < rows - 1 { face(i,i+columns); }
+    for y in 0..rows { for x in 0..columns { let i = y * columns + x;
+        if x + 1 < columns { face(i,i+1); } if y + 1 < rows { face(i,i+columns); }
     } }
     let mut next = z.to_vec(); let mut layer = loose.to_vec(); let mut bedrock = 0.0; let mut transferred = 0.0; let mut net = 0.0;
     for i in 0..n {
@@ -170,7 +170,8 @@ fn sediment(z: &[f32], drain: &Drainage, source: &[f64], columns: usize, rows: u
         // keep multiplication/division order to retain JS f64 rounding.
         let length = if marine[i] { fluvial_length.max(0.05 * (sea - z[i] as f64).max(1.0) / 0.00004) } else { fluvial_length };
         let attenuation = 1.0 - unsafe { exp(-cell / length) };
-        let accommodation = if !marine[i] && depth > 0.01 { depth } else { (cell * 0.025).max(if marine[i] { sea - z[i] as f64 + 0.15 } else { 0.0 }) };
+        // Keep the dry-channel minimum out of shallow marine accommodation.
+        let accommodation = if marine[i] { (sea - z[i] as f64 + 0.15).max(0.0) } else if depth > 0.01 { depth } else { cell * 0.025 };
         let settled = (volume * attenuation).min(accommodation * area); deposition[i] = settled / area; deposited += settled;
         if marine[i] { marine_deposited += settled; } else { terrestrial += settled; if depth > 0.01 { lake += settled; } }
         let transported = volume - settled;
@@ -223,9 +224,12 @@ impl Kernel {
             let sea = self.seas[self.iteration+1]; let mut next = self.terrain.clone(); let mut detached = vec![0.0;self.raw.len()];
             for order_index in (0..self.drainage.processed).rev() {
                 let i = self.drainage.order[order_index] as usize; let x = i % self.columns; let y = i / self.columns; let downstream = self.drainage.flow[i];
-                if x == 0 || y == 0 || x + 1 == self.columns || y + 1 == self.rows { continue; }
                 let uplift = if self.flags & 1 != 0 { self.uplift[i] as f64 } else { 0.0 } * self.dt; let raised = self.terrain[i] as f64 + uplift;
                 next[i] = raised as f32; self.stats[12] += uplift * (self.cell * self.cell);
+                // The erosion boundary follows crustal motion; only incision
+                // is fixed here. Hillslope exchange still uses every internal
+                // face, including the perimeter-to-interior faces.
+                if x == 0 || y == 0 || x + 1 == self.columns || y + 1 == self.rows { continue; }
                 if self.terrain[i] as f64 <= sea || downstream < 0 { continue; } let downstream = downstream as usize;
                 let horizontal = if i % self.columns == downstream % self.columns || i / self.columns == downstream / self.columns { self.cell } else { self.cell * SQRT2 };
                 let receiver_lake = self.drainage.hydro[downstream] as f64 - self.terrain[downstream] as f64 > 0.01;

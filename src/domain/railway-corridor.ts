@@ -79,6 +79,19 @@ export function railwayCorridors(input: RailwayCorridorInput): RailwayCorridor[]
       const p = points[i]!, f = fields[i]!
       const onSide = side === 0 ? p.y === 0 : side === 1 ? p.x === input.width : side === 2 ? p.y === input.height : p.x === 0
       if (!onSide || f.blocked || f.water || f.grade > .12) continue
+      // Polygon point-in-region is open on some viewport edges. A sample
+      // exactly on a clipped sea boundary can otherwise look like dry seabed.
+      // Survey the actual inward approach before accepting an external exit.
+      // At a viewport corner, an edge-normal probe remains on the other open
+      // polygon boundary. Move inward on both axes to survey the actual land.
+      const inward = { x: p.x === 0 ? 1 : p.x === input.width ? -1 : 0, y: p.y === 0 ? 1 : p.y === input.height ? -1 : 0 }
+      const inwardLength = Math.hypot(inward.x, inward.y)
+      if ([8, 20, 40].some(d => {
+        const approach = field({ x: p.x + inward.x * d / inwardLength, y: p.y + inward.y * d / inwardLength })
+        // A stream shortly after a dry bank can have a legitimate bridge;
+        // only forbidden sea/reserved land disqualifies the boundary approach.
+        return approach.blocked
+      })) continue
       const importance = f.channel ? Math.min(2, f.channel.width / 18) * Math.max(0, 1 - Math.abs(f.channel.bankDistance - 180) / 500) : 0
       candidates.push({ index: i, side, importance, score: f.cost - importance * .8 + distance(p, input.origin) * .00015 })
     }
@@ -97,7 +110,11 @@ export function railwayCorridors(input: RailwayCorridorInput): RailwayCorridor[]
     if (!first) continue
     if (input.allowTerminus && first.cost > 1500 && distance(points[a.index]!, points[station.cell]!) > 1400) plans.push({ points: first.points, from: points[a.index]!, to: points[station.cell]!, station: points[station.cell]!, terminus: true, score: first.cost / distance(points[a.index]!, points[station.cell]!) + station.access * .001 - a.importance * .12 + .15 })
     for (const b of exits) {
-      if (a.side >= b.side || (b.side - a.side !== 2) || distance(points[a.index]!, points[b.index]!) < Math.min(input.width, input.height) * .8) continue
+      // A valley can leave the surveyed window through adjacent edges. Forcing
+      // opposite edges sent an inland town toward the sea or over a high ridge.
+      // Retain a regional span and let the unchanged engineering DP decide.
+      const minimumSpan = Math.min(input.width, input.height) * (b.side - a.side === 2 ? .8 : .55)
+      if (a.side >= b.side || distance(points[a.index]!, points[b.index]!) < Math.max(1400, minimumSpan)) continue
       const second = route(station.cell, b.index)
       if (!second) continue
       const span = distance(points[a.index]!, points[b.index]!)
@@ -106,7 +123,17 @@ export function railwayCorridors(input: RailwayCorridorInput): RailwayCorridor[]
   }
   plans.sort((a, b) => a.score - b.score)
   const selected: RailwayCorridor[] = []
-  for (const plan of plans) if (selected.filter(previous => distance(previous.station, plan.station) < 100).length < 2 && selected.every(previous => distance(previous.from, plan.from) + distance(previous.to, plan.to) + distance(previous.station, plan.station) > 150)) { selected.push(plan); if (selected.length >= 12) break }
-  if (input.allowTerminus) for (const plan of plans.filter(p => p.terminus).slice(0, 3)) if (!selected.includes(plan)) selected.push(plan)
+  // A cheap terminal approach must not consume the through-line survey budget.
+  // Its construction is considered only after every through alignment fails.
+  for (const plan of plans.filter(plan => !plan.terminus)) if (selected.filter(previous => distance(previous.station, plan.station) < 100).length < 2 && selected.every(previous => distance(previous.from, plan.from) + distance(previous.to, plan.to) + distance(previous.station, plan.station) > 150)) { selected.push(plan); if (selected.length >= 12) break }
+  if (input.allowTerminus) {
+    const terminals: RailwayCorridor[] = []
+    // Survey different external approaches instead of spending all three
+    // attempts on nearby station alternatives reached from the same exit.
+    for (const plan of plans.filter(plan => plan.terminus)) if (terminals.every(previous => distance(previous.from, plan.from) > 400)) {
+      terminals.push(plan); if (terminals.length >= 3) break
+    }
+    selected.push(...terminals)
+  }
   return selected
 }

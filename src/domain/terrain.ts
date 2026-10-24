@@ -12,6 +12,8 @@ import type { WaterRegion } from './terrain-water.ts'
 import { extractDepressionLakes } from './depression-lakes.ts'
 import { coastalWindow } from './coastal-window.ts'
 import { regionQuery } from './region-query.ts'
+import { contourNaturalLand } from './land-use'
+import { boundsOf, regionArea, subtractRegions } from './geometry'
 
 const lakeCache = new WeakMap<RegionalTerrain, ReturnType<typeof extractDepressionLakes>>()
 
@@ -90,25 +92,6 @@ function simplifyLine(path: Point[], tolerance: number): Point[] {
   }
   return farthest ? [...simplifyLine(path.slice(0, farthest + 1), tolerance).slice(0, -1), ...simplifyLine(path.slice(farthest), tolerance)] : [a, b]
 }
-function simplifyLoop(polygon: Point[], tolerance: number) {
-  let farthest = 1
-  for (let i = 2; i < polygon.length; i++) if (Math.hypot(polygon[i]!.x - polygon[0]!.x, polygon[i]!.y - polygon[0]!.y) > Math.hypot(polygon[farthest]!.x - polygon[0]!.x, polygon[farthest]!.y - polygon[0]!.y)) farthest = i
-  return [...simplifyLine(polygon.slice(0, farthest + 1), tolerance).slice(0, -1), ...simplifyLine([...polygon.slice(farthest), polygon[0]!], tolerance).slice(0, -1)]
-}
-function soften(polygon: Point[], iterations: number, width: number, height: number) {
-  let result = polygon
-  for (let pass = 0; pass < iterations; pass++) {
-    const next: Point[] = []
-    for (let i = 0; i < result.length; i++) {
-      const p = result[i]!, q = result[(i + 1) % result.length]!
-      if ((p.x === 0 || p.x === width) && (p.y === 0 || p.y === height)) next.push(p)
-      next.push({ x: p.x * .75 + q.x * .25, y: p.y * .75 + q.y * .25 }, { x: p.x * .25 + q.x * .75, y: p.y * .25 + q.y * .75 })
-    }
-    result = next
-  }
-  return result
-}
-
 /** Remove tiny offset-bank loops where bend radius is smaller than half-width. */
 function cleanBank(path: Point[]) {
   let result = path
@@ -128,39 +111,27 @@ function cleanBank(path: Point[]) {
   return result
 }
 
-/** Trace contour masks as connected woodland boundaries, rather than isolated ellipse stamps. */
-function contours(mask: boolean[][], stepX: number, stepY: number) {
-  type Edge = { a: Point; b: Point; direction: number; used: boolean }
-  const edges: Edge[] = [], outgoing = new Map<string, Edge[]>()
-  const key = (p: Point) => `${p.x}:${p.y}`
-  const occupied = (x: number, y: number) => mask[y]?.[x] === true
-  const add = (a: Point, b: Point, direction: number) => {
-    const edge = { a, b, direction, used: false }
-    edges.push(edge)
-    const group = outgoing.get(key(a)) ?? []; group.push(edge); outgoing.set(key(a), group)
-  }
-  for (let y = 0; y < mask.length; y++) for (let x = 0; x < mask[y]!.length; x++) {
-    if (!occupied(x, y)) continue
-    if (!occupied(x, y - 1)) add({ x, y }, { x: x + 1, y }, 0)
-    if (!occupied(x + 1, y)) add({ x: x + 1, y }, { x: x + 1, y: y + 1 }, 1)
-    if (!occupied(x, y + 1)) add({ x: x + 1, y: y + 1 }, { x, y: y + 1 }, 2)
-    if (!occupied(x - 1, y)) add({ x, y: y + 1 }, { x, y }, 3)
-  }
-  const polygons: Point[][] = []
-  const priority = [1, 0, 3, 2]
-  for (const first of edges) {
-    if (first.used) continue
-    const path: Point[] = []
-    let edge: Edge | undefined = first
-    for (let guard = 0; edge && guard <= edges.length; guard++) {
-      edge.used = true; path.push({ x: edge.a.x * stepX, y: edge.a.y * stepY })
-      if (key(edge.b) === key(first.a)) break
-      const direction: number = edge.direction
-      edge = (outgoing.get(key(edge.b)) ?? []).filter(candidate => !candidate.used).sort((a, b): number => priority.indexOf((a.direction - direction + 4) % 4) - priority.indexOf((b.direction - direction + 4) % 4))[0]
-    }
-    if (path.length > 5 && area(path) > 12_000) polygons.push(soften(simplifyLoop(path, Math.max(stepX, stepY) * .8), 3, mask[0]!.length * stepX, mask.length * stepY))
-  }
-  return polygons
+/** Mountain-foot woodland uses the same continuous terrain suitability used by
+ * land placement. A binary 40m mask followed by 32m simplification turned a
+ * curved mountain foot into long straight bands. Keep its signed values and
+ * their holes through contouring; these polygons also constrain development. */
+export function woodlandContours(input: {
+  width: number; height: number; forest: number; origin: Point; coreRadius: number
+  elevation(p: Point): number; slope(p: Point): number; bankDistance(p: Point): number
+  variation(p: Point): number; water: WaterRegion[]
+}): WaterRegion[] {
+  if (input.forest <= 0) return []
+  const reference = input.elevation(input.origin), threshold = 110 - clamp(input.forest / 100) * 90
+  const water = input.water.map(region => ({ ...region, bounds: boundsOf(region.polygon) }))
+  const contours = contourNaturalLand(input.width, input.height, p => Math.min(
+    input.elevation(p) - reference + input.slope(p) * 320 + input.variation(p) - threshold,
+    input.bankDistance(p) - 65,
+    Math.hypot(p.x - input.origin.x, p.y - input.origin.y) - input.coreRadius - 75,
+  ), 24)
+  return contours.flatMap(region => clipWaterRegion(region, input.width, input.height)).flatMap(region => {
+    const b = boundsOf(region.polygon)
+    return subtractRegions(region, water.filter(w => w.bounds.maxX >= b.minX && w.bounds.minX <= b.maxX && w.bounds.maxY >= b.minY && w.bounds.minY <= b.maxY))
+  }).filter(region => regionArea(region) > 12_000).sort((a, b) => regionArea(b) - regionArea(a))
 }
 
 /** Regional watershed formation precedes urban site choice and the local map crop. */
@@ -205,7 +176,7 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   const coastalCandidates: { index: number; point: Point; score: number }[] = []
   for (let i = 0; i < world.rawDEM.length; i++) {
     const p = worldPoint(i), catchment = world.accumulatedArea[i]!, z = world.rawDEM[i]!, next = world.flowTo[i]!
-    const inlandMargin = input.terrain === 'coast' ? 1200 : 3500
+    const inlandMargin = input.terrain === 'coast' ? 500 : 3500
     if (p.x < inlandMargin || p.x > world.extent - inlandMargin || p.y < inlandMargin || p.y > world.extent - (input.terrain === 'coast' ? 500 : 2100) || world.ocean[i]) continue
     if (input.terrain === 'plain') {
       if (z < 28 || z > 150 || catchment > 300_000 || worldSlope(i) > .035) continue
@@ -228,14 +199,27 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
       if (cost < score) { score = cost; pivot = i }
     }
   }
-  if (pivot < 0) pivot = indexAt({ x: world.extent * .59, y: world.extent * (input.terrain === 'coast' ? .80 : .55) })
+  if (pivot < 0 && input.terrain === 'coast') {
+    // A rocky peninsula may have no low, gently sloping shoreline. Frame the
+    // least costly real shore anyway; do not invent one at a fixed southern
+    // coordinate. The city planner still checks buildability on this ground.
+    for (let i = 0; i < world.rawDEM.length; i++) {
+      const p = worldPoint(i)
+      if (world.ocean[i] || p.x < 500 || p.y < 500 || p.x > world.extent - 500 || p.y > world.extent - 500) continue
+      if (![i - 1, i + 1, i - world.columns, i + world.columns].some(j => j >= 0 && j < world.ocean.length && world.ocean[j])) continue
+      const cost = worldSlope(i) * 100 + Math.max(0, world.rawDEM[i]! - 25) / 10 - sitePotential(i)
+      coastalCandidates.push({ index: i, point: p, score: cost })
+      if (cost < score) { score = cost; pivot = i }
+    }
+  }
+  if (pivot < 0) pivot = indexAt({ x: world.extent * .59, y: world.extent * .55 })
   // The viewport is a surveyed window into the entire regional watershed. A
   // fixed river-at-68% crop made every seed have the same west-bank composition.
   // Transform *all* regional sampling, including the DEM and ocean, rather than
   // rotating already clipped polygons (which would leave unsupported corners).
   const frameSeed = seedNumber(`${input.seed}:map-frame-v1`)
   const style = noise(frameSeed, 0, 8), mirrored = frameSeed % 2 === 1, mirror = mirrored ? -1 : 1
-  const coastFrame = input.terrain === 'coast' ? coastalWindow({ width: w, height: h, extent: world.extent, margin: 500, mirrored, candidates: coastalCandidates, seaAt: p => p.x >= 0 && p.y >= 0 && p.x <= world.extent && p.y <= world.extent && !!world.ocean[indexAt(p)], usableAt: p => !!habitable[indexAt(p)] }) : null
+  const coastFrame = input.terrain === 'coast' ? coastalWindow({ width: w, height: h, extent: world.extent, margin: 500, mirrored, preferredBearing: style * Math.PI * 2, ...(input.coastType === 'peninsula' ? { landform: 'peninsula' as const } : {}), candidates: coastalCandidates, seaAt: p => p.x >= 0 && p.y >= 0 && p.x <= world.extent && p.y <= world.extent && !!world.ocean[indexAt(p)], usableAt: p => !!habitable[indexAt(p)] }) : null
   if (coastFrame) pivot = coastFrame.index
   const angle = coastFrame?.angle ?? (style - .5) * .9, cosine = Math.cos(angle), sine = Math.sin(angle)
   const oppositeBank = style > .5
@@ -585,15 +569,9 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   const bridgeSites = selected.filter(c => c.riverId === 'river').map(c => c.point)
   for (const candidate of selected) if (bridgeSites.length < 3 && bridgeSites.every(p => Math.hypot(p.x - candidate.point.x, p.y - candidate.point.y) > 650)) bridgeSites.push(candidate.point)
   if (input.forest > 0) {
-    const cols = Math.ceil(w / 40), rows = Math.ceil(h / 40), sx = w / cols, sy = h / rows, reference = elevation(cityOrigin)
-    const threshold = 110 - clamp(input.forest / 100) * 90
-    const mask = Array.from({ length: rows }, (_, row) => Array.from({ length: cols }, (_, col) => {
-      const p = { x: (col + .5) * sx, y: (row + .5) * sy }
-      if (waterAt(p) || nearRiver(p).bankDistance < 65 || Math.hypot(p.x - cityOrigin.x, p.y - cityOrigin.y) < coreRadius + 75) return false
-      const ridge = elevation(p) - reference + slope(p) * 320 + (noise(seed, p.x / 240, p.y / 240) - .5) * 14
-      return ridge > threshold
-    }))
-    for (const [i, polygon] of contours(mask, sx, sy).entries()) if (!polygon.some(waterAt)) areas.push({ id: `forest-${i}`, kind: 'forest', polygon, name: i === 0 ? '北山丘陵' : i === 1 ? '西ノ森' : undefined })
+    const forest = woodlandContours({ width: w, height: h, forest: input.forest, origin: cityOrigin, coreRadius, elevation, slope,
+      bankDistance: p => nearRiver(p).bankDistance, variation: p => (noise(seed, p.x / 240, p.y / 240) - .5) * 14, water: areas.filter(area => area.kind === 'water') })
+    for (const [i, region] of forest.entries()) areas.push({ id: `forest-${i}`, kind: 'forest', ...region, name: i === 0 ? '北山丘陵' : i === 1 ? '西ノ森' : undefined })
   }
   const channelAt: TerrainModel['channelAt'] = p => { const r = nearRiver(p); return Number.isFinite(r.distance) ? { point: r.point, tangent: r.tangent, bankDistance: r.bankDistance, width: r.width, surfaceElevation: r.z, riverId: r.riverId } : null }
   const bounds = { minX: -500, minY: -500, maxX: w + 500, maxY: h + 500 }

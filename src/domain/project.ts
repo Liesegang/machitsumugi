@@ -1,6 +1,8 @@
 import type { CityConfig, CityMap, Point, TerrainSurface, TimelineVersion } from './types'
 import { sliceCityAtYear } from './timeline'
 import { readableProvisionalNames } from './place-names'
+import { validateMapEdits } from './map-edits'
+import type { MapEdit } from './map-edits'
 import type { Annotation, LayerSettings, MapStyle } from '../map/render'
 
 export interface Project {
@@ -11,6 +13,8 @@ export interface Project {
   style: MapStyle
   /** Completed geometry is authoritative; importing it must not run a newer engine. */
   snapshot?: CityMap
+  /** Dated manual overlays. Never merge these into the generated snapshot. */
+  edits?: MapEdit[]
 }
 
 export const STORAGE_KEY = 'machitsumugi.project.v2'
@@ -27,7 +31,7 @@ const ARCHIVE_STORE = 'projects'
 let archiveWrites: Promise<boolean> = Promise.resolve(true)
 const CITY_TYPES = ['castle', 'temple', 'port', 'newtown', 'post', 'onsen'] as const
 const TERRAINS = ['river', 'plain', 'coast'] as const
-const FACILITIES = ['shrine', 'school', 'hospital', 'police', 'shop', 'park', 'castle', 'port', 'onsen'] as const
+const FACILITIES = ['shrine', 'school', 'university', 'hospital', 'police', 'shop', 'park', 'castle', 'port', 'onsen'] as const
 const STYLES = ['standard', 'mono', 'night'] as const
 const LAYER_KEYS = ['buildings', 'roads', 'railway', 'labels', 'facilities', 'terrain', 'grid'] as const
 
@@ -80,11 +84,12 @@ function configFrom(value: unknown): CityConfig {
   if (input.targetYear !== undefined) config.targetYear = number(input.targetYear, '表示年代', 1650, 2025, true)
   if (input.settlement !== undefined) config.settlement = choice(input.settlement, ['village', 'rural-town', 'regional-city', 'metropolis'] as const, '地域の規模')
   if (input.populationTrend !== undefined) config.populationTrend = choice(input.populationTrend, ['declining', 'stable', 'growing'] as const, '人口推移')
-  if (input.coastType !== undefined) config.coastType = choice(input.coastType, ['bay', 'ria', 'delta'] as const, '海岸の成り立ち')
+  if (input.coastType !== undefined) config.coastType = choice(input.coastType, ['bay', 'ria', 'delta', 'peninsula'] as const, '海岸の成り立ち')
   if (input.relief !== undefined) config.relief = choice(input.relief, ['lowland', 'hills', 'mountains'] as const, '地形の起伏')
   if (input.mapSize !== undefined) config.mapSize = choice(input.mapSize, ['small', 'medium', 'large'] as const, '地図の広さ')
   if (input.expressway !== undefined) config.expressway = boolean(input.expressway, '高速道路')
   if (input.bypass !== undefined) config.bypass = boolean(input.bypass, 'バイパス')
+  if (input.subway !== undefined) config.subway = boolean(input.subway, '地下鉄')
   return config
 }
 
@@ -159,7 +164,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       id, polygon: points(a.polygon, '土地の形', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints), kind: choice(a.kind, ['water', 'forest', 'park', 'field'] as const, '土地の種類'),
       ...(a.name === undefined ? {} : { name: string(a.name, '土地の名前', 200, true) }),
       ...(a.waterLevel === undefined ? {} : { waterLevel: number(a.waterLevel, '水平水面の標高', -10_000, 10_000) }),
-      ...(a.landUse === undefined ? {} : { landUse: choice(a.landUse, ['farmland', 'paddy', 'dry-field', 'meadow', 'wetland', 'vacant'] as const, '土地の用途') }),
+      ...(a.landUse === undefined ? {} : { landUse: choice(a.landUse, ['farmland', 'paddy', 'dry-field', 'meadow', 'woodland', 'wetland', 'vacant'] as const, '土地の用途') }),
       ...(a.holes === undefined ? {} : { holes: array(a.holes, '土地の内周', 10_000).map(hole => points(hole, '土地の内周の形', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints)) }),
     })
   const readRailway = (r: Record<string, unknown>, id: string) => {
@@ -171,9 +176,9 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
         return { kind: choice(s.kind, ['bridge', 'cutting', 'embankment'] as const, '鉄道構造物の種類'), from: point(s.from, '構造物の始点'), to: point(s.to, '構造物の終点'), maxHeight: number(s.maxHeight, '構造物の高さ', -10_000, 10_000), ...(s.length === undefined ? {} : { length: number(s.length, '鉄道構造物の延長', 0, 500_000) }) }
       })
       const junction = r.junction === undefined ? undefined : object(r.junction, '鉄道の分岐')
-      return { id, points: path, name: string(r.name, '路線名', 200), ...(elevations ? { elevations } : {}), ...(structures ? { structures } : {}), ...(junction ? { junction: { parentId: string(junction.parentId, '分岐元の路線', 128), point: point(junction.point, '分岐点') } } : {}), ...(r.builtYear === undefined ? {} : { builtYear: year(r.builtYear, '鉄道開通年') }) }
+      return { id, points: path, name: string(r.name, '路線名', 200), ...(r.mode === undefined ? {} : { mode: choice(r.mode, ['surface', 'subway'] as const, '鉄道の運行方式') }), ...(elevations ? { elevations } : {}), ...(structures ? { structures } : {}), ...(junction ? { junction: { parentId: string(junction.parentId, '分岐元の路線', 128), point: point(junction.point, '分岐点') } } : {}), ...(r.builtYear === undefined ? {} : { builtYear: year(r.builtYear, '鉄道開通年') }) }
     }
-  const readStation = (s: Record<string, unknown>, id: string) => ({ id, point: point(s.point, '駅の位置'), name: string(s.name, '駅名', 200) })
+  const readStation = (s: Record<string, unknown>, id: string) => ({ id, point: point(s.point, '駅の位置'), name: string(s.name, '駅名', 200), ...(s.mode === undefined ? {} : { mode: choice(s.mode, ['surface', 'subway'] as const, '駅の方式') }), ...(s.railwayId === undefined ? {} : { railwayId: string(s.railwayId, '駅の所属路線', 128) }), ...(s.builtYear === undefined ? {} : { builtYear: year(s.builtYear, '駅開業年') }), ...(s.entrance === undefined ? {} : { entrance: point(s.entrance, '駅の地上出入口') }), ...(s.buildingPolygon === undefined ? {} : { buildingPolygon: points(s.buildingPolygon, '駅舎の敷地', true, 32) }) })
   const readFacility = (f: Record<string, unknown>, id: string) => ({ id, point: point(f.point, '施設の位置'), name: string(f.name, '施設名', 200), kind: choice(f.kind, FACILITIES, '施設の種類') })
   const readDistrict = (d: Record<string, unknown>, id: string) => ({
       id, point: point(d.point, '地区の位置'), name: string(d.name, '地区名', 200),
@@ -335,7 +340,9 @@ export function validateProject(data: unknown): Project {
   })
   const inputLayers = object(input.layers, 'レイヤー')
   const layers = Object.fromEntries(LAYER_KEYS.map(key => [key, boolean(inputLayers[key], `レイヤー「${key}」`)])) as unknown as LayerSettings
-  return { version: 2, config, annotations, layers, style: choice(input.style, STYLES, '地図の配色'), ...(snapshot ? { snapshot } : {}) }
+  const factor = config.mapSize === 'large' ? 3 : config.mapSize === 'medium' ? 2 : 1
+  const edits = input.edits === undefined ? undefined : validateMapEdits(input.edits, snapshot?.width ?? 4000 * factor, snapshot?.height ?? 3000 * factor)
+  return { version: 2, config, annotations, layers, style: choice(input.style, STYLES, '地図の配色'), ...(snapshot ? { snapshot } : {}), ...(edits === undefined ? {} : { edits }) }
 }
 
 export function parseProject(text: string): Project {

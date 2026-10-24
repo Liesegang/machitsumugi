@@ -1,4 +1,4 @@
-import type { Area, Point } from './types'
+import type { Area, Point, Road } from './types'
 import { MinHeap, roadLength } from './road-graph'
 import type { RoadRole } from './road-graph'
 import { alignmentDiagnostics, resampleAlignment, splineAlignment, tangentAlignment } from './road-alignment'
@@ -67,6 +67,13 @@ export class RoadPlanner {
     this.railwayCorridors = corridors.slice()
     this.railwayConstraints = corridors.length ? new RailwayRoadConstraints(corridors) : null
     this.railwayRevision++; this.dryRouteCache.clear()
+  }
+  setRailwayRoadNetwork(roads: readonly Road[]) {
+    if (!this.railwayConstraints?.updateExistingRoads(roads)) return
+    this.railwayRevision++; this.dryRouteCache.clear()
+  }
+  railwayAllows(path: Point[], role: RoadRole) {
+    return Number.isFinite(this.railwayConstraints?.pathCost(path, role) ?? 0)
   }
   constructor(environment: PlanningEnvironment) {
     this.environment = environment

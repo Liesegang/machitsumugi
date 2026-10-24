@@ -6,9 +6,9 @@ import type { MapFeature } from '../map/inspect'
 import { renderMap } from '../map/render'
 import type { Annotation, RenderOptions } from '../map/render'
 export interface MapHandle { zoom: (factor: number) => void; fit: () => void; center: (point: Point) => void; getCenter: () => Point }
-interface Props { map: CityMap; options: RenderOptions; pinMode: boolean; onPick: (point: Point, feature?: MapFeature) => void; onAnnotationPick: (pin: Annotation) => void }
+interface Props { map: CityMap; options: RenderOptions; pinMode: boolean; editPoints?: Point[]; editPolygon?: boolean; onPick: (point: Point, feature?: MapFeature) => void; onAnnotationPick: (pin: Annotation) => void }
 interface View { x: number; y: number; scale: number }
-export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, options, pinMode, onPick, onAnnotationPick }, ref) {
+export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, options, pinMode, editPoints = [], editPolygon = false, onPick, onAnnotationPick }, ref) {
   const container = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLCanvasElement>(null)
   const [size, setSize] = useState({ width: 0, height: 0 })
@@ -102,7 +102,11 @@ export const MapCanvas = forwardRef<MapHandle, Props>(function MapCanvas({ map, 
       onPointerUp={event => { if (!gesture.current.moved && pointers.current.size === 1) pick({ x: event.clientX, y: event.clientY }); pointers.current.delete(event.pointerId) }}
       onPointerCancel={event => pointers.current.delete(event.pointerId)}
       onPointerLeave={() => setHover(null)}
-      onDoubleClick={event => { const rect = event.currentTarget.getBoundingClientRect(); zoomAt(1.7, { x: event.clientX - rect.left, y: event.clientY - rect.top }) }} />
+      onDoubleClick={event => { if (editPoints.length) return; const rect = event.currentTarget.getBoundingClientRect(); zoomAt(1.7, { x: event.clientX - rect.left, y: event.clientY - rect.top }) }} />
+    {!!editPoints.length && <svg className="edit-draft" aria-hidden="true" width={size.width} height={size.height}>
+      {editPolygon && editPoints.length > 2 ? <polygon points={editPoints.map(p => `${p.x * view.scale + view.x},${p.y * view.scale + view.y}`).join(' ')} /> : <polyline points={editPoints.map(p => `${p.x * view.scale + view.x},${p.y * view.scale + view.y}`).join(' ')} />}
+      {editPoints.map((p, i) => <g key={i} transform={`translate(${p.x * view.scale + view.x} ${p.y * view.scale + view.y})`}><circle r="4" /><text x="7" y="-7">{i + 1}</text></g>)}
+    </svg>}
     {hover && hover.map === map && hover.view === view && hover.layers === options.layers && !pinMode && <div className="map-hover" role="tooltip" style={{ left: Math.max(6, Math.min(size.width - 226, hover.point.x + 14)), top: Math.max(6, Math.min(size.height - 90, hover.point.y + 14)) }}><strong>{featureTitle(hover.feature)}</strong><span>{featureSummary(hover.feature) || 'クリックで履歴を表示'}</span></div>}
     <div className="scale-bar"><span style={{ width: Math.max(40, scaleMeters * view.scale) }} /><b>{scaleMeters} m</b></div>
     <div className="zoom-controls"><button aria-label="拡大" title="拡大 (+)" onClick={() => zoom(1.4)}><Plus size={19} /></button><button aria-label="縮小" title="縮小 (-)" onClick={() => zoom(1 / 1.4)}><Minus size={19} /></button><button aria-label="地図全体を表示" title="地図全体を表示 (Home)" onClick={fit}><LocateFixed size={19} /></button></div><span className="zoom-label">{Math.round(view.scale / (baseScale || 1) * 100)}%</span>

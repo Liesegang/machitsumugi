@@ -147,9 +147,13 @@ export function erodeTerrainJs(raw: Float32Array, columns: number, rows: number,
     // order is sources→outlets; reversal makes every updated receiver available.
     for (let index = drainage.processedCells - 1; index >= 0; index--) {
       const i = drainage.order[index]!, x = i % columns, y = Math.floor(i / columns), downstream = drainage.flowTo[i]!
-      if (!x || !y || x === columns - 1 || y === rows - 1) continue
       const uplift = (settings.uplift?.[i] ?? 0) * dt, raised = terrain[i]! + uplift
       next[i] = raised; upliftVolume += uplift * cellSize ** 2
+      // The open erosion boundary fixes incision, not crustal motion or the
+      // perimeter cell's hillslope exchange with its interior neighbours.
+      // Freezing these cells before uplift creates an artificial low rim while
+      // the interior rises, capturing real drainage along the rectangular edge.
+      if (!x || !y || x === columns - 1 || y === rows - 1) continue
       // Tectonic uplift applies to the prescribed crust field under the sea as
       // well as exposed land. The absence of a marine erosion model must not
       // suppress submarine uplift until sediment happens to expose the cell.

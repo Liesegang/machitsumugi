@@ -17,7 +17,7 @@ export function createCityTimeline(map: CityMap, overrides: Partial<CityTimeline
     buildings: table(map.buildings, overrides.buildings, b => b.builtYear ?? fromYear),
     areas: table(map.areas, overrides.areas, () => fromYear),
     railways: table(map.railways, overrides.railways, r => r.builtYear ?? 1900),
-    stations: table(map.stations, overrides.stations, () => 1900),
+    stations: table(map.stations, overrides.stations, s => s.builtYear ?? 1900),
     facilities: table(map.facilities, overrides.facilities, () => fromYear),
     districts: table(map.districts, overrides.districts, d => d.foundedYear ?? fromYear),
     parcels: table(map.parcels ?? [], overrides.parcels, p => p.createdYear),

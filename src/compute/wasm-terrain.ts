@@ -36,7 +36,9 @@ export function prepareTerrainWasm(input: { bytes?: BufferSource; url?: string |
       } else {
         const base = typeof location === 'undefined' ? undefined : new URL(import.meta.env.BASE_URL, location.href)
         if (!input.url && !base) throw new Error('No browser URL or supplied WASM bytes')
-        const response = await fetch(input.url ?? new URL('compute/terrain.wasm', base!), { signal: AbortSignal.timeout(5000) })
+        // Pages may cache public files across releases. Key the request by the
+        // verified binary so a new bundle cannot receive the previous kernel.
+        const response = await fetch(input.url ?? new URL(`compute/terrain.wasm?sha256=${TERRAIN_WASM_SHA256}`, base!), { signal: AbortSignal.timeout(5000) })
         if (!response.ok) throw new Error(`Terrain WASM HTTP ${response.status}`)
         bytes = await response.arrayBuffer()
       }

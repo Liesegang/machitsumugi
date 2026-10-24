@@ -36,7 +36,7 @@ describe('worker-local natural landscape cache', () => {
     expect(build).toHaveBeenCalledTimes(3)
     get({ ...input, seed: 'second' })
     expect(build).toHaveBeenCalledTimes(4)
-    const changes: Partial<TerrainModelInput>[] = [{ width: 2400 }, { height: 2400 }, { terrain: 'river' }, { coastType: 'ria' }, { relief: 'mountains' }, { forest: 20 }, { type: 'onsen' }, { settlement: 'village' }]
+    const changes: Partial<TerrainModelInput>[] = [{ width: 2400 }, { height: 2400 }, { terrain: 'river' }, { coastType: 'ria' }, { coastType: 'peninsula' }, { relief: 'mountains' }, { forest: 20 }, { type: 'onsen' }, { settlement: 'village' }]
     for (const change of changes) get({ ...input, ...change })
     expect(build).toHaveBeenCalledTimes(4 + changes.length)
   })
