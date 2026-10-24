@@ -98,12 +98,15 @@ describe('urban growth causal invariants', () => {
     expect(zero.roads.every(road => road.builtYear < 1700)).toBe(true)
     expect(zero.growthLog.filter(stage => stage.year >= 1700).every(stage => stage.roadsAdded === 0 && stage.constructionCost === 0)).toBe(true)
     expect(zero.centers.some(center => center.kind === 'station' || center.kind === 'suburb')).toBe(false)
+    expect(zero.remainingTransportCapital).toBe(0)
   })
 
   it('changes actual development decisions when positive demand is introduced', () => {
     expect(present.demandSchedule.at(-1)!.households).toBeGreaterThan(zero.demandSchedule.at(-1)!.households)
     expect(present.roads.some(road => road.builtYear >= 1700 && road.phase !== 'regional')).toBe(true)
     expect(present.developmentCells.reduce((n, cell) => n + cell.households, 0)).toBeGreaterThan(zero.developmentCells.reduce((n, cell) => n + cell.households, 0))
+    expect(Number.isFinite(present.remainingTransportCapital)).toBe(true)
+    expect(present.remainingTransportCapital).toBeGreaterThanOrEqual(0)
   })
 
   it('preserves the established street centerlines when later eras are simulated', () => {

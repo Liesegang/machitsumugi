@@ -28,6 +28,7 @@ import { surveyCastleAccess } from './castle-access'
 import { buildDistricts } from './districts'
 import { civicTransportAcquisitions } from './civic-transport'
 import { finalizeCivicRoadHistory } from './rail-access-acquisition'
+import { finalizeActualStockTransport } from './actual-stock-transport'
 import { resolveGenerationConfig } from './generation-config'
 import type { RegionalPreview } from './regional-terrain'
 import { planSubway } from './subway'
@@ -790,6 +791,12 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     facilities: civicFacilityHistory, areas: areaVersions,
     terrainSurfaces: harbor ? [{ from: 1650, to: 1920, value: naturalSurface }, { from: 1920, value: surface() }] : [{ from: 1650, value: naturalSurface }],
   })
-  return finalizeCivicRoadHistory(map).map
+  const served = finalizeCivicRoadHistory(map).map
+  // The coarse market integration precedes cadastral housing. Use the actual
+  // occupied stock once it exists, spending only the unspent road account.
+  // This appends current-year works; it cannot use future households to rewrite
+  // an earlier street network or rerun construction when the slider moves.
+  onProgress?.('実際の居住地と交通量から道路整備を評価中…')
+  return finalizeActualStockTransport(served, { funds: growth.remainingTransportCapital, terrain, core }).map
 
 }

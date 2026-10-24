@@ -1,6 +1,7 @@
 import type { Area, Point } from './types'
 import { distanceToSegment, pointInRegion } from './geometry'
 import { PlanarRoadGraph, projectOnRoadSegment, roadTravelSpeed } from './road-graph'
+import type { RoadRole } from './road-graph'
 import { occupiedSitesNear } from './neighborhood-survey'
 import type { OccupiedSite } from './neighborhood-survey'
 import { RoadPlanner, roadConstructionFactor } from './road-planner'
@@ -57,6 +58,8 @@ export interface BankConnectionSurvey {
 interface BankInput {
   graph: PlanarRoadGraph; planner: RoadPlanner; cells: OccupiedSite[]; year: number; settlement: string
   cache: Map<string, PlannedRoute | null>
+  trafficTime?: (a: Point, b: Point) => number
+  networkBenefit?: (route: PlannedRoute, width: number, role: RoadRole) => number | undefined
 }
 export interface BankConnectionProject { route: PlannedRoute; width: number; trips: number; minutesSaved: number; benefit: number; disconnected: boolean }
 
@@ -189,16 +192,21 @@ export function* bankConnectionProjects(input: BankInput & { availableFunds: () 
   let planned = 0
   for (const survey of surveyBankConnections(input)) {
     const lowerCost = survey.waterSpan * 13 + Math.max(0, survey.chord - survey.waterSpan) * roadConstructionFactor('collector') + 420
-    const oldTime = input.graph.travelTime(survey.a, survey.b), baseline = appraisalTime(oldTime)
-    if (existingCrossingNear(input.graph, input.planner, survey) || lowerCost > input.availableFunds() || (baseline - survey.chord / roadTravelSpeed({ role: 'collector' })) * impedance * survey.trips * valueOfMinutes <= lowerCost) continue
+    const oldTime = input.graph.travelTime(survey.a, survey.b)
+    const baseline = appraisalTime(input.trafficTime ? input.trafficTime(survey.a, survey.b) : oldTime), speed = roadTravelSpeed({ role: 'collector', width: policy.width })
+    if (existingCrossingNear(input.graph, input.planner, survey) || lowerCost > input.availableFunds() || (!input.networkBenefit && (baseline - survey.chord / speed) * impedance * survey.trips * valueOfMinutes <= lowerCost)) continue
     if (planned++ >= MAX_ROUTE_SURVEYS) break
     const route = planConnection(input, survey, policy.width)
     if (!route || route.bridgeLength < 4 || route.bridgeLength > policy.maximumWaterSpan || !Number.isFinite(route.cost) || !input.planner.railwayAllows(route.points, 'collector')) continue
     const affected = new Set<OccupiedSite>()
     for (let i = 1; i < route.points.length; i++) for (const site of nearby(route.points[i]!)) if (distanceToSegment(site.point, route.points[i - 1]!, route.points[i]!) < 35) affected.add(site)
     const acquisition = [...affected].reduce((sum, site) => sum + site.households * Math.min(1, route.length * policy.width / (site.area ?? 9500)) * 24, 0)
-    const cost = route.cost + acquisition, minutesSaved = Math.max(0, baseline - route.length / roadTravelSpeed({ role: 'collector' })) * impedance, benefit = minutesSaved * survey.trips * valueOfMinutes
-    if (cost > input.availableFunds() || !(cost > 0) || !Number.isFinite(benefit) || benefit <= cost) continue
+    const cost = route.cost + acquisition
+    if (cost > input.availableFunds() || !(cost > 0) || !Number.isFinite(cost)) continue
+    const minutesSaved = Math.max(0, baseline - route.length / speed) * impedance, localBenefit = minutesSaved * survey.trips * valueOfMinutes
+    const network = input.networkBenefit?.({ ...route, cost }, policy.width, 'collector')
+    const benefit = Math.max(localBenefit, Number.isFinite(network) ? network! : 0)
+    if (!Number.isFinite(benefit) || benefit <= cost) continue
     yield { route: { ...route, cost }, width: policy.width, trips: survey.trips, minutesSaved, benefit, disconnected: !Number.isFinite(oldTime) }
   }
 }
@@ -206,12 +214,15 @@ export function* bankConnectionProjects(input: BankInput & { availableFunds: () 
 /** Ten-year resident-funded programme, including stable/declining populations.
  * The caller's normal atomic transaction owns both approaches and the deck.
  */
-export function investInBankConnections(input: BankInput & { funds: number; commit: (project: BankConnectionProject) => boolean }) {
+export function investInBankConnections(input: BankInput & { funds: number; commit: (project: BankConnectionProject, remainingFunds: number) => boolean | { cost: number } }) {
   let spent = 0, completed = 0
   if (input.year % 10 !== 0 || !bankBridgePolicy(input.year, input.settlement)) return { spent, completed }
   for (const project of bankConnectionProjects({ ...input, availableFunds: () => input.funds - spent })) {
-    if (!input.commit(project)) continue
-    spent += project.route.cost; completed++
+    const remainingFunds = input.funds - spent, committed = input.commit(project, remainingFunds)
+    if (!committed) continue
+    const cost = typeof committed === 'object' ? committed.cost : project.route.cost
+    if (!Number.isFinite(cost) || cost < 0 || cost > remainingFunds) throw new RangeError('Committed bank connection exceeds its available construction funds')
+    spent += cost; completed++
   }
   return { spent, completed }
 }

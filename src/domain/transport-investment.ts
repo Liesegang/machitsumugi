@@ -60,7 +60,7 @@ export function planHousingCollectorBridge(input: {
  * in the simulation, not empirical currency or a calibrated transport forecast. */
 export function transportProjects(input: {
   graph: PlanarRoadGraph; planner: RoadPlanner; centers: GrowthCenter[]; cells: MarketSite[]; year: number; funds: number; arterial: boolean
-  completed: Set<string>; cache: Map<string, PlannedRoute | null>
+  completed: Set<string>; cache: Map<string, PlannedRoute | null>; trafficTime?: (a: Point, b: Point) => number
 }): TransportProject[] {
   const { graph, planner, cells, year } = input
   const centers = input.centers.filter(center => center.activeYear <= year)
@@ -102,7 +102,7 @@ export function transportProjects(input: {
     }
     if (!route || route.cost > input.funds || route.length > distance(first.point, last.point) * 1.8) continue
     const impedance = year < 1900 ? 2.7 : year < 1950 ? 1.5 : 1
-    const oldTime = graph.travelTime(route.points[0]!, route.points.at(-1)!)
+    const oldTime = (input.trafficTime ?? ((a, b) => graph.travelTime(a, b)))(route.points[0]!, route.points.at(-1)!)
     // The same finite scenario appraisal as resident-funded bank connections:
     // missing connectivity is a15-minute penalty, never infinite free benefit.
     const baseline = Number.isFinite(oldTime) ? Math.min(30, oldTime) : 15

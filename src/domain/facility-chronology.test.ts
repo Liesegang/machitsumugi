@@ -4,6 +4,7 @@ import { DEFAULT_CONFIG, generateCity } from './generator'
 import type { TerrainModel } from './terrain'
 import type { UrbanGrowthInput } from './urban-growth'
 import { erodeTerrain } from './hydrology'
+import { sliceCityAtYear } from './timeline'
 import { corridorPolygon, distanceToSegment, pointInRegion, polygonArea, polygonOverlapsRegion, polygonsOverlap, rectangle, regionArea } from './geometry'
 
 const fixture = vi.hoisted(() => ({ cut: null as null | { x: number; y: number }, cutYear: 1955, parks: false, woodedHill: false, lateStreet: false }))
@@ -55,7 +56,10 @@ describe('facility construction uses its own historical street survey', () => {
     expect(earlier.facilities.some(f => f.kind === 'school')).toBe(false)
     expect(later.buildings.find(b => b.id === 'facility-building-school')?.builtYear).toBe(1875)
     const prefix = new Map(earlier.buildings.map(building => [building.id, building]))
-    const laterOldStock = later.buildings.filter(building => (building.builtYear ?? 1700) <= 1850)
+    // Occupancy can legitimately change by1900 when another street opens.
+    // Compare the actual1850 versions, including occupancy, so this check
+    // rejects future leakage without requiring residents never to move.
+    const laterOldStock = sliceCityAtYear(later, 1850).buildings.filter(building => (building.builtYear ?? 1700) <= 1850)
     expect(laterOldStock.length).toBeGreaterThan(0)
     for (const building of laterOldStock) expect(building).toEqual(prefix.get(building.id))
     // Facility geometry is actually acquired, not a label-only correction.

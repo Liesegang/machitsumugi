@@ -1,6 +1,8 @@
 import type { Area, CityType, Point, TimelineVersion } from './types'
 import { pointInRegion } from './geometry'
 import { renewExistingRoad } from './road-renewal'
+import { assignRoadTraffic } from './road-traffic'
+import { surveyedProjectCost } from './surveyed-project-cost'
 import { frontageCapacity } from './frontage-supply'
 import { PlanarRoadGraph, extractStreetBlocks, projectOnRoadSegment, roadLength, roadTravelSpeed } from './road-graph'
 import type { RoadRole, SimulatedRoad } from './road-graph'
@@ -42,7 +44,7 @@ export interface GrowthCenter { point: Point; kind: 'historic' | 'station' | 'su
 export interface GrowthStage { phase: string; roadsAdded: number; year: number; reason: string; households: number; unmetHouseholds: number; constructionCost: number }
 export interface DevelopmentCell { id: string; point: Point; households: number; jobs: number; capacity: number; servicedCapacity?: number; servicedYear?: number; builtYear?: number; accessibility: number; landValue: number; ownerResistance: number; area?: number; frontageDepth?: number }
 export interface DemandTarget { households: number; jobs: number }
-export interface UrbanGrowthResult { roads: SimulatedRoad[]; roadHistory: TimelineVersion<SimulatedRoad>[]; centers: GrowthCenter[]; growthLog: GrowthStage[]; developmentCells: DevelopmentCell[]; demandSchedule: ({ year: number } & DemandTarget)[]; blocks: Point[][] }
+export interface UrbanGrowthResult { roads: SimulatedRoad[]; roadHistory: TimelineVersion<SimulatedRoad>[]; centers: GrowthCenter[]; growthLog: GrowthStage[]; developmentCells: DevelopmentCell[]; demandSchedule: ({ year: number } & DemandTarget)[]; blocks: Point[][]; remainingTransportCapital: number }
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n))
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y)
 const lerp = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
@@ -121,8 +123,10 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     return vacant
   }
   const ids = new Map<string, number>()
+  const acceptedCosts = new WeakMap<PlannedRoute, number>()
+  const charged = (route: PlannedRoute | null | undefined) => route ? acceptedCosts.get(route) ?? 0 : 0
   const nextId = (phase: string, year: number) => { const key = `${phase}-${year}`, n = ids.get(key) ?? 0; ids.set(key, n + 1); return `${key}-${n}` }
-  const addProject = (route: PlannedRoute, phase: string, year: number, role: RoadRole, reason: string, width: number, requireConnection = true, preserveEndpoint = false) => {
+  const addProject = (route: PlannedRoute, phase: string, year: number, role: RoadRole, reason: string, width: number, requireConnection = true, preserveEndpoint = false, maximumCost = Infinity) => {
     const validator = route.boundaryContinuation && regionalPlanner ? regionalPlanner : planner
     if ((!preserveEndpoint && route.length < 20) || !validator.validate(route.points, width, route.bridgeLength > 0) || !validator.railwayAllows(route.points, role)) return 0
     // Bridge decks are explicit pieces, rather than labeling a complete cross-country route a bridge.
@@ -143,7 +147,14 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     const projects = chunks.map((chunk, i) => ({ points: chunk.path, metadata: { id: nextId(phase, year), builtYear: year, phase, role: chunk.bridge ? 'bridge' as const : role, reason, width, kind: role === 'highway' && input.arterial && route.boundaryContinuation ? 'arterial' as const : 'local' as const, constructionCost: route.cost * roadLength(chunk.path) / Math.max(length, 1e-9), ...(chunk.bridge ? { bridge: true } : {}), ...(route.boundaryContinuation ? { boundaryContinuation: true } : {}), preserveEndpoint: preserveEndpoint || chunks.length > 1 }, requireConnection: i ? true : requireConnection }))
     // Bank approach, deck and exit form one project. A rejected mandatory
     // section must never leave a newly constructed road ending at the river.
-    const added = projects.length === 1 ? Number(!!graph.add(projects[0]!.points, projects[0]!.metadata, projects[0]!.requireConnection)) : graph.addBatch(projects)?.length ?? 0
+    const beforeCount = graph.roads.length
+    const pricing = surveyedProjectCost({ route, role, chunks: projects.map((project, i) => ({ path: project.points, bridge: chunks[i]!.bridge, reused: !!graph.reusableRoad(project.points, project.metadata) })), surveyCost: (path, role, bridge) => validator.cost(path, role, bridge) })
+    const newCost = pricing.newTotal
+    if (!Number.isFinite(newCost) || newCost > maximumCost + 1e-7) return 0
+    for (const [i, project] of projects.entries()) project.metadata.constructionCost = pricing.costs[i]!
+    const committed = projects.length === 1 ? !!graph.add(projects[0]!.points, projects[0]!.metadata, projects[0]!.requireConnection) : !!graph.addBatch(projects)
+    const added = committed ? graph.roads.length - beforeCount : 0
+    if (added) acceptedCosts.set(route, newCost)
     if (added) { planner.setRailwayRoadNetwork(graph.roads); regionalPlanner?.setRailwayRoadNetwork(graph.roads) }
     if (added && phase === 'regional') input.onPreview?.(graph.roads, year)
     return added
@@ -224,7 +235,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     const startHeading = i === 0 ? undefined : graph.openEndHeading(start)
     const options = { role: foundingRole, width: foundingWidth, allowBridge: true, startHeading, maxNodes: 20000 }
     const route = regionalPlanner ? regionalPlanner.toBoundary(start, terminal, options) : planner.plan(start, terminal, options)
-    if (route) { foundingCost += route.cost; addProject(route, 'regional', 1650, foundingRole, foundingReason, foundingWidth, i !== 0) }
+    if (route && addProject(route, 'regional', 1650, foundingRole, foundingReason, foundingWidth, i !== 0)) foundingCost += charged(route)
   }
   }
   surveyFoundingRoutes(hub)
@@ -236,7 +247,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       break
     }
   }
-  for (const route of valleySurveys) if (addProject(route, 'regional', 1650, 'lane', foundingReason, 4.5, graph.roads.length > 0)) foundingCost += route.cost
+  for (const route of valleySurveys) if (addProject(route, 'regional', 1650, 'lane', foundingReason, 4.5, graph.roads.length > 0)) foundingCost += charged(route)
   if (!graph.roads.length && input.type === 'port') {
     // A fishing landing need not begin with a modern-width regional highway.
     // When hills prevent that route, connect to a nearby inland producer by an
@@ -250,7 +261,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     for (const { cell } of producers) {
       const route = planner.plan(hub, cell.point, { role: 'lane', width: 5, maxNodes: 6000 })
       if (!route || route.length > distance(hub, cell.point) * 1.8) continue
-      if (addProject(route, 'regional', 1650, 'lane', '船着場と近傍の陸上生産集落を結ぶ成立期の細い往来', 5, false)) { foundingCost += route.cost; break }
+      if (addProject(route, 'regional', 1650, 'lane', '船着場と近傍の陸上生産集落を結ぶ成立期の細い往来', 5, false)) { foundingCost += charged(route); break }
     }
   }
   // Agricultural access predates urbanisation. Productive sectors are acquired
@@ -278,7 +289,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     if (route && route.length < best.near.distance * 1.55 && route.cost < 700) addProject(route, 'regional', 1650, 'farm', '耕作適地のまとまりへ旧街道・既存農道から接続する農道', 3.5)
   }
   growthLog.push({ phase: 'regional', year: 1650, roadsAdded: graph.roads.length, reason: '成立以前の街道・渡河・耕作地へのアクセス', households: foundingHouseholds, unmetHouseholds: 0, constructionCost: foundingCost })
-  if (!graph.roads.length) return { roads: [], roadHistory: [], centers, growthLog, developmentCells: cells, demandSchedule, blocks: [] }
+  if (!graph.roads.length) return { roads: [], roadHistory: [], centers, growthLog, developmentCells: cells, demandSchedule, blocks: [], remainingTransportCapital: 0 }
   const inheritedCorridor = graph.roads.filter(road => road.role !== 'farm')
   // Retainer/merchant grants follow a castle edge and its outward gate approach.
   // Only the accessible, dry adjoining quarters inherit this survey: the rest
@@ -421,7 +432,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
         addProject(surveyed.route, 'railway', year, 'access', '開業前に用地・既存街路接続を検査した駅前アクセス事業', 4, true, true)
         if (graph.ensureJunction(station)) {
           centers.push({ point: station, kind: 'station', weight: input.type === 'newtown' ? 1.5 : 1.04, activeYear: year, catchment: 470 * catchmentScale })
-          activatedStations.add(i); expenditure += surveyed.route.cost; continue
+          activatedStations.add(i); expenditure += charged(surveyed.route); continue
         }
       }
       const near = graph.nearest(station, 1800)
@@ -431,7 +442,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       if (route && !graph.ensureJunction(station)) addProject(route, 'railway', year, role, '鉄道開業に伴う駅前広場・街路への接続', width, true, true)
       if (graph.ensureJunction(station)) {
         centers.push({ point: station, kind: 'station', weight: input.type === 'newtown' ? 1.5 : 1.04, activeYear: year, catchment: 470 * catchmentScale })
-        activatedStations.add(i); expenditure += route?.cost ?? 0
+        activatedStations.add(i); expenditure += charged(route)
       } else {
         // A small hillside station need not have a 10m station avenue. Try a
         // real local access road from alternative existing streets; keep the
@@ -442,7 +453,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
           addProject(access, 'railway', year, 'access', '広い駅前街路が通らない地形での生活道からの駅アクセス', 4, true, true)
           if (!graph.ensureJunction(station)) continue
           centers.push({ point: station, kind: 'station', weight: input.type === 'newtown' ? 1.5 : 1.04, activeYear: year, catchment: 470 * catchmentScale })
-          activatedStations.add(i); expenditure += access.cost; break
+          activatedStations.add(i); expenditure += charged(access); break
         }
       }
     }
@@ -466,8 +477,19 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     const newDemand = Math.max(0, target.households - previousTarget)
     budget += density ? newDemand * 12 : 0
     capitalFund += density ? newDemand * 3 + allocated * .022 * elapsed : 0
+    const trafficEnabled = density > 0 && year >= 1955 && year % 5 === 0
+    let traffic: ReturnType<typeof assignRoadTraffic> | undefined, trafficRevision = -1, trafficPopulation = -1, trafficCenters = -1
+    const readTraffic = () => {
+      if (!trafficEnabled) return undefined
+      if (!traffic || trafficRevision !== graph.topologyRevision || trafficPopulation !== allocated || trafficCenters !== centers.length) {
+        traffic = assignRoadTraffic({ roads: graph.roads, cells, destinations: centers.filter(center => center.activeYear <= year), year })
+        trafficRevision = graph.topologyRevision; trafficPopulation = allocated; trafficCenters = centers.length
+      }
+      return traffic
+    }
+    const trafficTime = trafficEnabled ? (a: Point, b: Point) => readTraffic()!.travelTime(a, b) : undefined
     if (density > 0 && !populationFalling) {
-      const renewal = renewExistingRoad({ graph, planner, cells, year, funds: capitalFund })
+      const renewal = renewExistingRoad({ graph, planner, cells, destinations: centers.filter(center => center.activeYear <= year), traffic: readTraffic(), year, funds: capitalFund })
       if (renewal) { capitalFund -= renewal.cost; expenditure += renewal.cost; transportCache.clear(); neighborhoodRouteCache.clear() }
     }
     previousTarget = target.households
@@ -503,11 +525,11 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     if (density > 0 && year >= 1750 && !populationFalling) {
       const rejectedTransport = new Set<string>()
       while (capitalFund > 100) {
-        const project = transportProjects({ graph, planner, centers, cells, year, funds: capitalFund, arterial: input.arterial, completed: new Set([...completedTransport, ...rejectedTransport]), cache: transportCache })[0]
+        const project = transportProjects({ graph, planner, centers, cells, year, funds: capitalFund, arterial: input.arterial, completed: new Set([...completedTransport, ...rejectedTransport]), cache: transportCache, trafficTime })[0]
         if (!project) break
-        if (!addProject(project.route, phase, year, project.role, `市場・駅・集落間の交通を集める公共道路（${Math.round(project.trips)}移動/日、迂回${project.minutesSaved.toFixed(1)}分短縮）`, project.width, true, false)) { rejectedTransport.add(project.pair); continue }
+        if (!addProject(project.route, phase, year, project.role, `市場・駅・集落間の交通を集める公共道路（${Math.round(project.trips)}移動/日、迂回${project.minutesSaved.toFixed(1)}分短縮）`, project.width, true, false, capitalFund)) { rejectedTransport.add(project.pair); continue }
         completedTransport.add(project.pair)
-        capitalFund -= project.route.cost; expenditure += project.route.cost
+        capitalFund -= charged(project.route); expenditure += charged(project.route)
         existing(year); occupy(target.households, year)
       }
     }
@@ -518,9 +540,9 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       if (site) {
         const near = graph.nearest(site.point, 500)!
         const route = planner.plan(near.point, site.point, { role: 'collector', width: 10, maxNodes: 5500 })
-        if (route && route.cost < budget * .55 && addProject(route, 'suburban', year, 'collector', '人口増加に対応する住宅地開発の接続道路', 10)) {
+        if (route && route.cost < budget * .55 && addProject(route, 'suburban', year, 'collector', '人口増加に対応する住宅地開発の接続道路', 10, true, false, budget)) {
           const stations = input.stationPoints, railAngle = stations.length > 1 ? Math.atan2(stations.at(-1)!.y - stations[0]!.y, stations.at(-1)!.x - stations[0]!.x) : Math.atan2(near.b.y - near.a.y, near.b.x - near.a.x)
-          budget -= route.cost; expenditure += route.cost; centers.push({ point: site.point, kind: 'suburb', weight: input.type === 'newtown' ? 1.05 : .66, activeYear: year, catchment: 330 }); plannedDistricts.push({ center: site.point, year, angle: input.type === 'newtown' ? railAngle : Math.atan2(near.b.y - near.a.y, near.b.x - near.a.x), completed: 0 }); lastProjectYear = year
+          budget -= charged(route); expenditure += charged(route); centers.push({ point: site.point, kind: 'suburb', weight: input.type === 'newtown' ? 1.05 : .66, activeYear: year, catchment: 330 }); plannedDistricts.push({ center: site.point, year, angle: input.type === 'newtown' ? railAngle : Math.atan2(near.b.y - near.a.y, near.b.x - near.a.x), completed: 0 }); lastProjectYear = year
         }
       }
     }
@@ -540,7 +562,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       // A land-readjustment district is a bounded commitment; empty demand does
       // not create a citywide grid, and only two scheduled streets are funded per tick.
       if (route.cost > budget || route.cost > potential * 30) continue
-      if (addProject(route, 'suburban', year, 'lane', '鉄道を基準に測量した限定住区の段階的な区画道路', 6.5)) { budget -= route.cost; expenditure += route.cost; district.completed++; estateChanged = true }
+      if (addProject(route, 'suburban', year, 'lane', '鉄道を基準に測量した限定住区の段階的な区画道路', 6.5, true, false, budget)) { budget -= charged(route); expenditure += charged(route); district.completed++; estateChanged = true }
       else district.completed++
       }
     }
@@ -637,9 +659,9 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
         }
         const best = selection.project
         if (!best) break
-        const added = addProject(best.route, phase, year, best.role, best.reason, best.width)
+        const added = addProject(best.route, phase, year, best.role, best.reason, best.width, true, false, budget)
         if (!added) { rejectedProjects.add(best.route); projects++; continue }
-        budget -= best.cost; expenditure += best.cost; projects++
+        budget -= charged(best.route); expenditure += charged(best.route); projects++
         // Market can immediately occupy newly serviced land, without rebuilding older roads or houses.
         for (const cell of best.served) { cell.roadDistance = graph.nearest(cell.point, 100)?.distance ?? Infinity; cell.servicedCapacity = frontageCapacity(cell, cell.roadDistance); if (cell.roadDistance < cell.frontageDepth + 1 && cell.servicedYear === undefined) cell.servicedYear = year }
         occupy(target.households, year)
@@ -650,15 +672,26 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     // use the existing resident road levy in the finite capital account, including
     // declining years. The same project is never charged to development fees.
     if (density > 0) {
-      const bankInvestment = investInBankConnections({ graph, planner, cells, year, settlement, funds: capitalFund, cache: bankConnectionRouteCache,
-        commit: project => !!addProject(project.route, phase, year, 'collector', project.disconnected
+      // Full-network appraisal includes travellers passing THROUGH these
+      // neighbourhoods. Four physically surveyed alternatives per programme
+      // round bound the expensive reassignment; local appraisals remain valid.
+      let appraisals = 0
+      const networkBenefit = trafficEnabled && year % 10 === 0 ? (route: PlannedRoute, width: number, role: RoadRole) => {
+        if (appraisals++ >= 4) return undefined
+        const beforeTraffic = readTraffic()!, staged = graph.fork(), before = staged.roads.length
+        if (!staged.add(route.points, { id: `traffic-appraisal-${year}-${appraisals}`, builtYear: year, role, reason: '', phase, width, kind: 'local', constructionCost: route.cost, preserveEndpoint: true }) || staged.roads.length === before) return 0
+        const afterTraffic = assignRoadTraffic({ roads: staged.roads, cells, destinations: centers.filter(center => center.activeYear <= year), year })
+        return Math.max(0, beforeTraffic.totalDailyVehicleMinutes - afterTraffic.totalDailyVehicleMinutes) * 250 * 8 * .02 / 60
+      } : undefined
+      const bankInvestment = investInBankConnections({ graph, planner, cells, year, settlement, funds: capitalFund, cache: bankConnectionRouteCache, trafficTime, networkBenefit,
+        commit: (project, funds) => addProject(project.route, phase, year, 'collector', project.disconnected
           ? `分離していた両岸の居住街路を接続する公共橋梁（${Math.round(project.trips)}移動/日、有限の接続便益で評価）`
-          : `両岸の既存住民による迂回を短縮する公共橋梁（${Math.round(project.trips)}移動/日、${project.minutesSaved.toFixed(1)}分短縮）`, project.width),
+          : `両岸の既存住民による迂回を短縮する公共橋梁（${Math.round(project.trips)}移動/日、${project.minutesSaved.toFixed(1)}分短縮）`, project.width, true, false, funds) ? { cost: charged(project.route) } : false,
       })
       capitalFund -= bankInvestment.spent; expenditure += bankInvestment.spent
       if (bankInvestment.completed) { existing(year); occupy(target.households, year) }
-      const investment = investInNeighborhood({ graph, planner, cells, year, funds: capitalFund, cache: neighborhoodRouteCache,
-        commit: project => !!addProject(project.route, phase, year, 'lane', `近隣住区の既存住民による迂回を短縮する接続道路（${Math.round(project.trips)}移動/日、${project.minutesSaved.toFixed(1)}分短縮）`, project.width),
+      const investment = investInNeighborhood({ graph, planner, cells, year, funds: capitalFund, cache: neighborhoodRouteCache, trafficTime, networkBenefit,
+        commit: (project, funds) => addProject(project.route, phase, year, 'lane', `近隣住区の既存住民による迂回を短縮する接続道路（${Math.round(project.trips)}移動/日、${project.minutesSaved.toFixed(1)}分短縮）`, project.width, true, false, funds) ? { cost: charged(project.route) } : false,
       })
       capitalFund -= investment.spent; expenditure += investment.spent
       if (investment.completed) { existing(year); occupy(target.households, year) }
@@ -671,6 +704,9 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
   }
   const finalTarget = demandSchedule.at(-1) ?? demandAt(1650)
   for (const cell of cells) cell.jobs = Math.round(cell.households * finalTarget.jobs / finalTarget.households)
-  return { roads: graph.roads, roadHistory: graph.roadHistory, centers, growthLog, developmentCells: cells, demandSchedule, blocks: extractStreetBlocks(graph.roads) }
+  // This is the actual unspent public road account, excluding housing access
+  // contributions and regional programmes. Final built-stock traffic appraisal
+  // may spend it once; it must never infer a second budget from target demand.
+  return { roads: graph.roads, roadHistory: graph.roadHistory, centers, growthLog, developmentCells: cells, demandSchedule, blocks: extractStreetBlocks(graph.roads), remainingTransportCapital: capitalFund }
 }
 

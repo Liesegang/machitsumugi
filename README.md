@@ -83,7 +83,7 @@ ghq get github.com/Liesegang/machitsumugi
 
 ## 地理と生成ルール
 
-**[エンジン2.3のアルゴリズム、論文、仮定と検証条件](docs/algorithms.md)**
+**[エンジン2.4のアルゴリズム、論文、仮定と検証条件](docs/algorithms.md)**
 
 [日本の実地図との10回の比較記録](docs/comparison-review.md)では、生成画像の問題、変更理由、再確認後に残った差を記載しています。
 地図を見分けられない品質を達成したという主張ではありません。

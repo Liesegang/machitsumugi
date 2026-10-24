@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { PlanarRoadGraph } from './road-graph'
 import { RoadPlanner } from './road-planner'
 import { investInNeighborhood, neighborhoodConnections } from './neighborhood-connections'
@@ -33,6 +33,56 @@ describe('neighbourhood connectivity investment', () => {
     const input = fixture()
     expect([...neighborhoodConnections({ ...input, availableFunds: () => 0 })]).toEqual([])
     expect([...neighborhoodConnections({ ...input, cells: input.cells.map(cell => ({ ...cell, households: 0 })) })]).toEqual([])
+  })
+
+  it('appraises measured congestion with a finite cap while preserving the resident levy and dry-route survey', () => {
+    const input = fixture(), cells = input.cells.map(cell => ({ ...cell, households: 20 }))
+    expect([...neighborhoodConnections({ ...input, cells })]).toEqual([])
+    const loaded = { ...input, cells, trafficTime: () => 20 }
+    const project = [...neighborhoodConnections(loaded)][0]!
+    expect(project).toBeDefined()
+    expect(project.benefit).toBeGreaterThan(project.route.cost)
+    expect(project.route.cost).toBeLessThanOrEqual(input.availableFunds())
+    const capped = [...neighborhoodConnections({ ...loaded, trafficTime: () => 30 })][0]!
+    expect([...neighborhoodConnections({ ...loaded, trafficTime: () => 1e9 })][0]!.benefit).toBe(capped.benefit)
+    expect([...neighborhoodConnections({ ...loaded, trafficTime: () => Infinity })]).toEqual([])
+    expect([...neighborhoodConnections({ ...loaded, availableFunds: () => project.route.cost - 1 })]).toEqual([])
+    const planner = new RoadPlanner({ ...input.planner.environment, areas: [{ id: 'river', kind: 'water', polygon: [{ x: 250, y: 50 }, { x: 350, y: 50 }, { x: 350, y: 800 }, { x: 250, y: 800 }] }] })
+    expect([...neighborhoodConnections({ ...loaded, planner, cache: new Map() })]).toEqual([])
+  })
+
+  it('includes bounded through-network savings only after a funded physical survey, without adding local savings twice', () => {
+    const input = fixture(), cells = input.cells.map(cell => ({ ...cell, households: 20 }))
+    const networkBenefit = vi.fn(() => 2000)
+    const projects = [...neighborhoodConnections({ ...input, cells, networkBenefit })]
+    expect(projects).not.toHaveLength(0)
+    expect(projects[0]!.benefit).toBe(2000)
+    expect(networkBenefit.mock.calls.length).toBeLessThanOrEqual(6)
+    expect([...neighborhoodConnections({ ...input, cells, networkBenefit: () => undefined })]).toEqual([])
+    const unavailable = vi.fn(() => 1e9)
+    expect([...neighborhoodConnections({ ...input, cells, availableFunds: () => 201, networkBenefit: unavailable })]).toEqual([])
+    expect(unavailable).not.toHaveBeenCalled()
+    const planner = new RoadPlanner({ ...input.planner.environment, areas: [{ id: 'river', kind: 'water', polygon: [{ x: 250, y: 50 }, { x: 350, y: 50 }, { x: 350, y: 800 }, { x: 250, y: 800 }] }] })
+    expect([...neighborhoodConnections({ ...input, planner, cells, cache: new Map(), networkBenefit: unavailable })]).toEqual([])
+    expect(unavailable).not.toHaveBeenCalled()
+  })
+
+  it('passes remaining capital to each transaction and charges its exact committed work once', () => {
+    const input = fixture(), c = { x: 700, y: 350 }, d = { x: 900, y: 350 }
+    input.graph.add([c, { x: 700, y: 900 }, { x: 900, y: 900 }, d], { id: 'second-old-detour', role: 'lane', kind: 'local', width: 5, builtYear: 1650, phase: 'regional', constructionCost: 1300, reason: 'another occupied block' }, false)
+    const cells = [...input.cells, ...[c, d].map(point => ({ ...input.cells[0]!, point }))], observed: number[] = []
+    const result = investInNeighborhood({ ...input, cells, funds: 2000, commit: (project, remaining) => {
+      observed.push(remaining)
+      expect(project.route.cost).toBeLessThan(1200)
+      // The atomic transaction performs this resurvey limit check BEFORE any
+      // mutation. Its actual physical cost is higher than the initial quote.
+      if (1200 > remaining) return false
+      return { cost: 1200 }
+    } })
+    expect(observed.length).toBeGreaterThanOrEqual(2)
+    expect(observed[0]).toBe(2000)
+    expect(observed[1]).toBe(800)
+    expect(result).toEqual({ spent: 1200, completed: 1 })
   })
 
   it('keeps water barriers when an attractive local shortcut has no surveyed crossing', () => {

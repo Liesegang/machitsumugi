@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { PlanarRoadGraph, extractStreetBlocks, roadLength } from './road-graph'
+import { describe, expect, it, vi } from 'vitest'
+import { PlanarRoadGraph, extractStreetBlocks, roadLength, roadTravelSpeed } from './road-graph'
 import type { RoadMetadata } from './road-graph'
 
 const metadata = (id: string): RoadMetadata => ({ id, builtYear: 1700, phase: 'oldtown', role: 'lane', reason: 'test transport project', width: 6, kind: 'local', constructionCost: 100 })
@@ -46,6 +46,70 @@ describe('incremental planar road graph', () => {
     expect(anchors.length).toBeGreaterThan(2)
     expect(new Set(anchors.map(a => a.road.id)).size).toBe(1)
     expect(Math.max(...anchors.map(a => a.point.x)) - Math.min(...anchors.map(a => a.point.x))).toBeGreaterThan(150)
+  })
+
+  it('reuses exact projection queries without sharing caller-owned results', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add(Array.from({ length: 31 }, (_, i) => point(i * 10, 0)), metadata('survey-road'), false)
+    const road = graph.roads[0]!, controlledAccess = vi.fn(() => false)
+    Object.defineProperty(road, 'controlledAccess', { get: controlledAccess })
+    const query = point(150, 70), first = graph.projections(query, 240, 6), expected = structuredClone(first)
+    const reads = controlledAccess.mock.calls.length
+    expect(reads).toBeGreaterThan(0)
+    first[0]!.point.x = -999
+    first[0]!.distance = -1
+    first[0]!.road = { ...road, id: 'caller-replacement' }
+    first.reverse(); first.pop()
+    const repeated = graph.projections(query, 240, 6)
+    expect(controlledAccess.mock.calls.length).toBe(reads)
+    expect(repeated).toEqual(expected)
+    expect(repeated[0]!.road).toBe(road)
+    expect(graph.projections(query, 240, 6)).not.toBe(repeated)
+    expect(graph.projections(query, 240, 6)[0]!.point).not.toBe(repeated[0]!.point)
+  })
+
+  it('distinguishes exact projection coordinates, radius and requested count', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add(Array.from({ length: 31 }, (_, i) => point(i * 10, 0)), metadata('survey-road'), false)
+    const query = point(150, 50), many = graph.projections(query, 240, 3)
+    expect(many).toHaveLength(3)
+    expect(graph.projections(query, 240, 1)).toEqual(many.slice(0, 1))
+    expect(graph.projections(query, 40, 3)).toEqual([])
+    expect(graph.projections(point(150.0001, 50), 240, 3)[0]!.point.x).toBe(150.0001)
+    expect(graph.projections(query, Infinity, 3)).toEqual(many)
+  })
+
+  it('invalidates projection results after both a new street and a realignment', () => {
+    const graph = new PlanarRoadGraph(), query = point(150, 75)
+    graph.add([point(0, 0), point(300, 0)], metadata('old-road'), false)
+    expect(graph.projections(query, 200, 1)[0]!.distance).toBe(75)
+    const changed = graph.modify('old-road', 1900, { points: [point(0, 0), query, point(300, 0)], width: 8, reason: 'funded realignment', constructionCost: 200 })
+    expect(changed).not.toBeNull()
+    const realigned = graph.projections(query, 200, 1)[0]!
+    expect(realigned.distance).toBe(0)
+    expect(realigned.road).toBe(changed)
+    expect(realigned.road.width).toBe(8)
+    const newQuery = point(150, 150)
+    expect(graph.projections(newQuery, 200, 1)[0]!.distance).toBe(75)
+    const street = graph.add([query, newQuery, point(300, 150)], { ...metadata('new-street'), builtYear: 1950 })
+    expect(street).not.toBeNull()
+    expect(graph.projections(newQuery, 200, 1)[0]!.distance).toBe(0)
+    expect(graph.projections(newQuery, 200, 1)[0]!.road).toBe(street)
+  })
+
+  it('bounds retained projection queries and recomputes evicted exact sites', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(0, 0), point(300, 0)], metadata('survey-road'), false)
+    const controlledAccess = vi.fn(() => false)
+    Object.defineProperty(graph.roads[0]!, 'controlledAccess', { get: controlledAccess })
+    const first = graph.projections(point(100, 20), Infinity, 1)
+    let last = first
+    for (let i = 0; i < 2048; i++) last = graph.projections(point(i / 10, 21), Infinity, 1)
+    const reads = controlledAccess.mock.calls.length
+    expect(graph.projections(point(204.7, 21), Infinity, 1)).toEqual(last)
+    expect(controlledAccess.mock.calls.length).toBe(reads)
+    expect(graph.projections(point(100, 20), Infinity, 1)).toEqual(first)
+    expect(controlledAccess.mock.calls.length).toBeGreaterThan(reads)
   })
 
   it('finds physical survey-line crossings and builds a real connected loop', () => {
@@ -106,7 +170,7 @@ describe('incremental planar road graph', () => {
     const link = graph.add([point(400, 100), station], { ...metadata('forecourt'), role: 'access', width: 3.5, preserveEndpoint: true })
     expect(link!.points.at(-1)).toEqual(station)
     expect(graph.roads[0]!.points).toContainEqual(point(400, 100))
-    expect(graph.travelTime(point(400, 100), station)).toBeCloseTo(.5 / 220, 7)
+    expect(graph.travelTime(point(400, 100), station)).toBeCloseTo(.5 / roadTravelSpeed({ role: 'access', width: 3.5 }), 7)
     expect(graph.ensureJunction(point(650, 100))).toBe(true)
     expect(graph.roads[0]!.points).toContainEqual(point(650, 100))
   })
@@ -171,5 +235,45 @@ describe('incremental planar road graph', () => {
     ])).toBeNull()
     expect(graph.roadHistory).toEqual(before)
     expect(graph.roads[0]!.width).toBe(4)
+  })
+  it('uses the actual road width in route choice and invalidates time after a funded widening', () => {
+    const graph = new PlanarRoadGraph(), a = point(0, 0), b = point(300, 0)
+    graph.add([a, b], { ...metadata('narrow'), width: 3 }, false)
+    const time = graph.accessibilityFrom(a)
+    expect(time(b)).toBeCloseTo(300 / 110, 8)
+    graph.add([a, point(0, 100), point(300, 100), b], { ...metadata('wide-detour'), width: 6 })
+    expect(graph.travelTime(a, b)).toBeCloseTo(500 / 220, 8)
+    expect(graph.modify('narrow', 1960, { width: 6, reason: 'funded corridor widening', constructionCost: 200 })).not.toBeNull()
+    expect(time(b)).toBeCloseTo(300 / 220, 8)
+    expect(roadTravelSpeed({ role: 'lane' })).toBe(220)
+    expect(roadTravelSpeed({ role: 'lane', width: 20 })).toBe(220)
+    expect(roadTravelSpeed({ role: 'access', width: 2.8 })).toBeLessThan(roadTravelSpeed({ role: 'access', width: 4.6 }))
+  })
+  it('reuses a reverse short bridge inside an atomic new route without duplicating its history or capacity', () => {
+    const graph = new PlanarRoadGraph(), a = point(1527.6096333640426, 1276.7161067259492), b = point(1547.6285889453163, 1250.8823106459731)
+    const deck = { ...metadata('original-deck'), role: 'bridge' as const, bridge: true, width: 13 }
+    graph.add([a, b], deck, false)
+    const history = structuredClone(graph.roadHistory)
+    const reused = graph.reusableRoad([b, a], { ...deck, width: 10 })
+    expect(reused?.id).toBe('original-deck')
+    const batch = graph.addBatch([
+      { points: [point(1600, 1100), b], metadata: { ...metadata('new-approach'), builtYear: 1900 }, requireConnection: false },
+      { points: [b, a], metadata: { ...deck, id: 'duplicate-deck', builtYear: 1900 } },
+      { points: [a, point(1400, 1400)], metadata: { ...metadata('new-exit'), builtYear: 1900 } },
+    ])
+    expect(batch).toHaveLength(3)
+    expect(batch![1]!.id).toBe('original-deck')
+    expect(graph.roads.filter(road => road.bridge)).toHaveLength(1)
+    expect(graph.roadHistory.filter(version => version.value.id === 'original-deck')).toEqual(history)
+    expect(Number.isFinite(graph.travelTime(point(1600, 1100), point(1400, 1400)))).toBe(true)
+    expect(graph.reusableRoad([a, b], { ...deck, width: 14 })).toBeNull()
+    expect(graph.reusableRoad([a, b], { ...deck, level: 1 })).toBeNull()
+  })
+  it('does not mistake a different curved route or another grade for the same owned corridor', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(0, 0), point(100, 60), point(200, 0)], metadata('curve'), false)
+    expect(graph.reusableRoad([point(0, 0), point(200, 0)], metadata('straight'))).toBeNull()
+    expect(graph.reusableRoad([point(0, 0), point(100, 60), point(200, 0)], { ...metadata('raised'), level: 1 })).toBeNull()
+    expect(graph.reusableRoad([point(200, 0), point(100, 60), point(0, 0)], metadata('reverse'))?.id).toBe('curve')
   })
 })

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { bankBridgePolicy, bankConnectionProjects, investInBankConnections, surveyBankConnections } from './bank-connection-bridges'
 import { PlanarRoadGraph } from './road-graph'
 import { RoadPlanner } from './road-planner'
@@ -41,6 +41,52 @@ describe('bridges connecting already inhabited banks', () => {
     expect(Number.isFinite(project.minutesSaved)).toBe(true)
     expect(Number.isFinite(project.benefit)).toBe(true)
     expect(project.minutesSaved).toBeLessThan(15)
+  })
+
+  it('can fund a physically surveyed bridge from loaded delay without inventing money or unlimited benefits', () => {
+    const input = fixture(), cells = input.cells.map(cell => ({ ...cell, households: 200 }))
+    expect([...bankConnectionProjects({ ...input, cells })]).toEqual([])
+    const loaded = { ...input, cells, trafficTime: () => 30 }
+    const project = [...bankConnectionProjects(loaded)][0]!
+    expect(project).toBeDefined()
+    expect(project.disconnected).toBe(false)
+    expect(project.benefit).toBeGreaterThan(project.route.cost)
+    expect(input.planner.validate(project.route.points, project.width, true)).toBe(true)
+    expect([...bankConnectionProjects({ ...loaded, trafficTime: () => 1e9 })][0]!.benefit).toBe(project.benefit)
+    expect([...bankConnectionProjects({ ...loaded, availableFunds: () => project.route.cost - 1 })]).toEqual([])
+    input.planner.environment.terrain!.seaAt = () => true
+    expect([...bankConnectionProjects(loaded)]).toEqual([])
+  })
+
+  it('counts through-network beneficiaries once and requires funding and railway clearance before global appraisal', () => {
+    const input = fixture(), cells = input.cells.map(cell => ({ ...cell, households: 200 })), networkBenefit = vi.fn(() => 10_000)
+    const project = [...bankConnectionProjects({ ...input, cells, networkBenefit })][0]!
+    expect(project).toBeDefined()
+    expect(project.benefit).toBe(10_000)
+    expect(networkBenefit.mock.calls.length).toBeLessThanOrEqual(3)
+    expect([...bankConnectionProjects({ ...input, cells, networkBenefit: () => undefined })]).toEqual([])
+    const unavailable = vi.fn(() => 1e9)
+    expect([...bankConnectionProjects({ ...input, cells, availableFunds: () => project.route.cost - 1, networkBenefit: unavailable })]).toEqual([])
+    expect(unavailable).not.toHaveBeenCalled()
+    const x = input.a.x + 40
+    input.planner.setRailwayCorridors([{ id: 'surface-rail', points: [{ x, y: 0 }, { x, y: 1300 }] }])
+    input.planner.setRailwayRoadNetwork([{ id: 'old-gate', kind: 'local', width: 6, points: [{ x: x - 30, y: 490 }, { x: x + 30, y: 490 }] }])
+    expect([...bankConnectionProjects({ ...input, cells, networkBenefit: unavailable })]).toEqual([])
+    expect(unavailable).not.toHaveBeenCalled()
+  })
+
+  it('shares the remaining levy across bridge transactions using exact committed physical costs', () => {
+    const input = fixture(), cells = [300, 750].flatMap(y => [input.a, input.b].map(point => ({ point: { ...point, y }, households: 600, capacity: 600, area: 100_000, frontageDepth: 20 }))), observed: number[] = []
+    const result = investInBankConnections({ ...input, cells, funds: 20_000, networkBenefit: () => 50_000, commit: (project, remaining) => {
+      observed.push(remaining)
+      expect(project.route.cost).toBeLessThan(14_000)
+      if (14_000 > remaining) return false
+      return { cost: 14_000 }
+    } })
+    expect(observed.length).toBeGreaterThanOrEqual(2)
+    expect(observed[0]).toBe(20_000)
+    expect(observed[1]).toBe(6000)
+    expect(result).toEqual({ spent: 14_000, completed: 1 })
   })
 
   it('charges only an atomic successful project, archives it and reuses its crossing in later rounds', () => {

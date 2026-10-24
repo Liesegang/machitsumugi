@@ -5,8 +5,15 @@ export interface SimulatedRoad extends Road { builtYear: number; role: RoadRole;
 export interface RoadMetadata { id: string; builtYear: number; role: RoadRole; reason: string; phase: string; width: number; kind: Road['kind']; constructionCost: number; bridge?: boolean; preserveEndpoint?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean }
 export interface RoadProject { points: Point[]; metadata: RoadMetadata; requireConnection?: boolean; modifies?: string }
 export interface RoadProjection { point: Point; distance: number; road: SimulatedRoad; a: Point; b: Point; t: number }
-/** Generalized modern travel speed in m/min; historical impedance is applied by year. */
-export const roadTravelSpeed = (road: { role?: string; kind?: Road['kind'] }) => road.role === 'expressway' ? 1400 : road.role === 'ramp' ? 350 : road.role === 'highway' || (!road.role && road.kind === 'arterial') ? 450 : road.role === 'collector' ? 330 : road.role === 'farm' ? 100 : 220
+/** Generalized uncongested speed in m/min; historical impedance is applied by
+ * year. Width constrains an actual carriageway, including access streets. A
+ * role-only proposal uses its reference section; widening never raises speed
+ * above that class's limit. Capacity/junction delays are evaluated separately. */
+export const roadTravelSpeed = (road: { role?: string; kind?: Road['kind']; width?: number }) => {
+  const base = road.role === 'expressway' ? 1400 : road.role === 'ramp' ? 350 : road.role === 'highway' || (!road.role && road.kind === 'arterial') ? 450 : road.role === 'collector' ? 330 : road.role === 'farm' ? 100 : 220
+  const reference = road.role === 'expressway' ? 22 : road.role === 'ramp' ? 7 : road.role === 'highway' || (!road.role && road.kind === 'arterial') ? 13 : road.role === 'collector' ? 8 : road.role === 'access' ? 4.6 : road.role === 'farm' ? 4 : 6
+  return base * (road.width !== undefined && Number.isFinite(road.width) && road.width > 0 ? Math.max(.35, Math.min(1, road.width / reference)) : 1)
+}
 const key = (p: Point) => `${Math.round(p.x * 20)},${Math.round(p.y * 20)}`
 export const roadLength = (points: Point[]) => points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i]!.x, p.y - points[i]!.y), 0)
 const dist = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y)
@@ -49,15 +56,18 @@ export class PlanarRoadGraph {
   private segments: Segment[] = []
   private buckets = new Map<string, Segment[]>()
   private revision = 0
+  /** Invalidates traffic assignment after a real junction or road change. */
+  get topologyRevision() { return this.revision }
   private routingRevision = -1
   private routing: { points: Point[]; nodes: Map<string, number>; adjacency: { to: number; time: number; length: number }[][] } | null = null
   private queryRevision = -1
   private nearestQueries = new Map<string, RoadProjection | null>()
   private projectionQueries = new Map<string, number>()
+  private projectionResults = new Map<string, RoadProjection[]>()
   private accessibilityQueries = new Map<string, (point: Point) => number>()
   private syncQueries() {
     if (this.queryRevision === this.revision) return
-    this.nearestQueries.clear(); this.projectionQueries.clear(); this.accessibilityQueries.clear()
+    this.nearestQueries.clear(); this.projectionQueries.clear(); this.projectionResults.clear(); this.accessibilityQueries.clear()
     this.queryRevision = this.revision
   }
   private remember<T>(cache: Map<string, T>, k: string, value: T, limit = 8192) {
@@ -94,6 +104,14 @@ export class PlanarRoadGraph {
     return this.remember(this.nearestQueries, queryKey, null)
   }
   projections(p: Point, radius: number, count = 12): RoadProjection[] {
+    this.syncQueries()
+    const queryKey = `${p.x}:${p.y}:${radius}:${count}`
+    // Retain exact survey sites only while their road geometry is unchanged.
+    // Callers own the result array, projection records and projected points;
+    // the road reference still identifies the actual graph-owned corridor.
+    const copy = (hits: RoadProjection[]) => hits.map(hit => ({ ...hit, point: { ...hit.point } }))
+    const cached = this.projectionResults.get(queryKey)
+    if (cached) return copy(cached)
     const candidates = Number.isFinite(radius) ? this.nearby(p, p, radius) : this.segments
     const hits: RoadProjection[] = []
     for (const s of candidates) {
@@ -110,7 +128,8 @@ export class PlanarRoadGraph {
       if (selected.some(other => dist(other.point, hit.point) < 65)) continue
       selected.push(hit); if (selected.length >= count) break
     }
-    return selected
+    this.remember(this.projectionResults, queryKey, selected, 2048)
+    return copy(selected)
   }
   /** Exact junction sites along a proposed survey line, in chainage order. */
   crossings(a: Point, b: Point): { point: Point; road: SimulatedRoad; t: number }[] {
@@ -182,11 +201,30 @@ export class PlanarRoadGraph {
     if (!near.road.points.some(p => dist(p, point) < 1e-7)) for (let i = 1; i < near.road.points.length; i++) if (dist(projectOnRoadSegment(point, near.road.points[i - 1]!, near.road.points[i]!).point, point) < 1e-7) { near.road.points.splice(i, 0, { ...point }); break }
     this.revision++; return true
   }
+  /** A surveyed section already owned at sufficient width is reused, including
+   * a reverse traversal of a short bridge deck. This is not a second capacity
+   * edge or a new dated construction. A wider request still needs modify(). */
+  reusableRoad(path: Point[], metadata: Pick<RoadMetadata, 'width' | 'role' | 'level' | 'controlledAccess' | 'bridge'>): SimulatedRoad | null {
+    if (path.length < 2) return null
+    const first = path[0]!, last = path.at(-1)!, proposal = { ...metadata, points: path }
+    const covered = (points: Point[], route: Point[]) => points.every(point => route.slice(1).some((end, i) => dist(projectOnRoadSegment(point, route[i]!, end).point, point) <= .04))
+    for (const road of this.roads) {
+      if (road.width + 1e-7 < metadata.width || controlledRoad(road) !== controlledRoad(metadata) || !!(road.bridge || road.role === 'bridge') !== !!(metadata.bridge || metadata.role === 'bridge')) continue
+      const sameEnds = dist(first, road.points[0]!) < .04 && dist(last, road.points.at(-1)!) < .04
+      const reversedEnds = dist(first, road.points.at(-1)!) < .04 && dist(last, road.points[0]!) < .04
+      if ((!sameEnds && !reversedEnds) || roadLevelAt(proposal, first) !== roadLevelAt(road, first) || roadLevelAt(proposal, last) !== roadLevelAt(road, last)) continue
+      if (Math.abs(roadLength(path) - roadLength(road.points)) > .08 || !covered(path, road.points) || !covered(road.points, path)) continue
+      return road
+    }
+    return null
+  }
   /** All crossings are real shared vertices; a road may connect two older roads to close a loop. */
   add(path: Point[], metadata: RoadMetadata, requireConnection = true): SimulatedRoad | null {
     if (path.length < 2 || roadLength(path) < (metadata.preserveEndpoint ? 1e-7 : metadata.role === 'bridge' ? .01 : 20)) return null
     path = path.map(p => ({ ...p }))
     for (const i of [0, path.length - 1]) { if (controlledRoad(metadata) || (i === path.length - 1 && metadata.preserveEndpoint)) continue; const near = this.nearest(path[i]!, 1); if (near) path[i] = near.point }
+    const existing = this.reusableRoad(path, metadata)
+    if (existing) return existing
     if (requireConnection && this.roads.length && !this.nearest(path[0]!, .15)) return null
     const normalized: Point[] = [path[0]!], junctions: { road: SimulatedRoad; point: Point }[] = []
     for (let i = 1; i < path.length; i++) {
