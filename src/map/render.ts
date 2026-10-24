@@ -182,8 +182,10 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
 
   if (layers.terrain) {
     for (const group of landPaintGroups(map.areas)) {
-      if (options.contours && map.terrainSurface) continue
       const area = group[0]!
+      // Fortification surfaces are surveyed works, not natural-cover paint.
+      // Their walls, courts and dry ditches remain legible over contour relief.
+      if (options.contours && map.terrainSurface && !/^castle-(?:wall|courtyard|dry-ditch)-/.test(area.id)) continue
       ctx.beginPath()
       for (const part of group) for (const ring of [part.polygon, ...part.holes ?? []]) {
         if (!ring.length) continue
