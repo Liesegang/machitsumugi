@@ -269,19 +269,43 @@ export function planRailway(input: RailwayPlanInput): RailwayPlan | null {
       const span = distance(corridor.from, corridor.station)
       if (span < 1450) continue
       const direction = { x: (corridor.station.x - corridor.from.x) / span, y: (corridor.station.y - corridor.from.y) / span }
-      const start = { x: corridor.from.x + direction.x * 40, y: corridor.from.y + direction.y * 40 }, trackLevel = input.terrain.elevation(start)
+      // The branch validator reserves 12m at the viewport edge and checks both
+      // 5m track shoulders. An oblique/corner entry needs more than 40m before
+      // its whole cross-section enters that same permissible rectangle.
+      let approachDistance = 40, lastApproachDistance = span - 350
+      for (const [position, delta, size, shoulder] of [[corridor.from.x, direction.x, input.width, Math.abs(direction.y) * 5], [corridor.from.y, direction.y, input.height, Math.abs(direction.x) * 5]] as const) {
+        const clearance = 12 + shoulder + 1e-6
+        if (Math.abs(delta) < 1e-10) { if (position < clearance || position > size - clearance) lastApproachDistance = -1; continue }
+        const a = (clearance - position) / delta, b = (size - clearance - position) / delta
+        approachDistance = Math.max(approachDistance, Math.min(a, b)); lastApproachDistance = Math.min(lastApproachDistance, Math.max(a, b))
+      }
+      const approachLength = Math.ceil(approachDistance / 5) * 5
+      if (approachLength > lastApproachDistance) continue
+      const start = { x: corridor.from.x + direction.x * approachLength, y: corridor.from.y + direction.y * approachLength }, trackLevel = input.terrain.elevation(start)
+      const reserved = input.terrain.areas.filter(a => a.kind === 'water' && a.id.startsWith('sea') || a.id === 'historic-core' || a.id.startsWith('moat-'))
+      const blocked = (p: Point) => reserved.some(a => inside(p, a.polygon) && !a.holes?.some(hole => inside(p, hole))) || !!input.core && (inside(p, input.core) || input.core.some((a, i) => segmentDistance(p, a, input.core![(i + 1) % input.core!.length]!) < 18))
+      const approachPoints: Point[] = [], approachGround: number[] = []
       let validApproach = true, maxEarthwork = 0, maxGroundGrade = 0
-      for (let j = 0; j <= 8; j++) {
-        const p = { x: corridor.from.x + direction.x * j * 5, y: corridor.from.y + direction.y * j * 5 }, earthwork = Math.abs(trackLevel - input.terrain.elevation(p))
-        if (input.terrain.waterAt(p) || earthwork > 11) validApproach = false
+      for (let j = 0; j <= approachLength / 5; j++) {
+        const along = j * 5, p = { x: corridor.from.x + direction.x * along, y: corridor.from.y + direction.y * along }, ground = input.terrain.elevation(p), earthwork = Math.abs(trackLevel - ground)
+        approachPoints.push(p); approachGround.push(ground)
+        if (input.terrain.waterAt(p) || earthwork > 11 || [-5, 0, 5].some(side => blocked({ x: p.x - direction.y * side, y: p.y + direction.x * side }))) validApproach = false
         maxEarthwork = Math.max(maxEarthwork, earthwork)
         if (j) { const before = { x: p.x - direction.x * 5, y: p.y - direction.y * 5 }; maxGroundGrade = Math.max(maxGroundGrade, Math.abs(input.terrain.elevation(p) - input.terrain.elevation(before)) / 5) }
       }
       if (!validApproach) continue
       const plan = planRailBranch({ width: input.width, height: input.height, terrain: input.terrain, core: input.core, inheritedRoads: input.inheritedRoads, start: { point: start, heading: Math.atan2(direction.y, direction.x), elevation: trackLevel, grade: 0 }, goal: corridor.station, maxNodes: 24000 })
-      if (!plan || plan.length + 40 < 1500) continue
-      const points = [corridor.from, ...plan.points]
-      return { ...plan, points, elevations: [trackLevel, ...plan.elevations], stationTargets: [points.at(-1)!], terminus: points.at(-1)!, diagnostics: { ...plan.diagnostics, maxEarthwork: Math.max(maxEarthwork, plan.diagnostics.maxEarthwork), maxGroundGrade: Math.max(maxGroundGrade, plan.diagnostics.maxGroundGrade) } }
+      if (!plan || plan.length + approachLength < 1500) continue
+      const approachKinds = approachGround.map((ground): RailwayStructure['kind'] | null => trackLevel - ground > 1.5 ? 'embankment' : ground - trackLevel > 1.5 ? 'cutting' : null), approachStructures: RailwayStructure[] = []
+      for (let i = 0; i < approachKinds.length; i++) {
+        const kind = approachKinds[i], first = i
+        while (i + 1 < approachKinds.length && approachKinds[i + 1] === kind) i++
+        if (!kind) continue
+        const from = Math.max(0, first - 1), to = Math.min(approachPoints.length - 1, i + 1)
+        approachStructures.push({ kind, from: approachPoints[from]!, to: approachPoints[to]!, length: (to - from) * 5, maxHeight: Math.max(...approachGround.slice(from, to + 1).map(ground => Math.abs(trackLevel - ground))) })
+      }
+      const points = [...approachPoints.slice(0, -1), ...plan.points], elevations = [...approachPoints.slice(0, -1).map(() => trackLevel), ...plan.elevations]
+      return { ...plan, points, elevations, structures: [...approachStructures, ...plan.structures], stationTargets: [points.at(-1)!], terminus: points.at(-1)!, diagnostics: { ...plan.diagnostics, maxEarthwork: Math.max(maxEarthwork, plan.diagnostics.maxEarthwork), maxGroundGrade: Math.max(maxGroundGrade, plan.diagnostics.maxGroundGrade) } }
     }
     return null
   }
