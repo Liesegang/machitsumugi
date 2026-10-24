@@ -23,7 +23,7 @@ export interface PlanningTerrain {
   bankDistance?: (point: Point) => number
   channelAt?: (point: Point) => { point: Point; tangent: Point; bankDistance: number; width: number; surfaceElevation: number; riverId: string } | null
 }
-export interface PlanningEnvironment { width: number; height: number; areas: Area[]; core: Point[] | null; terrain?: PlanningTerrain; bridgeSites?: Point[]; landCost?: (point: Point) => number; waterGeometryBounds?: { minX: number; minY: number; maxX: number; maxY: number } }
+export interface PlanningEnvironment { width: number; height: number; areas: Area[]; core: Point[] | null; terrain?: PlanningTerrain; bridgeSites?: Point[]; landCost?: (point: Point) => number; exactLandCost?: boolean; waterGeometryBounds?: { minX: number; minY: number; maxX: number; maxY: number } }
 export interface SurveyedBridgeSpan { bankA: Point; bankB: Point }
 export interface PlannedRoute { points: Point[]; length: number; cost: number; bridgeLength: number; method: 'direct' | 'heading-search' | 'bridge-project'; boundaryContinuation?: boolean; surveyedBridgeSpans?: SurveyedBridgeSpan[] }
 export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; alignment?: 'natural' | 'planned'; maximumGrade?: number }
@@ -169,7 +169,10 @@ export class RoadPlanner {
     const k = within ? gy * this.cacheColumns + gx : -1
     const outsideKey = within ? '' : `${gx},${gy}`
     let value = within ? this.cache[k] : this.outsideCache.get(outsideKey)
-    if (value) return value
+    // A hard parcel/building mask must not move to the terrain-cost lattice.
+    // Only small site planners opt in; the larger smooth earthwork cache stays.
+    const exactLandCost = this.environment.exactLandCost ? this.environment.landCost?.(p) ?? 0 : 0
+    if (value) return exactLandCost ? { ...value, cost: value.cost + exactLandCost } : value
     const terrain = this.environment.terrain
     const water = terrain ? terrain.waterAt(p) : this.waterAreas.some(a => occupied(p, a))
     const sea = water && (terrain?.seaAt?.(p) ?? this.seaAreas.some(a => occupied(p, a)))
@@ -181,7 +184,7 @@ export class RoadPlanner {
     if (!earth) {
       const q = { x: ex * 24, y: ey * 24 }, grade = terrain?.slope(q) ?? 0
       const forest = this.forestAt(q)
-      earth = { grade, cost: 1 + grade * grade * 95 + Math.max(0, terrain?.elevation(q) ?? 0) / 500 + (forest ? 2.4 : 0) + (terrain?.wetness?.(q) ?? 0) * .55 + (this.environment.landCost?.(q) ?? 0) }
+      earth = { grade, cost: 1 + grade * grade * 95 + Math.max(0, terrain?.elevation(q) ?? 0) / 500 + (forest ? 2.4 : 0) + (terrain?.wetness?.(q) ?? 0) * .55 + (this.environment.exactLandCost ? 0 : this.environment.landCost?.(q) ?? 0) }
       if (earthWithin) this.earthCache[earthKey] = earth
       else this.outsideEarthCache.set(outsideEarthKey, earth)
     }
@@ -193,7 +196,7 @@ export class RoadPlanner {
     value = { water, sea, grade, cost, coreDistance }
     if (within) this.cache[k] = value
     else this.outsideCache.set(outsideKey, value)
-    return value
+    return exactLandCost ? { ...value, cost: value.cost + exactLandCost } : value
   }
   waterAt(p: Point) { return this.environment.terrain?.waterAt(p) ?? this.waterAreas.some(a => occupied(p, a)) }
   suitable(p: Point, width = 6) {

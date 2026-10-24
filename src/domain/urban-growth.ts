@@ -4,6 +4,7 @@ import { renewExistingRoad } from './road-renewal'
 import { assignRoadTraffic } from './road-traffic'
 import { surveyedProjectCost } from './surveyed-project-cost'
 import { frontageCapacity } from './frontage-supply'
+import { prospectiveRoadDistance, PROSPECTIVE_ROAD_REACH } from './prospective-road-access'
 import { PlanarRoadGraph, extractStreetBlocks, projectOnRoadSegment, roadLength, roadTravelSpeed } from './road-graph'
 import type { RoadRole, SimulatedRoad } from './road-graph'
 import { RoadPlanner } from './road-planner'
@@ -12,7 +13,7 @@ import { createLandholdingCost } from './road-alignment'
 import { diverseOpportunityBatches, sampleLandOpportunities } from './land-opportunities'
 import { planHousingCollectorBridge, transportProjects } from './transport-investment'
 import { valleySettlementCandidates } from './valley-settlements'
-import { RegionalRoadPlanner } from './regional-road-planner'
+import { RegionalRoadPlanner, regionalRoadKind } from './regional-road-planner'
 import { planModernTransport } from './modern-transport'
 import { createRoadProjectCache } from './road-project-cache'
 import { investInNeighborhood } from './neighborhood-connections'
@@ -21,6 +22,8 @@ import { foundingMarketGates } from './founding-market'
 import { commitValleyThroughRoad, planValleyThroughRoad } from './valley-through-road'
 import { developmentClimbMinutes, surveyDevelopmentSite } from './development-terrain'
 import { isConstructionYear, simulationEndYear, simulationYears } from './simulation-calendar'
+import { advancePlannedNeighborhood, canCommitPlannedNeighborhood, plannedNeighborhoodContains, canSurveyInfillChord } from './planned-neighborhood'
+import { surveyAgriculturalAccessProjects } from './agricultural-network'
 
 export interface UrbanGrowthInput {
   width: number; height: number; seed: string; type: CityType; center: Point; core: Point[] | null; areas: Area[]
@@ -69,8 +72,14 @@ export function scenarioDemandAtYear(input: DemographicScenario, year: number): 
   // statistical report). A regional urban crop includes countryside, so the
   // scenario remains below that density: 15,668 households at the default,
   // assuming 2.2 people/household. This is a fiction-setting scale, not a forecast.
-  // Only post-1950 regional growth changes; village/rural/metro and history retain their scales.
-  const metropolitanModern = settlement === 'metropolis' ? 4.6 : settlement === 'regional-city' ? 2.8 : 1, metropolitanIndustry = settlement === 'metropolis' ? 1.7 : 1
+  // These modern scales leave village/rural demand and earlier history intact.
+  // A metropolis must not use a regional-town population merely housed in a
+  // few taller buildings. Tokyo's2020 general-household density was about
+  // 8,300/km² (5,208,438 households /627.53km²). This fictional post-town
+  // scenario at85 demand targets ~86,000 households in4×3km, below that urban
+  // reference; terrain and surveyed supply can still leave unmet demand.
+  // https://www.toukei.metro.tokyo.lg.jp/kokutyo/2020/kt20tv0006.csv
+  const metropolitanModern = settlement === 'metropolis' ? 19 : settlement === 'regional-city' ? 2.8 : 1, metropolitanIndustry = settlement === 'metropolis' ? 1.7 : 1
   const retention = settlement === 'village' ? .28 : settlement === 'rural-town' ? .62 : .82
   const decline = trend === 'declining' ? 1 - clamp((year - peakYear) / (2025 - peakYear), 0, 1) * (1 - retention) : 1
   const households = Math.max(1, Math.round((base + p * ((old + industrial * metropolitanIndustry) * oldScale + modern * modernScale * metropolitanModern) * scale * regionalReach) * decline))
@@ -144,7 +153,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     }
     if (run.length > 1) chunks.push({ path: run, bridge: mode })
     const length = chunks.reduce((sum, chunk) => sum + roadLength(chunk.path), 0)
-    const projects = chunks.map((chunk, i) => ({ points: chunk.path, metadata: { id: nextId(phase, year), builtYear: year, phase, role: chunk.bridge ? 'bridge' as const : role, reason, width, kind: role === 'highway' && input.arterial && route.boundaryContinuation ? 'arterial' as const : 'local' as const, constructionCost: route.cost * roadLength(chunk.path) / Math.max(length, 1e-9), ...(chunk.bridge ? { bridge: true } : {}), ...(route.boundaryContinuation ? { boundaryContinuation: true } : {}), preserveEndpoint: preserveEndpoint || chunks.length > 1 }, requireConnection: i ? true : requireConnection }))
+    const projects = chunks.map((chunk, i) => ({ points: chunk.path, metadata: { id: nextId(phase, year), builtYear: year, phase, role: chunk.bridge ? 'bridge' as const : role, reason, width, kind: regionalRoadKind(input.arterial, route.boundaryContinuation, role), constructionCost: route.cost * roadLength(chunk.path) / Math.max(length, 1e-9), ...(chunk.bridge ? { bridge: true } : {}), ...(route.boundaryContinuation ? { boundaryContinuation: true } : {}), preserveEndpoint: preserveEndpoint || chunks.length > 1 }, requireConnection: i ? true : requireConnection }))
     // Bank approach, deck and exit form one project. A rejected mandatory
     // section must never leave a newly constructed road ending at the river.
     const beforeCount = graph.roads.length
@@ -272,21 +281,8 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     .map(cell => ({ cell, score: cell.ownerResistance + (input.terrainModel?.wetness?.(cell.point) ?? .2) * .65 - (input.terrainModel?.slope(cell.point) ?? 0) * 4 }))
     .sort((a, b) => b.score - a.score || a.cell.id.localeCompare(b.cell.id))
   for (const { cell } of agriculturalCandidates) if (agriculturalSectors.every(other => distance(other.point, cell.point) > (settlement === 'village' ? 500 : settlement === 'rural-town' ? 400 : 320))) agriculturalSectors.push(cell)
-  const pendingSectors = new Set(agriculturalSectors)
-  while (pendingSectors.size) {
-    let best: { cell: MarketCell; near: NonNullable<ReturnType<PlanarRoadGraph['nearest']>>; score: number } | null = null
-    for (const cell of pendingSectors) {
-      const near = graph.nearest(cell.point, 620)
-      if (!near) continue
-      if (near.distance <= 150) { pendingSectors.delete(cell); continue }
-      const score = (cell.ownerResistance + .3) / (100 + near.distance)
-      if (!best || score > best.score) best = { cell, near, score }
-    }
-    if (!best) break
-    pendingSectors.delete(best.cell)
-    const route = planner.plan(best.near.point, best.cell.point, { role: 'farm', width: 3.5, maxNodes: 3500 })
-    // Avoid costly hillside detours; an inaccessible sector remains uncultivated.
-    if (route && route.length < best.near.distance * 1.55 && route.cost < 700) addProject(route, 'regional', 1650, 'farm', '耕作適地のまとまりへ旧街道・既存農道から接続する農道', 3.5)
+  for (const project of surveyAgriculturalAccessProjects({ graph, planner, sectors: agriculturalSectors })) {
+    if (addProject(project.route, 'regional', 1650, 'farm', project.reason, project.width)) foundingCost += charged(project.route)
   }
   growthLog.push({ phase: 'regional', year: 1650, roadsAdded: graph.roads.length, reason: '成立以前の街道・渡河・耕作地へのアクセス', households: foundingHouseholds, unmetHouseholds: 0, constructionCost: foundingCost })
   if (!graph.roads.length) return { roads: [], roadHistory: [], centers, growthLog, developmentCells: cells, demandSchedule, blocks: [], remainingTransportCapital: 0 }
@@ -341,8 +337,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     const marketPrice = 1 + .75 * Math.log1p(Math.max(0, demandAt(year).households - foundingHouseholds) / 250)
     const functions = active.map(center => ({ center, time: graph.accessibilityFrom(center.point) }))
     for (const cell of cells) {
-      const near = graph.nearest(cell.point, 160)
-      cell.roadDistance = near?.distance ?? Infinity
+      cell.roadDistance = prospectiveRoadDistance(graph, cell.point)
       cell.servicedCapacity = frontageCapacity(cell, cell.roadDistance)
       let access = 0
       for (const item of functions) {
@@ -533,10 +528,14 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
         existing(year); occupy(target.households, year)
       }
     }
-    if (year >= 1955 && unmet > 90 && !populationFalling && (settlement === 'regional-city' || settlement === 'metropolis' || (input.type === 'newtown' && target.households > 700)) && plannedDistricts.length < (input.type === 'newtown' ? 3 : 2) && year - lastProjectYear >= 10) {
+    if (canCommitPlannedNeighborhood({ year, unmetHouseholds: unmet, populationFalling, settlement, type: input.type, targetHouseholds: target.households, districtCount: plannedDistricts.length, lastProjectYear })) {
       const stationCenters = centers.filter(c => c.kind === 'station')
       const occupiedCenter = (input.type === 'newtown' ? stationCenters[plannedDistricts.length % Math.max(1, stationCenters.length)] : null)?.point ?? centers.filter(c => c.kind === 'station' || c.kind === 'historic')[0]!.point
-      const site = cells.filter(c => c.households === 0 && c.suitability > .76 && c.roadDistance > 60 && c.roadDistance < 350 && distance(c.point, occupiedCenter) > (input.type === 'newtown' ? 280 : 700) && distance(c.point, occupiedCenter) < (input.type === 'newtown' ? 1100 : 1600) && plannedDistricts.every(d => distance(d.center, c.point) > 700) && districtSupply(c.point) >= 90 && (input.type !== 'newtown' || [-1, 1].every(dx => [-1, 1].every(dy => { const corner = { x: c.point.x + dx * 330, y: c.point.y + dy * 330 }; return planner.suitable(corner, 12) && !input.areas.some(a => a.kind === 'forest' && pointInRegion(corner, a)) })))).sort((a, b) => (b.accessibility * .6 + b.suitability - b.ownerResistance) - (a.accessibility * .6 + a.suitability - a.ownerResistance))[0]
+      // A whole 660m square with all four corners outside forest/water is not
+      // required to survey a neighbourhood. That rejected nearly every hill
+      // new town before a single street could be considered. Available pads
+      // justify the commitment; every individual street is still surveyed.
+      const site = cells.filter(c => c.households === 0 && c.suitability > .76 && c.roadDistance > 60 && c.roadDistance < 350 && distance(c.point, occupiedCenter) > (input.type === 'newtown' ? 280 : 700) && distance(c.point, occupiedCenter) < (input.type === 'newtown' ? 1100 : 1600) && plannedDistricts.every(d => distance(d.center, c.point) > 700) && districtSupply(c.point) >= 90).sort((a, b) => (b.accessibility * .6 + b.suitability - b.ownerResistance) - (a.accessibility * .6 + a.suitability - a.ownerResistance))[0]
       if (site) {
         const near = graph.nearest(site.point, 500)!
         const route = planner.plan(near.point, site.point, { role: 'collector', width: 10, maxNodes: 5500 })
@@ -547,24 +546,21 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       }
     }
     let estateChanged = false
-    if (input.type === 'newtown' && year >= 1955 && target.households - allocated > 40) for (const district of plannedDistricts) {
-      if (year <= district.year) continue
-      const along = { x: Math.cos(district.angle), y: Math.sin(district.angle) }, across = { x: -along.y, y: along.x }
-      const at = (u: number, v: number): Point => ({ x: district.center.x + along.x * u + across.x * v, y: district.center.y + along.y * u + across.y * v })
-      const projects: [Point, Point][] = [[at(0, 0), at(330, 0)], [at(0, 0), at(-330, 0)], [at(0, 0), at(0, 330)], [at(0, 0), at(0, -330)]]
-      for (const offset of [85, -85, 170, -170, 255, -255]) projects.push([at(0, offset), at(330, offset)], [at(0, offset), at(-330, offset)], [at(offset, 0), at(offset, 330)], [at(offset, 0), at(offset, -330)])
-      for (let funded = 0; funded < 2 && district.completed < projects.length; funded++) {
-      const [a, b] = projects[district.completed]!, near = graph.nearest(a, 3)
-      if (!near || !planner.suitable(b, 6.5)) { district.completed++; continue }
-      const route = cachedRoute(near.point, b, 'lane', 6.5, undefined, true)
-      if (!route) { district.completed++; continue }
-      const potential = cells.filter(c => !c.households && distance(c.point, district.center) < 470 && c.landValue > .025).reduce((sum, c) => sum + c.capacity, 0)
-      // A land-readjustment district is a bounded commitment; empty demand does
-      // not create a citywide grid, and only two scheduled streets are funded per tick.
-      if (route.cost > budget || route.cost > potential * 30) continue
-      if (addProject(route, 'suburban', year, 'lane', '鉄道を基準に測量した限定住区の段階的な区画道路', 6.5, true, false, budget)) { budget -= charged(route); expenditure += charged(route); district.completed++; estateChanged = true }
-      else district.completed++
-      }
+    if (year >= 1955) for (const district of plannedDistricts) {
+      const progress = advancePlannedNeighborhood({
+        district, year, unmetHouseholds: target.households - allocated, budget, cells,
+        nearest: point => graph.nearest(point, 3)?.point ?? null,
+        suitable: (point, width) => planner.suitable(point, width),
+        plan: (from, street) => cachedRoute(from, street.to, street.role, street.width, undefined, true),
+        commit: (route, street, maximumCost) => {
+          if (!addProject(route, 'suburban', year, street.role, '既存道路・鉄道の地域軸を測量した限定住区の段階的な区画道路', street.width, true, false, maximumCost)) return null
+          const cost = charged(route)
+          budget -= cost; expenditure += cost
+          return cost
+        },
+      })
+      district.completed = progress.completed
+      estateChanged ||= progress.accepted > 0
     }
     if (estateChanged) { existing(year); occupy(target.households, year) }
     if (unmet > 0 && density > 0 && expansionAllowed) {
@@ -575,7 +571,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
       // rather than imposing a fixed road construction quota on the economy.
       while (budget > 20 && allocated < target.households && projects < remainingCells * 3) {
         // Valuable, currently unserved land is considered; all other land remains farmland/open space.
-        const rankedOpportunities = cells.filter(c => c.households < c.capacity && c.roadDistance >= c.frontageDepth + 2 && c.roadDistance < 380 && c.landValue > .025 && (input.type !== 'newtown' || year < 1955 || plannedDistricts.every(d => { const x = c.point.x - d.center.x, y = c.point.y - d.center.y, u = x * Math.cos(d.angle) + y * Math.sin(d.angle), v = -x * Math.sin(d.angle) + y * Math.cos(d.angle); return Math.abs(u) > 360 || Math.abs(v) > 360 })))
+        const rankedOpportunities = cells.filter(c => c.households < c.capacity && c.roadDistance >= c.frontageDepth + 2 && c.roadDistance < PROSPECTIVE_ROAD_REACH && c.landValue > .025 && (year < 1955 || plannedDistricts.every(d => !plannedNeighborhoodContains(c.point, d))))
           .map(c => ({ cell: c, score: c.landValue * (c.capacity - c.households) / (35 + c.roadDistance) * (.9 + random() * .2) }))
           .sort((a, b) => b.score - a.score || a.cell.id.localeCompare(b.cell.id))
         const selection: { project: Candidate | null } = { project: null }
@@ -607,7 +603,11 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
             }
           }
           const hasRoute = () => alternatives.some(alternative => alternative.route && !rejectedProjects.has(alternative.route))
-          if (!hasRoute() && opposite) { const role: RoadRole = 'lane', width = year < 1900 ? 5.7 : 6.3; alternatives.push({ route: cachedRoute(first.point, opposite.point, role, width, cell.point), role, width }) }
+          if (!hasRoute() && opposite) {
+            const role: RoadRole = 'lane', width = year < 1900 ? 5.7 : 6.3
+            const survey = canSurveyInfillChord({ site: cell.point, from: first.point, to: opposite.point, frontageDepth: cell.frontageDepth, year, slope: p => input.terrainModel?.slope(p) ?? 0 })
+            alternatives.push({ route: cachedRoute(first.point, opposite.point, role, width, survey ? undefined : cell.point, survey), role, width })
+          }
           const desiredLength = clamp(cell.frontageDepth * 3.3, 65, 150), accessWidth = cell.frontageDepth < 25 ? 3.3 : 4.6
           const extend = Math.min(80, Math.max(0, desiredLength - first.distance)), d = distance(first.point, cell.point)
           const beyond = { x: cell.point.x + (cell.point.x - first.point.x) / d * extend, y: cell.point.y + (cell.point.y - first.point.y) / d * extend }

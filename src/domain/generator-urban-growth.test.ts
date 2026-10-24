@@ -84,14 +84,17 @@ function expectSplitCrossings(result: UrbanGrowthResult) {
 
 describe('urban growth causal invariants', () => {
   let zero: UrbanGrowthResult, historic: UrbanGrowthResult, railway: UrbanGrowthResult, present: UrbanGrowthResult, withoutRailway: UrbanGrowthResult, repeated: UrbanGrowthResult
-  beforeAll(() => {
-    zero = simulateUrbanGrowth({ ...fixture, density: 0, era: 'present' })
-    historic = simulateUrbanGrowth({ ...fixture, era: 'historic' })
-    railway = simulateUrbanGrowth({ ...fixture, era: 'railway' })
-    present = simulateUrbanGrowth({ ...fixture, era: 'present' })
-    withoutRailway = simulateUrbanGrowth({ ...fixture, railway: false, era: 'present' })
-    repeated = simulateUrbanGrowth({ ...fixture, era: 'historic' })
-  }, 120_000)
+  // Six complete chronological worlds belong to the discovered regression
+  // jobs, alongside the other generator suites. Keep every invariant and the
+  // original region/conditions. Each independent world gets its own bounded
+  // setup; a shared two-minute hook must not hide six skipped checks when
+  // several otherwise valid worlds are computed under CPU contention.
+  beforeAll(() => { zero = simulateUrbanGrowth({ ...fixture, density: 0, era: 'present' }) }, 120_000)
+  beforeAll(() => { historic = simulateUrbanGrowth({ ...fixture, era: 'historic' }) }, 120_000)
+  beforeAll(() => { railway = simulateUrbanGrowth({ ...fixture, era: 'railway' }) }, 120_000)
+  beforeAll(() => { present = simulateUrbanGrowth({ ...fixture, era: 'present' }) }, 120_000)
+  beforeAll(() => { withoutRailway = simulateUrbanGrowth({ ...fixture, railway: false, era: 'present' }) }, 120_000)
+  beforeAll(() => { repeated = simulateUrbanGrowth({ ...fixture, era: 'historic' }) }, 120_000)
 
   it('does not schedule later expansion with demand set to zero', () => {
     expect(zero.roads.length).toBeGreaterThan(0)

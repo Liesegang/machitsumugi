@@ -59,11 +59,15 @@ describe('frontage land development', () => {
     for (const building of infill) {
       const parcel = current.parcels.find(p => p.id === building.parcelId)!
       expect(building.builtYear).toBeGreaterThanOrEqual(1955)
-      expect(parcel.createdYear).toBe(1650)
+      const parent = current.parcels.find(p => `${p.id}-rear` === parcel.id)!
+      expect(parent).toBeTruthy()
+      expect(parcel.createdYear).toBe(parent.createdYear)
+      expect(parcel.createdYear).toBeLessThan(1955)
       expect(parcel.access![0].y).toBe(500)
       expect(building.polygon.every(point => pointInPolygon(point, parcel.polygon))).toBe(true)
       expect(historic.buildings.some(b => b.parcelId === parcel.id)).toBe(false)
-      expect(historic.parcels.find(p => p.id === parcel.id)!.polygon).toEqual(parcel.polygon)
+      if (parcel.createdYear <= 1800) expect(historic.parcels.find(p => p.id === parcel.id)!.polygon).toEqual(parcel.polygon)
+      else expect(historic.parcels.find(p => p.id === parcel.id)).toBeUndefined()
     }
     for (const old of historic.buildings) {
       const surviving = current.buildings.find(b => b.id === old.id)
@@ -91,6 +95,22 @@ describe('frontage land development', () => {
     expect(result.snapshots.at(-1)!.year).toBe(2025)
     for (const b of result.buildings) expect(result.events.some(e => e.entityId === b.id && e.year === b.builtYear)).toBe(true)
     for (const snapshot of result.snapshots) expect(snapshot.vacant - snapshot.unmet).toBe(snapshot.capacity - snapshot.households)
+  })
+  it('acquires actual homes and their old gardens instead of publishing empty lots along every rural road', () => {
+    const longRoad: Road = { id: 'rural-through-road', points: [{ x: 100, y: 500 }, { x: 4300, y: 500 }], role: 'lane', kind: 'local', width: 4.5, builtYear: 1650 }
+    const result = developLand({ config: { ...config, type: 'post', settlement: 'village', density: 15, railway: false }, roads: [longRoad], center: { x: 500, y: 500 }, stations: [], canPlace: () => true, slope: () => 0 })
+    expect(result.buildings.length).toBeGreaterThan(0)
+    expect(result.parcels.filter(p => p.polygon.every(point => point.x > 2800))).toEqual([])
+    for (const parcel of result.parcels) {
+      const acquired = result.events.find(event => event.id === `title-acquisition-${parcel.id}`)!
+      expect(acquired?.year).toBe(parcel.createdYear)
+      expect(result.history.parcels.filter(version => version.value.id === parcel.id).every(version => version.from >= acquired.year)).toBe(true)
+      // Unbuilt old garden titles must belong to a real acquired parent home.
+      if (!result.history.buildings.some(version => version.value.parcelId === parcel.id)) {
+        expect(parcel.id.endsWith('-rear')).toBe(true)
+        expect(result.history.buildings.some(version => `${version.value.parcelId}-rear` === parcel.id)).toBe(true)
+      }
+    }
   })
   it('gives each rebuild a unique event ID when the same parcel is developed again', () => {
     const result = developLand({ config, roads, center: { x: 600, y: 500 }, stations: [], canPlace: (_polygon, year) => year !== 1955, slope: () => 0 })

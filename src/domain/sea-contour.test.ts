@@ -7,6 +7,14 @@ const inside = (p: Point, polygon: Point[]) => {
   return hit
 }
 describe('continuous ocean isobath', () => {
+  it('keeps marine sediment filled exactly to water level connected to the sea', () => {
+    const sea = contourConnectedSea({ width: 240, height: 180, step: 12, elevation: p => p.x < 120 ? -2 : p.x <= 192 ? 0 : p.x - 192, regionalOcean: () => true })
+    const covered = (p: Point) => sea.some(a => inside(p, a.polygon) && !a.holes.some(h => inside(p, h)))
+    expect(covered({ x: 150, y: 90 })).toBe(true)
+    expect(covered({ x: 210, y: 90 })).toBe(false)
+    expect(sea).toHaveLength(1)
+    expect(sea[0]!.holes).toHaveLength(0)
+  })
   it('interpolates a sloping shoreline at its zero elevation, without cell stair steps', () => {
     const elevation = (p: Point) => p.x + p.y * .37 - 480
     const sea = contourConnectedSea({ width: 1000, height: 800, step: 12, elevation, regionalOcean: () => true })

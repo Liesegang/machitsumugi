@@ -1,6 +1,6 @@
 import polygonClipping from 'polygon-clipping'
 import type { Area, Point } from '../domain/types'
-import { subtractRegions } from '../domain/geometry'
+import { partitionWaterAreas } from '../domain/water-partition'
 import type { PolygonRegion } from '../domain/geometry'
 
 interface WaterGeometry { surfaces: Area[]; shorelines: PolygonRegion[] }
@@ -13,8 +13,7 @@ const cache = new WeakMap<readonly Area[], { water: Area[]; polygons: Point[][];
 export function waterGeometry(areas: readonly Area[]): WaterGeometry {
   const water = areas.filter(area => area.kind === 'water' && area.polygon.length >= 3), previous = cache.get(areas)
   if (previous && water.length === previous.water.length && water.every((area, i) => area === previous.water[i] && area.polygon === previous.polygons[i] && area.holes === previous.holes[i] && area.waterLevel === previous.levels[i])) return previous.geometry
-  const standing = water.filter(area => area.waterLevel !== undefined)
-  const surfaces = water.flatMap(area => area.waterLevel !== undefined ? [area] : subtractRegions(area, standing).map((part, i) => ({ ...area, ...part, holes: part.holes, id: i ? `${area.id}-surface-${i}` : area.id })))
+  const surfaces = partitionWaterAreas(water)
   const polygon = (area: Area): polygonClipping.Polygon => [area.polygon, ...(area.holes ?? [])].map(ring => ring.map(p => [p.x, p.y]))
   const [first, ...rest] = water.map(polygon)
   const shorelines: PolygonRegion[] = first ? polygonClipping.union(first, ...rest).map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), holes: rings.slice(1).map(ring => ring.slice(0, -1).map(([x, y]) => ({ x, y }))) })) : []

@@ -51,8 +51,8 @@ describe('conservative erosion, transport and deposition', () => {
       const elevation = Float32Array.from({ length: n * n }, (_, i) => -depth - Math.floor(i / n) * .0001)
       const drainage = routeDrainage(elevation, n, n, cellSize)
       const result = transportSediment({ elevation, hydroElevation: drainage.hydroDEM, flowTo: drainage.flowTo, order: drainage.order, sourceVolume: source, columns: n, rows: n, cellSize })
-      expect(result.deposition[centre]).toBeCloseTo(-elevation[centre]! + .15, 8)
-      for (let i = 0; i < elevation.length; i++) expect(elevation[i]! + result.deposition[i]!).toBeLessThanOrEqual(.15 + 1e-10)
+      expect(result.deposition[centre]).toBeCloseTo(-elevation[centre]!, 8)
+      for (let i = 0; i < elevation.length; i++) expect(elevation[i]! + result.deposition[i]!).toBeLessThanOrEqual(1e-10)
       expect(result.exportedVolume).toBeGreaterThan(0)
       expect(Math.abs(result.massBalanceError) / result.sourceVolume).toBeLessThan(1e-12)
     }

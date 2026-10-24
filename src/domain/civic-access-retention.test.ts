@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { retainCivicAccess } from './civic-access-retention'
+import { retainCivicAccess, retireCivicPavementReservations } from './civic-access-retention'
 import { createCityTimeline, sliceCityAtYear } from './timeline'
-import { rectangle } from './geometry'
+import { corridorPolygon, polygonsOverlap, rectangle } from './geometry'
 import type { Building, CityMap, Parcel, Road, TimelineVersion } from './types'
 
 const driveway: Road = { id: 'facility-access-school', points: [{ x: 100, y: 100 }, { x: 100, y: 200 }], width: 3.5, kind: 'local', role: 'access', builtYear: 1880, reason: '学校への接道' }
@@ -21,6 +21,30 @@ function fixture(): CityMap {
 const versions = (map: CityMap) => map.timeline!.roads.filter(v => v.value.id === driveway.id)
 
 describe('dated reuse of surviving civic driveway frontages', () => {
+  it('reserves a relocated facility external approach before later housing, but releases its internal paths and adopts only used paving', () => {
+    const external = { year: 1880, to: undefined as number | undefined }, internal = { year: 1880, to: undefined as number | undefined }
+    retireCivicPavementReservations([external], driveway.id, driveway.id, 1950)
+    retireCivicPavementReservations([internal], `${driveway.id}-internal-0`, driveway.id, 1950)
+    const approachPaving = corridorPolygon(driveway.points[0]!, driveway.points[1]!, driveway.width / 2 + 2)
+    const campusPathPaving = corridorPolygon({ x: 100, y: 200 }, { x: 140, y: 200 }, 2.8 / 2 + 2)
+    const records = [{ ...external, polygon: approachPaving }, { ...internal, polygon: campusPathPaving }]
+    const canBuild = (polygon: Road['points'], year: number) => !records.some(record => record.year <= year && (record.to === undefined || year < record.to) && polygonsOverlap(polygon, record.polygon))
+    const newHouse: Building = { id: 'later-housing-over-old-approach', polygon: rectangle(96, 142, 8, 8), kind: 'residential', height: 2, builtYear: 1960 }
+    expect(canBuild(newHouse.polygon, 1875)).toBe(true)
+    expect(canBuild(newHouse.polygon, 1960)).toBe(false)
+    expect(canBuild(rectangle(116, 197, 8, 6), 1960)).toBe(true)
+    const map = fixture()
+    if (canBuild(newHouse.polygon, 1960)) map.timeline!.buildings.push({ from: 1960, value: newHouse })
+    const result = retainCivicAccess(map)
+    expect(result.unresolved).toEqual([])
+    expect(result.retained[0]).toMatchObject({ from: 1950, length: 60, parcelIds: ['near', 'far'] })
+    expect(versions(result.map).map(v => [v.from, v.to, v.value.points.at(-1)!.y])).toEqual([[1880, 1950, 200], [1950, undefined, 160]])
+    // This is the actual failure without the reservation: a new footprint can
+    // otherwise block the already-used driveway before the final survey runs.
+    const blocked = fixture()
+    blocked.timeline!.buildings.push({ from: 1960, value: newHouse })
+    expect(retainCivicAccess(blocked).unresolved[0]?.reason).toContain(newHouse.id)
+  })
   it('keeps only used paving after a campus moves, without changing land or rewriting its original road history', () => {
     const before = fixture(), serialized = JSON.stringify(before), result = retainCivicAccess(before), after = result.map
     expect(result.unresolved).toEqual([])

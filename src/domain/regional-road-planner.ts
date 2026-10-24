@@ -1,7 +1,14 @@
-import type { Point } from './types'
+import type { Point, Road } from './types'
+import type { RoadRole } from './road-graph'
 import { RoadPlanner } from './road-planner'
 import type { PlannedRoute, PlanningEnvironment, PlanningOptions } from './road-planner'
 import type { RailwayCorridor } from './railway-road-constraints'
+
+/** Administrative designation does not require a13m engineering cross-section.
+ * Only an actually surveyed regional continuation can receive this designation. */
+export function regionalRoadKind(arterial: boolean, boundaryContinuation: boolean | undefined, role: RoadRole): Road['kind'] {
+  return arterial && boundaryContinuation && ['highway', 'collector', 'lane', 'bridge'].includes(role) ? 'arterial' : 'local'
+}
 
 export interface BoundaryPortalOptions {
   width: number

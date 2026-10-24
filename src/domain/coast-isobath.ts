@@ -6,7 +6,7 @@ export function isobathCrossing(a: Point, b: Point, elevation: (p: Point) => num
   if (!first) return a
   if (!last) return b
   if ((first < 0) === (last < 0)) throw new Error('A shoreline crossing must bracket sea level')
-  for (let i = 0; i < 32 && Math.hypot(high.x - low.x, high.y - low.y) > .005; i++) {
+  for (let i = 0; i < 40 && Math.hypot(high.x - low.x, high.y - low.y) > .000001; i++) {
     const middle = { x: (low.x + high.x) / 2, y: (low.y + high.y) / 2 }, z = elevation(middle)
     if (!z) return middle
     if ((z < 0) === (first < 0)) { low = middle; first = z } else high = middle

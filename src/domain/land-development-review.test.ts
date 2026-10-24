@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { developLand } from './land-development'
 import { scenarioDemandAtYear } from './urban-growth'
-import { pointInPolygon } from './geometry'
+import { pointInPolygon, polygonArea, polygonsOverlap } from './geometry'
 import type { CityConfig, Road } from './types'
 
 // The street supply is deliberately identical in each comparison. These checks
@@ -18,7 +18,10 @@ const flat = run()
 describe('land market and surviving historic stock regressions', () => {
   it('does not lose most housing on a gentle grade when physical lot supply is unchanged', () => {
     const gentlySloping = run(.033)
-    expect(gentlySloping.parcels.map(p => ({ id: p.id, polygon: p.polygon }))).toEqual(flat.parcels.map(p => ({ id: p.id, polygon: p.polygon })))
+    // Market choices may differ; the same acquired holding must still have the
+    // same physical title. Unchosen frontage options are no longer saved lots.
+    const flatTitles = new Map(flat.parcels.map(parcel => [parcel.id, parcel]))
+    for (const parcel of gentlySloping.parcels) if (flatTitles.has(parcel.id)) expect(parcel.polygon).toEqual(flatTitles.get(parcel.id)!.polygon)
     // A 3.3% grade may lower value; it must not reproduce the old 74% collapse.
     expect(gentlySloping.snapshots.at(-1)!.capacity).toBeGreaterThan(flat.snapshots.at(-1)!.capacity * .8)
     expect(gentlySloping.buildings.some(b => (b.builtYear ?? 0) > 1960)).toBe(true)
@@ -42,6 +45,25 @@ describe('land market and surviving historic stock regressions', () => {
       expect(flat.events.some(event => event.kind === 'construction' && event.entityId === replacement.id && event.year === acquisition.year)).toBe(true)
     }
     expect(flat.snapshots.at(-1)!.capacity).toBeGreaterThan(flat.buildings.length)
+  })
+  it('buys a real larger modern holding beside an old road instead of freezing every future dwelling to its old house option', () => {
+    const assembled = flat.parcels.filter(parcel => parcel.id.startsWith('housing-'))
+    expect(assembled.length).toBeGreaterThan(0)
+    const roadIds = new Map(roads.map(road => [road.id, road]))
+    for (const parcel of assembled) {
+      expect(roadIds.get(parcel.roadId)?.builtYear).toBe(1650)
+      expect(parcel.createdYear).toBeGreaterThanOrEqual(1955)
+      expect(polygonArea(parcel.polygon)).toBeGreaterThanOrEqual(850)
+      expect(historic.parcels.some(old => old.id === parcel.id)).toBe(false)
+      const first = flat.history.parcels.find(version => version.value.id === parcel.id)!
+      expect(first.from).toBe(parcel.createdYear)
+      expect(flat.events.some(event => event.id === `title-acquisition-${parcel.id}` && event.year === first.from)).toBe(true)
+      const building = flat.buildings.find(building => building.parcelId === parcel.id)!
+      expect(building.height).toBeGreaterThanOrEqual(3)
+      expect(building.polygon.every(point => pointInPolygon(point, parcel.polygon))).toBe(true)
+      expect(polygonArea(building.polygon)).toBeGreaterThan(polygonArea(parcel.polygon) * .6)
+      for (const other of flat.parcels) if (other.id !== parcel.id && !other.retiredYear) expect(polygonsOverlap(parcel.polygon, other.polygon)).toBe(false)
+    }
   })
   it('keeps old buildings and parcel geometry unless an acquisition records their replacement', () => {
     for (const old of historic.buildings) {

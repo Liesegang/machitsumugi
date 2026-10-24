@@ -171,7 +171,7 @@ fn sediment(z: &[f32], drain: &Drainage, source: &[f64], columns: usize, rows: u
         let length = if marine[i] { fluvial_length.max(0.05 * (sea - z[i] as f64).max(1.0) / 0.00004) } else { fluvial_length };
         let attenuation = 1.0 - unsafe { exp(-cell / length) };
         // Keep the dry-channel minimum out of shallow marine accommodation.
-        let accommodation = if marine[i] { (sea - z[i] as f64 + 0.15).max(0.0) } else if depth > 0.01 { depth } else { cell * 0.025 };
+        let accommodation = if marine[i] { (sea - z[i] as f64).max(0.0) } else if depth > 0.01 { depth } else { cell * 0.025 };
         let settled = (volume * attenuation).min(accommodation * area); deposition[i] = settled / area; deposited += settled;
         if marine[i] { marine_deposited += settled; } else { terrestrial += settled; if depth > 0.01 { lake += settled; } }
         let transported = volume - settled;

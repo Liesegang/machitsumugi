@@ -4,9 +4,10 @@ import { agriculturalHistory } from './agricultural-history'
 import { shoppingStreetHistory } from './commercial-history'
 import type { AgriculturalAcquisition, AgriculturalTitle } from './agricultural-history'
 import { createTerrainModel } from './terrain'
+import { riparianWetlandMargin } from './riparian-wetland'
 import { simulateUrbanGrowth } from './urban-growth'
 import type { UrbanGrowthResult } from './urban-growth'
-import { boundsOf, corridorPolygon, distance, distanceToSegment, intersectRegions, overlaps, pathPointAt, pointInPolygon, pointInRegion, polygonOverlapsRegion, polygonsOverlap, projectPoint, rectangle, regionArea, segmentsCross, subtractRegions } from './geometry'
+import { boundsOf, corridorPolygon, distance, distanceToSegment, intersectRegions, overlaps, pathPointAt, pointInPolygon, pointInRegion, polygonArea, polygonOverlapsRegion, polygonsOverlap, projectPoint, rectangle, regionArea, segmentsCross, subtractRegions } from './geometry'
 import type { PolygonRegion } from './geometry'
 import type { Bounds } from './geometry'
 import { developLand, GENERATOR_VERSION } from './land-development'
@@ -28,6 +29,7 @@ import { surveyCastleAccess } from './castle-access'
 import { buildDistricts } from './districts'
 import { civicTransportAcquisitions } from './civic-transport'
 import { finalizeCivicRoadHistory } from './rail-access-acquisition'
+import { retireCivicPavementReservations } from './civic-access-retention'
 import { finalizeActualStockTransport } from './actual-stock-transport'
 import { resolveGenerationConfig } from './generation-config'
 import type { RegionalPreview } from './regional-terrain'
@@ -400,9 +402,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     const polygon = corridorPolygon(path[i]!, b, width / 2), bounds = boundsOf(polygon)
     return reserves.filter(reserve => reserveActive(reserve, asOf) && overlaps(bounds, reserve.bounds)).every(reserve => !polygonOverlapsRegion(polygon, reserve))
   })
-  const facilityLot = (kind: FacilityKind, point: Point, access: NonNullable<ReturnType<typeof nearestRoad>>, neighbourhood = false) => {
-    const width = neighbourhood ? 48 : kind === 'university' ? 220 : kind === 'park' ? 144 : kind === 'school' || kind === 'port' ? 108 : kind === 'hospital' ? 88 : kind === 'police' ? 46 : 74
-    const depth = neighbourhood ? 42 : kind === 'university' ? 180 : kind === 'park' ? 116 : kind === 'school' ? 88 : kind === 'port' ? 80 : kind === 'hospital' ? 70 : kind === 'police' ? 48 : 68
+  const facilityLot = (kind: FacilityKind, point: Point, access: NonNullable<ReturnType<typeof nearestRoad>>, neighbourhood = false, campusSpan: [number, number] = [220, 180]) => {
+    const width = neighbourhood ? 48 : kind === 'university' ? campusSpan[0] : kind === 'park' ? 144 : kind === 'school' || kind === 'port' ? 108 : kind === 'hospital' ? 88 : kind === 'police' ? 46 : 74
+    const depth = neighbourhood ? 42 : kind === 'university' ? campusSpan[1] : kind === 'park' ? 116 : kind === 'school' ? 88 : kind === 'port' ? 80 : kind === 'hospital' ? 70 : kind === 'police' ? 48 : 68
     const nx = (point.x - access.point.x) / access.distance, ny = (point.y - access.point.y) / access.distance
     const tr = (x: number, y: number) => ({ x: point.x + ny * x + nx * y, y: point.y - nx * x + ny * y })
     const rect = (x: number, y: number, w: number, h: number) => rectangle(x, y, w, h).map(p => tr(p.x, p.y))
@@ -433,7 +435,8 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     const sites = availableAt(constructionYear, kind === 'port' ? 1600 : kind === 'university' ? 420 : kind === 'park' && !identity?.neighbourhood ? 280 : 120, allowWoodland)
     const population = civicPopulations.get(constructionYear) ?? civicPopulations.get([...civicPopulations.keys()].filter(date => date <= constructionYear).at(-1) ?? 0) ?? []
     const served = identity?.neighbourhood ? new Map(sites.map(site => [site.point, population.reduce((sum, cell) => distance(cell.point, site.point) < 320 ? sum + cell.households : sum, 0)])) : undefined
-    const ranked = sites.filter(c => facilities.filter(f => placedYear(f) <= constructionYear).every(f => distance(f.point, c.point) > 155)).filter(c => !identity?.neighbourhood || facilities.filter(f => f.kind === 'park').every(f => distance(f.point, c.point) > 430) && naturalTerrain.slope(c.point) < .08 && (served?.get(c.point) ?? 0) >= 45).filter(c => {
+    const campusSpans: [number, number][] = kind === 'university' && (config.settlement === 'metropolis' || config.settlement === 'regional-city') ? [[320, 260], [220, 180]] : [[220, 180]]
+    const ranked = sites.flatMap(c => campusSpans.map(span => ({ ...c, lot: facilityLot(kind, c.point, c.access, identity?.neighbourhood, span) }))).filter(c => facilities.filter(f => placedYear(f) <= constructionYear).every(f => distance(f.point, c.point) > 155)).filter(c => !identity?.neighbourhood || facilities.filter(f => f.kind === 'park').every(f => distance(f.point, c.point) > 430) && naturalTerrain.slope(c.point) < .08 && (served?.get(c.point) ?? 0) >= 45).filter(c => {
       const p = c.point
       if (kind !== 'port' || config.terrain === 'plain') return true
       let bank = Infinity
@@ -441,20 +444,24 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       return bank > 35 && bank < 175
     }).filter(c => {
       if (!c.access) return false
-      const campus = facilityLot(kind, c.point, c.access, identity?.neighbourhood).campus
+      const campus = c.lot.campus
       if (kind === 'school' || kind === 'hospital' || kind === 'police') {
         const samples = [...campus, ...campus.map((p, i) => ({ x: (p.x + campus[(i + 1) % campus.length]!.x) / 2, y: (p.y + campus[(i + 1) % campus.length]!.y) / 2 })), c.point], levels = samples.map(p => naturalTerrain.elevation(p))
         if (Math.max(...levels) - Math.min(...levels) > 3 || samples.some(p => naturalTerrain.slope(p) > .08 || naturalTerrain.wetness(p) > .52 || (() => { const channel = naturalTerrain.channelAt(p); return channel !== null && channel.bankDistance < 90 && naturalTerrain.elevation(p) - channel.surfaceElevation < 3 })())) return false
       }
       return canBuild(campus, true, constructionYear, allowWoodland) && (!harbor || constructionYear < 1920 || !polygonsOverlap(campus, harbor.platform))
-    }).sort((a, b) => (!version && served ? served.get(b.point)! - served.get(a.point)! : 0) || distance(a.point, target) - distance(b.point, target))
+    }).sort((a, b) => {
+      if (!version && served) { const difference = served.get(b.point)! - served.get(a.point)!; if (difference) return difference }
+      const siteCost = (c: typeof a) => distance(c.point, target) + (kind === 'university' ? naturalTerrain.slope(c.point) * 4000 + (polygonArea(c.lot.campus) < 70000 ? 180 : 0) : 0)
+      return siteCost(a) - siteCost(b)
+    })
     let accessPath: Point[] | null = null, accessCost = 0
     let campusProposal: CampusProposal | undefined, parkPlaza: PolygonRegion | undefined, parkPath: PlannedRoute | undefined
     const suffix = version ? `-relocation-${constructionYear}-${version}` : ''
     const name = identity?.name ?? (kind === 'school' ? `${config.name.replace(/[市町村]$/, '')}第一小学校` : kind === 'university' ? `${config.name.replace(/[市町村]$/, '')}大学` : facilityNames[kind])
-    const chosen = ranked.slice(0, version ? 96 : kind === 'university' ? 12 : 24).find(c => {
+    const chosen = ranked.slice(0, version ? 96 : kind === 'university' ? 32 : 24).find(c => {
       if (!c.access) return false
-      const proposedLot = facilityLot(kind, c.point, c.access, identity?.neighbourhood), entrance = proposedLot.entrance
+      const proposedLot = c.lot, entrance = proposedLot.entrance
       const route = facilityPlanner.plan(c.access.point, entrance, { role: 'access', width: 3.5, maxNodes: 6000, ...(allowWoodland ? { maximumGrade: .14 } : {}) })
       if (!route || !Number.isFinite(route.cost) || !accessAvoidsReserves(route.points, 3.5, constructionYear)) return false
       const localBounds = boundsOf(proposedLot.campus), offset = { x: localBounds.minX - 10, y: localBounds.minY - 10 }, local = (p: Point) => ({ x: p.x - offset.x, y: p.y - offset.y }), global = (p: Point) => ({ x: p.x + offset.x, y: p.y + offset.y })
@@ -463,9 +470,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       const internalRoute = (a: Point, b: Point, structures: Building[]) => {
         // Campus paths need a few hundred metres of actual terrain, not another
         // pair of 12km-wide survey arrays for every individual lecture hall.
-        if (!cachedInternal || cachedInternal.structures !== structures) cachedInternal = { structures, planner: new RoadPlanner({ width: localBounds.maxX - localBounds.minX + 20, height: localBounds.maxY - localBounds.minY + 20, areas: [], core: null,
+        if (!cachedInternal || cachedInternal.structures !== structures) cachedInternal = { structures, planner: new RoadPlanner({ width: localBounds.maxX - localBounds.minX + 20, height: localBounds.maxY - localBounds.minY + 20, areas: [], core: null, exactLandCost: true,
           terrain: { elevation: p => naturalTerrain.elevation(global(p)), slope: p => naturalTerrain.slope(global(p)), waterAt: p => naturalTerrain.waterAt(global(p)), bridgeSites: [] },
-          landCost: p => { const q = global(p); return !pointInPolygon(q, proposedLot.campus) || structures.some(building => pointInPolygon(q, building.polygon)) ? Infinity : reserveCost(q) + (woodedSite ? 2.4 : 0) },
+          landCost: p => { const q = global(p); return !pointInPolygon(q, proposedLot.campus) || structures.some(building => pointInPolygon(q, building.polygon) || building.polygon.some((a, i) => distanceToSegment(q, a, building.polygon[(i + 1) % building.polygon.length]!) < 1.6)) ? Infinity : reserveCost(q) + (woodedSite ? 2.4 : 0) },
         }) }
         const route = cachedInternal.planner.plan(local(a), local(b), { role: 'access', width: 2.8, alignment: 'planned', maximumGrade: .14, maxNodes: 1800 })
         return route ? { ...route, points: route.points.map(global) } : null
@@ -496,7 +503,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     const { point } = chosen
     // Earlier facility junctions subdivide this route; cached segment indices are stale.
     const access = nearestRoad(point, constructionYear)!
-    const lot = facilityLot(kind, point, access, identity?.neighbourhood)
+    const lot = chosen.lot
     const driveway: Road = { id: `${identity ? `${identity.id}-access` : `facility-access-${kind}`}${suffix}`, points: accessPath!, kind: 'local', width: 3.5, role: 'access', builtYear: constructionYear, reason: version ? '交通用地取得に伴う公共施設の移転先への接道' : '公共施設用地の接道' }
     ensureRoadJunction(access.road.id, access.point)
     roads.push(driveway)
@@ -587,7 +594,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       for (const road of site.paths) {
         const index = roads.indexOf(road); if (index >= 0) roads.splice(index, 1)
         retiredCivicRoads.push({ from: road.builtYear ?? site.year, to: acquisition.year, value: road })
-        for (const record of civicRouteRecords.get(road.id) ?? []) record.to = acquisition.year
+        retireCivicPavementReservations(civicRouteRecords.get(road.id) ?? [], road.id, site.accessRoad.id, acquisition.year)
       }
       for (const area of site.areas) { landRetired.set(area.polygon, acquisition.year); const index = areas.indexOf(area); if (index >= 0) areas.splice(index, 1) }
       for (const building of site.buildings) { buildingRetired.set(building.id, acquisition.year); const index = buildings.indexOf(building); if (index >= 0) buildings.splice(index, 1) }
@@ -667,8 +674,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   const mapBoundary = { polygon: rectangle(0, 0, W, H) }
   const densityAt = settlementDensity(development.parcels)
   const settled = contourNaturalLand(W, H, p => densityAt(p) - .13, 24).flatMap(region => intersectRegions(region, mapBoundary))
-  const bankDistance = terrain.bankDistance ?? ((p: Point) => Math.min(...terrain.rivers.flatMap(r => r.points.slice(1).map((b, i) => Math.max(0, distanceToSegment(p, r.points[i]!, b) - (r.widths[i] ?? 10) / 2)))))
-  const wetlands = contourNaturalLand(W, H, p => Math.min(.085 - terrain.slope(p), terrain.wetness(p) - .58, (60 - bankDistance(p)) / 100)).flatMap(region => intersectRegions(region, mapBoundary))
+  const wetlands = contourNaturalLand(W, H, p => riparianWetlandMargin(p, terrain)).flatMap(region => intersectRegions(region, mapBoundary))
   for (const region of settled) convertedLand.add({ ...region, bounds: boundsOf(region.polygon) })
   for (const region of wetlands) { const record = { ...region, bounds: boundsOf(region.polygon) }; convertedLand.add(record) }
   const inheritedRoads = roadsAt(1650).filter(r => !r.controlledAccess)

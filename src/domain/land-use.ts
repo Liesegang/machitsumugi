@@ -251,7 +251,7 @@ function surveyIntersection(subject: Point[], district: Point[], inset = 0) {
  * This is a fictional ownership/irrigation allocation, not real cadastral data.
  */
 export function agriculturalPlots(width: number, height: number, seed: string, river: Point[] = [], terrain?: AgriculturalTerrain, inheritedRoads: Road[] = []) {
-  const random = seededRandom(`${seed}:agricultural-ownership-v3`)
+  const random = seededRandom(`${seed}:agricultural-ownership-v4`)
   type SurveySite = { point: Point; bearing?: number; roadId?: string }
   const sites: SurveySite[] = []
   const addSite = (site: SurveySite, spacing = 210) => {
@@ -265,9 +265,13 @@ export function agriculturalPlots(width: number, height: number, seed: string, r
   const roads = inheritedRoads.filter(r => (r.builtYear ?? 1650) <= 1650 && !r.controlledAccess).sort((a, b) => Number(b.role === 'farm') - Number(a.role === 'farm') || a.id.localeCompare(b.id))
   for (const road of roads) {
     const length = road.points.slice(1).reduce((sum, p, i) => sum + distance(p, road.points[i]!), 0)
-    const count = Math.max(1, Math.ceil(length / 380))
+    // A cadastral survey belongs to one long access/irrigation reach. Sampling
+    // every road bend used to rotate a fresh lattice every few hundred metres,
+    // creating a fan of fields along every curved road. Local terraces can
+    // still establish a separate contour-aligned holding below.
+    const count = Math.max(1, Math.ceil(length / 1200))
     for (let i = 0; i < count; i++) {
-      const t = (i + .5) / count, point = pathPointAt(road.points, t), span = Math.min(.4, 65 / Math.max(length, 1)), a = pathPointAt(road.points, Math.max(0, t - span)), b = pathPointAt(road.points, Math.min(1, t + span))
+      const t = (i + .5) / count, point = pathPointAt(road.points, t), a = pathPointAt(road.points, i / count), b = pathPointAt(road.points, (i + 1) / count)
       if (distance(a, b) <= 1) continue
       const bearing = Math.atan2(b.y - a.y, b.x - a.x)
       addSite({ point, bearing, roadId: road.id })
@@ -306,11 +310,10 @@ export function agriculturalPlots(width: number, height: number, seed: string, r
       return contour
     }
     if (site.bearing !== undefined) {
-      if (channelBearing === undefined || (channel?.bankDistance ?? 1000) > 450) return site.bearing
-      // Rectangular axes are equivalent modulo a right angle, so blend their
-      // fourfold directions without accidentally rotating neighbouring grids 45°.
-      const angle = Math.atan2(Math.sin(site.bearing * 4) * .85 + Math.sin(channelBearing * 4) * .15, Math.cos(site.bearing * 4) * .85 + Math.cos(channelBearing * 4) * .15) / 4
-      return angle + Math.round((site.bearing - angle) / (Math.PI / 2)) * Math.PI / 2
+      // A river's small bends do not rotate an established level land survey.
+      // The canal/road reach is the durable boundary; tributaries still choose
+      // distinct axes when no inherited survey exists.
+      return site.bearing
     }
     return channelBearing ?? 0
   }

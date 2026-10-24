@@ -200,6 +200,19 @@ describe('land conversion and remaining cover', () => {
     }
   })
 
+  it('keeps a level cadastral reach coherent when its old road and nearby stream bend', () => {
+    const road: Road = { id: 'curved-old-road', points: [{ x: 100, y: 400 }, { x: 330, y: 320 }, { x: 600, y: 440 }, { x: 900, y: 400 }], kind: 'local', width: 3.5, role: 'farm', builtYear: 1650 }
+    const terrain = { elevation: () => 5, slope: () => 0, wetness: () => .1, channelAt: (p: Point) => ({ bankDistance: 100, surfaceElevation: 3, tangent: { x: 1, y: Math.sin(p.x / 140) * .8 } }) }
+    const plots = agriculturalPlots(1000, 800, 'coherent-reach', [], terrain, [road])
+    const axes = plots.map(plot => surveyAxis(plot.polygon)).filter(axis => axis.alignment > .999999)
+    expect(axes.length).toBeGreaterThan(80)
+    expect(axes.every(axis => bearingDifference(axis.angle, 0) < 1e-7)).toBe(true)
+    // Keep actual shared ownership and variation; coherence is not overlapping
+    // rectangles or one identical tile copied beside every curve sample.
+    const districts = new Set(plots.map(plot => plot.districtId))
+    expect(districts.size).toBe(1)
+  })
+
   it('surveys an adjoining hillside separately from its level old access road', () => {
     const road: Road = { id: 'terrace-access', points: [{ x: 80, y: 400 }, { x: 1120, y: 400 }], kind: 'local', width: 3.5, role: 'farm', builtYear: 1650 }
     const terrain = {

@@ -87,7 +87,11 @@ export function transportSediment(input: SedimentInput): SedimentStep {
     // continues downstream and the next routing pass can move the mouth.
     // The dry-channel minimum must not overfill centimetres-deep sea by a
     // whole 1.25m at 50m resolution. Marine capacity follows its actual bed.
-    const accommodation = marine[i] ? Math.max(0, sea - elevation[i]! + .15) : lakeDepth > .01 ? lakeDepth : cellSize * .025
+    // Subaqueous settling fills its measured water column. An arbitrary
+    // freeboard created rows of identical +15cm, one-cell offshore islands.
+    // Real uplift and sediment delivered to already exposed ground are handled
+    // by their own physical terms; excess marine load continues downstream.
+    const accommodation = marine[i] ? Math.max(0, sea - elevation[i]!) : lakeDepth > .01 ? lakeDepth : cellSize * .025
     const settled = Math.min(volume * attenuation, accommodation * cellArea)
     deposition[i] = settled / cellArea
     depositedVolume += settled

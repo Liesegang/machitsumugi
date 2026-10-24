@@ -16,6 +16,24 @@ function coast(columns = 17, rows = 15): MarineReworkingInput {
 }
 
 describe('conservative marine erosion and sediment transport', () => {
+  it('reworks a loose sea-connected shoal through swash while preserving rock, high land and an inland basin', () => {
+    const columns = 15, rows = 15, count = columns * rows, elevation = new Float32Array(count).fill(5), ocean = new Uint8Array(count), alluvium = new Float64Array(count)
+    for (let y = 0; y < rows; y++) for (let x = 7; x < columns; x++) { const i = y * columns + x; elevation[i] = -1; ocean[i] = 1; alluvium[i] = .2 }
+    const shoal = 7 * columns + 7, rock = 8 * columns + 7, high = 9 * columns + 7, inland = 3 * columns + 3
+    elevation[shoal] = .0003; ocean[shoal] = 0; alluvium[shoal] = 1
+    elevation[rock] = .3; ocean[rock] = 0; alluvium[rock] = 0
+    elevation[high] = 2; ocean[high] = 0; alluvium[high] = 2
+    elevation[inland] = .0003; alluvium[inland] = 1
+    const input = { columns, rows, cellSize: 50, seaLevel: 0, elevation, ocean, alluvium }
+    const result = reworkMarineCPU(input, { openBoundary: false }), disabled = reworkMarineCPU(input, { openBoundary: false, swashHeightMetres: 0 })
+    expect(result.budget.activeSwashCells).toBe(1)
+    expect(result.elevation[shoal]).toBeLessThan(0)
+    expect(disabled.elevation[shoal]).toBe(elevation[shoal])
+    for (const i of [rock, high, inland]) { expect(result.elevation[i]).toBe(elevation[i]); expect(result.alluvium[i]).toBe(alluvium[i]) }
+    expect(result.budget.integerMassBalanceErrorUnits).toBe(0)
+    expect(Math.abs(result.budget.massBalanceError)).toBeLessThan(1e-6)
+    expect(Math.abs(result.budget.terrainBalanceError)).toBeLessThan(1e-6)
+  })
   it('resuspends, moves and deposits actual sediment without touching inland/lake cells or inputs', () => {
     const input = coast(), original = new Float32Array(input.elevation), originalLoose = new Float64Array(input.alluvium), frames: number[] = []
     const result = reworkMarineCPU(input, { steps: 96, openBoundary: false, onStep: state => frames.push(state.iteration) })
@@ -42,6 +60,18 @@ describe('conservative marine erosion and sediment transport', () => {
     expect(result.budget.reentrainedVolume).toBeLessThanOrEqual(result.budget.depositedVolume)
     expect(result.budget.integerMassBalanceErrorUnits).toBe(0)
     expect(result.budget.finalLooseVolume + result.budget.suspendedVolume).toBeCloseTo(result.budget.bedrockErodedVolume, 7)
+  })
+
+  it('retains excess shallow-water load in suspension instead of depositing new land above sea level', () => {
+    const columns = 7, rows = 7, count = columns * rows
+    const input = { columns, rows, cellSize: 50, seaLevel: 0, elevation: new Float32Array(count).fill(-.0002), ocean: new Uint8Array(count).fill(1), alluvium: new Float64Array(count), suspended: new Float64Array(count).fill(1) }
+    const result = reworkMarineCPU(input, { steps: 32, waveHeightMetres: 0, openBoundary: false })
+    expect(result.budget.depositedVolume).toBeGreaterThan(0)
+    expect(result.elevation.every(z => z <= 0)).toBe(true)
+    expect(result.budget.suspendedVolume).toBeGreaterThan(count * 2499)
+    expect(result.budget.integerMassBalanceErrorUnits).toBe(0)
+    expect(Math.abs(result.budget.massBalanceError)).toBeLessThan(1e-6)
+    expect(result.budget.terrainBalanceError).toBe(0)
   })
 
   it('records open-boundary loss rather than deleting it, while a closed boundary conserves all suspended stock', () => {

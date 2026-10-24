@@ -11,7 +11,7 @@ export type RegionalComputeOptions = Pick<MarineReworkingOptions, 'mode' | 'sign
   /** Diagnostic observer of the actual erosion grid, before preview decimation. */
   onFluvialStep?: LandscapeOptions['onStep']
 }
-export const REGIONAL_PHYSICS_VERSION = `landscape-v12:481x481:50m:256x4000y:marine-washload-v1:${MARINE_PHYSICS_VERSION}`
+export const REGIONAL_PHYSICS_VERSION = `landscape-v13:481x481:50m:256x4000y:marine-water-accommodation-v2:${MARINE_PHYSICS_VERSION}`
 
 export interface RegionalTerrain {
   extent: number

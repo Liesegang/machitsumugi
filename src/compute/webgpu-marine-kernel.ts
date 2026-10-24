@@ -4,7 +4,7 @@
  * This is a bounded morphodynamic closure, not a wave/current hydrodynamics
  * solver or a calibrated coastal forecast. Fixed-point sediment is conserved;
  * sub-quantum loose sediment remains in its original cell, never as a source. */
-export const MARINE_PHYSICS_VERSION = 'marine-storm-integer-v2-active-layer'
+export const MARINE_PHYSICS_VERSION = 'marine-storm-integer-v3-swash'
 export const MARINE_Q = 4096
 export interface MarineReworkingInput {
   elevation: Float32Array
@@ -32,6 +32,8 @@ export interface MarineReworkingOptions {
   mixingDepthMetres?: number
   currentMetresPerSecond?: { x: number; y: number }
   diffusivityM2PerSecond?: number
+  /** Bounded wave run-up over loose shore sediment; default half wave height. */
+  swashHeightMetres?: number
   openBoundary?: boolean
   mode?: 'auto' | 'gpu' | 'cpu'
   signal?: AbortSignal
@@ -58,6 +60,7 @@ export interface MarineReworkingBudget {
   maxRenderRoundingMetres: number
   quantumMetres: number
   activeOceanCells: number
+  activeSwashCells: number
 }
 export interface MarineReworkingResult {
   elevation: Float32Array
@@ -85,6 +88,7 @@ export interface MarineKernel {
   initialLoose: Uint32Array
   initialSuspended: Uint32Array
   activeCells: number
+  swashCells: number
   roundingResidual: number
   immobileLoose: number
   activeLayerUnits: number
@@ -114,6 +118,8 @@ export function createMarineKernel(input: MarineReworkingInput, options: MarineR
   const waveHeight = nonnegative(options.waveHeightMetres ?? 1.5, 'Wave height'), period = nonnegative(options.wavePeriodSeconds ?? 8, 'Wave period')
   const waveBase = nonnegative(options.waveBaseDepthMetres ?? 40, 'Wave base'), critical = nonnegative(options.criticalStressPascals ?? .2, 'Critical stress')
   const friction = nonnegative(options.waveFrictionFactor ?? .02, 'Wave friction'), mixing = nonnegative(options.mixingDepthMetres ?? 10, 'Mixing depth')
+  const swash = nonnegative(options.swashHeightMetres ?? waveHeight * .5, 'Wave run-up')
+  if (swash > 10) throw new RangeError('Wave run-up exceeds supported10m range')
   if (period <= 0 || critical <= 0 || mixing <= 0 || waveBase < .01 || waveBase > 200) throw new RangeError('Marine wave period, stress, mixing depth or wave base is outside supported bounds')
   const resuspension = nonnegative(options.resuspensionMetresPerSecond ?? 5e-6, 'Resuspension rate'), rockRate = nonnegative(options.rockErosionMetresPerSecond ?? 3e-9, 'Rock erosion rate')
   const rockLimit = nonnegative(options.rockErosionLimitMetres ?? .05, 'Rock erosion limit'), settling = nonnegative(options.settlingVelocityMetresPerSecond ?? .001, 'Settling velocity')
@@ -134,21 +140,27 @@ export function createMarineKernel(input: MarineReworkingInput, options: MarineR
   const parameters = new Uint32Array(20), signed = new Int32Array(parameters.buffer)
   parameters.set([columns, rows, count, 0, 0, Math.round(.01 / quantum), maxDepth, rockCap, rockQ, resuspendQ, MARINE_Q, 0, ...advection, diff, Number(options.openBoundary ?? true), 1, 0])
   signed[4] = Math.round(seaLevel / quantum)
+  parameters[19] = Math.floor(swash / quantum)
   const base = new Int32Array(count), ocean = new Uint32Array(count), state = new Uint32Array(count * 8)
   const initialLoose = new Uint32Array(count), initialSuspended = new Uint32Array(count)
   // No event can entrain more than rate*duration from one cell. Deeper bulk is
   // immutable during this event and stays in the original f64 inventory. The
   // extra quantum prevents falsely exposing rock at the final rate-limited step.
   const activeLayerUnits = Math.ceil(resuspendQ / MARINE_Q * steps) + 1
-  let activeCells = 0, initialUnits = 0, roundingResidual = 0, immobileLoose = 0, maxQuantizationError = 0, maxBase = 0
+  let activeCells = 0, swashCells = 0, initialUnits = 0, roundingResidual = 0, immobileLoose = 0, maxQuantizationError = 0, maxBase = 0
   for (let i = 0; i < count; i++) {
     if (!Number.isFinite(input.elevation[i]!) || Math.abs(input.elevation[i]!) > 20_000 || input.ocean[i]! > 1) throw new RangeError('Marine elevations/mask are outside supported bounds')
     nonnegative(input.alluvium[i]!, 'Loose sediment'); nonnegative(input.suspended?.[i] ?? 0, 'Suspended sediment')
     base[i] = Math.round(input.elevation[i]! / quantum)
     maxBase = Math.max(maxBase, Math.abs(base[i]!))
     maxQuantizationError = Math.max(maxQuantizationError, Math.abs(base[i]! * quantum - input.elevation[i]!))
-    if (!input.ocean[i]) continue
-    ocean[i] = 1; activeCells++
+    // Only the first surveyed shore cell can receive swash. This is neither a
+    // flood fill across low inland ground nor rock erosion above sea level.
+    const x = i % columns, y = Math.floor(i / columns)
+    const shoreSand = !input.ocean[i] && input.elevation[i]! > seaLevel && input.elevation[i]! <= seaLevel + swash && input.alluvium[i]! >= quantum &&
+      [x ? i - 1 : -1, x + 1 < columns ? i + 1 : -1, y ? i - columns : -1, y + 1 < rows ? i + columns : -1].some(j => j >= 0 && input.ocean[j] === 1)
+    if (!input.ocean[i] && !shoreSand) continue
+    ocean[i] = shoreSand ? 2 : 1; activeCells++; if (shoreSand) swashCells++
     const fullLoose = Math.floor(input.alluvium[i]! / quantum), loose = Math.min(fullLoose, activeLayerUnits), suspended = Math.floor((input.suspended?.[i] ?? 0) / quantum)
     if (!Number.isSafeInteger(fullLoose) || loose > 1_000_000_000 || suspended > 1_000_000_000) throw new RangeError('One marine cell exceeds the integer sediment range')
     initialLoose[i] = loose; initialSuspended[i] = suspended
@@ -165,7 +177,7 @@ export function createMarineKernel(input: MarineReworkingInput, options: MarineR
     if (options.quantumMetres === undefined) return createMarineKernel(input, { ...options, quantumMetres: .001 })
     throw new RangeError('Marine sediment ledger exceeds its conservative 31-bit global mass bound')
   }
-  return { input, options, count, steps, quantum, base, ocean, coefficients, parameters, state, initialLoose, initialSuspended, activeCells, roundingResidual, immobileLoose, activeLayerUnits, maxQuantizationError, gpuSafe: true }
+  return { input, options, count, steps, quantum, base, ocean, coefficients, parameters, state, initialLoose, initialSuspended, activeCells, swashCells, roundingResidual, immobileLoose, activeLayerUnits, maxQuantizationError, gpuSafe: true }
 }
 
 export function marineDepthIndex(kernel: MarineKernel, state: Uint32Array, i: number) {
@@ -205,7 +217,7 @@ export function finishMarineKernel(kernel: MarineKernel, state: Uint32Array, led
     roundingResidualVolume: kernel.roundingResidual * area, immobileLooseVolume: kernel.immobileLoose * area, activeLayerDepthMetres: kernel.activeLayerUnits * quantum, renderRoundingVolume, integerMassBalanceErrorUnits: integerBalance,
     massBalanceError: initialLooseVolume + initialSuspendedVolume + bedrockErodedVolume - finalLooseVolume - suspendedVolume - exportedVolume,
     terrainBalanceError: deltaUnits * unitVolume + suspendedVolume - initialSuspendedVolume + exportedVolume,
-    maxInputElevationQuantizationErrorMetres: kernel.maxQuantizationError, maxRenderRoundingMetres, quantumMetres: quantum, activeOceanCells: kernel.activeCells,
+    maxInputElevationQuantizationErrorMetres: kernel.maxQuantizationError, maxRenderRoundingMetres, quantumMetres: quantum, activeOceanCells: kernel.activeCells, activeSwashCells: kernel.swashCells,
   }
   return { elevation, alluvium, suspended, delta, budget, backend, metrics, integerState: state, integerLedger: ledger }
 }
@@ -223,13 +235,13 @@ export function reworkMarineCPU(input: MarineReworkingInput, options: MarineRewo
     b.set(a)
     for (let i = 0; i < count; i++) {
       const s = i * 8
-      if (!kernel.ocean[i] || kernel.base[i]! + ai[s]! > sea) continue
+      if (!kernel.ocean[i] || kernel.base[i]! + ai[s]! > sea + p[19]!) continue
       const activity = kernel.coefficients[depth(ai, i) * 2]!
       const credit = marineScale(p[9]!, activity) + a[s + 4]!, removed = Math.min(a[s + 1]!, Math.floor(credit / MARINE_Q))
       b[s + 4] = removed < a[s + 1]! ? credit % MARINE_Q : 0
       b[s + 1] = a[s + 1]! - removed; b[s + 2] = a[s + 2]! + removed
       let rock = 0
-      if (!b[s + 1]) {
+      if (!b[s + 1] && kernel.ocean[i] === 1) {
         const rockCredit = marineScale(p[8]!, activity) + a[s + 5]!
         rock = Math.min(p[7]! - a[s + 3]!, Math.floor(rockCredit / MARINE_Q)); b[s + 5] = rockCredit % MARINE_Q
       } else b[s + 5] = 0
@@ -238,10 +250,17 @@ export function reworkMarineCPU(input: MarineReworkingInput, options: MarineRewo
     flux.fill(0)
     for (let i = 0; i < count; i++) {
       const s = i * 8
-      if (!kernel.ocean[i] || kernel.base[i]! + bi[s]! > sea) continue
+      if (!kernel.ocean[i] || kernel.base[i]! + bi[s]! > sea + p[19]!) continue
+      // The draining swash sheet returns its entrained load to adjacent wet
+      // cells. Offshore suspension must not diffuse uphill into a dry cell
+      // and immediately settle there as an artificial sand trap.
+      const backwash = kernel.base[i]! + bi[s]! > sea
+      let wetFaces = 0
+      if (backwash) for (let d = 0; d < 4; d++) { const j = target(i, d); if (j >= 0 && kernel.ocean[j] && kernel.base[j]! + bi[j * 8]! <= sea) wetFaces++ }
       for (let d = 0; d < 4; d++) {
         const j = target(i, d)
-        if (j < 0 ? !p[17] : !kernel.ocean[j] || kernel.base[j]! + bi[j * 8]! > sea) continue
+        if (j < 0 ? !p[17] || backwash : !kernel.ocean[j] || kernel.base[j]! + bi[j * 8]! > sea) continue
+        if (backwash) { flux[i * 4 + d] = marineScale(b[s + 2]!, Math.floor(MARINE_Q / wetFaces)); continue }
         const other = j < 0 ? 0 : b[j * 8 + 2]!
         flux[i * 4 + d] = marineScale(b[s + 2]!, p[12 + d]!) + marineScale(Math.max(0, b[s + 2]! - other), p[16]!)
       }
@@ -257,7 +276,11 @@ export function reworkMarineCPU(input: MarineReworkingInput, options: MarineRewo
         if (j < 0) exported += flux[l + d]!; else load += flux[j * 4 + (d ^ 1)]!
       }
       const settling = kernel.base[i]! + bi[s]! > sea ? MARINE_Q : kernel.coefficients[depth(bi, i) * 2 + 1]!
-      const deposited = marineScale(load, settling)
+      // Settling cannot put sediment above the water surface. Retain excess
+      // in suspension; one integer quantum reserves a sub-resolution water
+      // film and covers the input base's half-quantum rounding uncertainty.
+      const accommodation = Math.max(0, sea - kernel.base[i]! - bi[s]! - 1)
+      const deposited = Math.min(marineScale(load, settling), accommodation)
       a[s + 1] = b[s + 1]! + deposited; a[s + 2] = load - deposited; ai[s] = bi[s]! + deposited
       ledger[l + 1] += deposited; ledger[l + 2] += exported
     }

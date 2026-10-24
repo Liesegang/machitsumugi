@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { scenarioDemandAtYear, simulateUrbanGrowth } from './urban-growth'
 import { developLand } from './land-development'
+import { simulationYears } from './simulation-calendar'
 import type { CityConfig, Road } from './types'
 
 describe('settlement scale and demographic history', () => {
@@ -12,6 +13,12 @@ describe('settlement scale and demographic history', () => {
     expect(scenarioDemandAtYear({ ...input, settlement: 'village' }, 2025).households).toBe(136)
     expect(scenarioDemandAtYear({ ...input, settlement: 'rural-town' }, 2025).households).toBe(1651)
     expect(scenarioDemandAtYear({ ...input, settlement: 'metropolis' }, 2025).households).toBeGreaterThan(20000)
+    const metropolitanCrop = scenarioDemandAtYear({ type: 'post', density: 85, settlement: 'metropolis' }, 2025)
+    // A4×3km major-city demand is below Tokyo's2020 household density, and
+    // above the old23k-household regional-scale crop. This is a demand target,
+    // never permission to exceed the physical housing/road/terrain capacity.
+    expect(metropolitanCrop.households).toBeGreaterThan(80000)
+    expect(metropolitanCrop.households).toBeLessThan(100000)
     expect(scenarioDemandAtYear({ ...input, mapSize: 'large' }, 2025).households).toBeGreaterThan(20000)
     expect(scenarioDemandAtYear({ ...input, mapSize: 'large', settlement: 'village' }, 2025)).toEqual(scenarioDemandAtYear({ ...input, settlement: 'village' }, 2025))
     expect(scenarioDemandAtYear({ ...input, populationTrend: 'stable' }, 2025)).toEqual(scenarioDemandAtYear({ ...input, populationTrend: 'stable' }, 1985))
@@ -29,7 +36,15 @@ describe('settlement scale and demographic history', () => {
     expect(final.buildings).toBeGreaterThanOrEqual(peak.buildings)
     expect(final.vacant).toBeGreaterThan(0)
     expect(result.buildings.some(building => (building as unknown as { occupancy: string }).occupancy === 'vacant')).toBe(true)
-    expect(result.events.filter(event => event.kind === 'acquisition')).toEqual([])
+    // Potential frontages are no longer pre-owned titles. Initial residential
+    // purchases are now recorded; declining demand must still retain that
+    // physical stock rather than buying/clearing additional land after the
+    // scenario's demographic peak (occupied stock can plateau earlier).
+    const acquisitions = result.events.filter(event => event.kind === 'acquisition')
+    expect(acquisitions.length).toBeGreaterThan(0)
+    const demandPeak = simulationYears(2025).reduce((a, b) => scenarioDemandAtYear(config, a).households > scenarioDemandAtYear(config, b).households ? a : b)
+    expect(acquisitions.every(event => event.year <= demandPeak)).toBe(true)
+    for (const event of acquisitions) expect(result.parcels.some(parcel => parcel.id === event.entityId && parcel.createdYear === event.year)).toBe(true)
   })
 
   it('scales inherited road standards and keeps a small village out of metropolitan road investment', () => {

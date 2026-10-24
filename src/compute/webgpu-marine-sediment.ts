@@ -42,14 +42,14 @@ fn neighborCell(i: u32, direction: u32) -> i32 {
 fn entrain(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x; if (i >= p.info.z) { return; }
   var state = statesIn[i];
-  if (ocean[i] == 0u || base[i] + state.delta > p.sea) { statesOut[i] = state; return; }
+  if (ocean[i] == 0u || base[i] + state.delta > p.sea + i32(p.transport.w)) { statesOut[i] = state; return; }
   let activity = coefficients[depth(i, state)].x;
   let credit = scale(p.rates.y, activity) + state.resuspCarry;
   let removed = min(state.loose, credit / 4096u);
   state.resuspCarry = select(0u, credit % 4096u, removed < state.loose);
   state.loose -= removed; state.suspended += removed;
   var rock = 0u;
-  if (state.loose == 0u) {
+  if (state.loose == 0u && ocean[i] == 1u) {
     let rockCredit = scale(p.rates.x, activity) + state.rockCarry;
     rock = min(p.rockCap - state.rock, rockCredit / 4096u);
     state.rockCarry = rockCredit % 4096u;
@@ -64,14 +64,23 @@ fn entrain(@builtin(global_invocation_id) id: vec3<u32>) {
 fn transport(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x; if (i >= p.info.z) { return; }
   let state = statesIn[i]; var flow = vec4<u32>(0u);
-  if (ocean[i] == 0u || base[i] + state.delta > p.sea) { faces[i] = flow; return; }
+  if (ocean[i] == 0u || base[i] + state.delta > p.sea + i32(p.transport.w)) { faces[i] = flow; return; }
+  let backwash = base[i] + state.delta > p.sea;
+  var wetFaces = 0u;
+  if (backwash) {
+    for (var d = 0u; d < 4u; d++) {
+      let j = neighborCell(i, d);
+      if (j >= 0 && ocean[u32(j)] != 0u && base[u32(j)] + statesIn[u32(j)].delta <= p.sea) { wetFaces += 1u; }
+    }
+  }
   for (var d = 0u; d < 4u; d++) {
     let j = neighborCell(i, d); var other = 0u;
-    if (j < 0) { if (p.transport.y == 0u) { continue; } }
+    if (j < 0) { if (p.transport.y == 0u || backwash) { continue; } }
     else {
       if (ocean[u32(j)] == 0u || base[u32(j)] + statesIn[u32(j)].delta > p.sea) { continue; }
       other = statesIn[u32(j)].suspended;
     }
+    if (backwash) { flow[d] = scale(state.suspended, 4096u / wetFaces); continue; }
     let difference = state.suspended - min(state.suspended, other);
     flow[d] = scale(state.suspended, p.advection[d]) + scale(difference, p.transport.x);
   }
@@ -92,7 +101,8 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   var fraction = coefficients[depth(i, state)].y;
   if (base[i] + state.delta > p.sea) { fraction = 4096u; }
-  let deposited = scale(load, fraction);
+  let accommodation = u32(max(0, p.sea - base[i] - state.delta - 1));
+  let deposited = min(scale(load, fraction), accommodation);
   state.loose += deposited; state.suspended = load - deposited; state.delta += i32(deposited);
   ledger[i].y += deposited; ledger[i].z += exported;
   statesOut[i] = state;

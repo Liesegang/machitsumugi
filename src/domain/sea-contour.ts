@@ -1,7 +1,8 @@
 import type { Point } from './types'
 import { isobathCrossing, refineIsobath } from './coast-isobath'
+import { finiteVolumeShoreField, shoreReconstructionPreserves } from './shoreline-reconstruction'
 
-interface SeaContourInput { width: number; height: number; step?: number; columns?: number; rows?: number; origin?: Point; elevation(p: Point): number; regionalOcean(p: Point): boolean }
+interface SeaContourInput { width: number; height: number; step?: number; columns?: number; rows?: number; origin?: Point; finiteVolumeCellSize?: number; elevation(p: Point): number; regionalOcean(p: Point): boolean }
 export interface SeaPolygon { polygon: Point[]; holes: Point[][] }
 const signedArea = (p: Point[]) => p.reduce((sum, a, i) => { const b = p[(i + 1) % p.length]!; return sum + a.x * b.y - b.x * a.y }, 0) / 2
 function inside(p: Point, polygon: Point[]) {
@@ -25,14 +26,14 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
   for (let y = 0; y <= rows; y++) for (let x = 0; x <= cols; x++) {
     const i = y * stride + x, p = { x: origin.x + x * sx, y: origin.y + y * sy }
     values[i] = input.elevation(p)
-    if ((!x || !y || x === cols || y === rows) && values[i]! < 0 && input.regionalOcean(p)) { connected[i] = 1; queue[tail++] = i }
+    if ((!x || !y || x === cols || y === rows) && values[i]! <= 0 && input.regionalOcean(p)) { connected[i] = 1; queue[tail++] = i }
   }
   while (head < tail) {
     const i = queue[head++]!, x = i % stride, y = Math.floor(i / stride)
-    for (const j of [x ? i - 1 : -1, x < cols ? i + 1 : -1, y ? i - stride : -1, y < rows ? i + stride : -1]) if (j >= 0 && !connected[j] && values[j]! < 0) { connected[j] = 1; queue[tail++] = j }
+    for (const j of [x ? i - 1 : -1, x < cols ? i + 1 : -1, y ? i - stride : -1, y < rows ? i + stride : -1]) if (j >= 0 && !connected[j] && values[j]! <= 0) { connected[j] = 1; queue[tail++] = j }
   }
   // Disconnected below-sea-level depressions are inland basins, not painted sea.
-  for (let i = 0; i < values.length; i++) if (values[i]! < 0 && !connected[i]) values[i] = Math.max(.001, -values[i]!)
+  for (let i = 0; i < values.length; i++) if (values[i]! <= 0 && !connected[i]) values[i] = Math.max(.001, -values[i]!)
   const vertices = new Map<string, Point>(), edges = new Map<string, string[]>(), used = new Set<string>()
   const add = (a: string, b: string) => { if (a === b) return; const left = edges.get(a) ?? [], right = edges.get(b) ?? []; left.push(b); right.push(a); edges.set(a, left); edges.set(b, right) }
   const node = (x: number, y: number) => { const key = `n${x}:${y}`; if (!vertices.has(key)) vertices.set(key, { x: origin.x + x * sx, y: origin.y + y * sy }); return key }
@@ -45,7 +46,7 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
   }
   for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
     const i = y * stride + x, v = [values[i]!, values[i + 1]!, values[i + stride + 1]!, values[i + stride]!]
-    const keys: (string | null)[] = [(v[0]! < 0) !== (v[1]! < 0) ? crossing(x, y, true) : null, (v[1]! < 0) !== (v[2]! < 0) ? crossing(x + 1, y, false) : null, (v[2]! < 0) !== (v[3]! < 0) ? crossing(x, y + 1, true) : null, (v[3]! < 0) !== (v[0]! < 0) ? crossing(x, y, false) : null]
+    const keys: (string | null)[] = [(v[0]! <= 0) !== (v[1]! <= 0) ? crossing(x, y, true) : null, (v[1]! <= 0) !== (v[2]! <= 0) ? crossing(x + 1, y, false) : null, (v[2]! <= 0) !== (v[3]! <= 0) ? crossing(x, y + 1, true) : null, (v[3]! <= 0) !== (v[0]! <= 0) ? crossing(x, y, false) : null]
     const found = keys.filter((k): k is string => k !== null)
     const shore = (a: string, b: string) => {
       const refined = refineIsobath(vertices.get(a)!, vertices.get(b)!, { elevation: input.elevation, bounds: { minX: origin.x + x * sx, minY: origin.y + y * sy, maxX: origin.x + (x + 1) * sx, maxY: origin.y + (y + 1) * sy } })
@@ -57,12 +58,12 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
     else if (found.length === 4) {
       // Bilinear saddle/asymptotic decision, instead of a fixed diagonal bias.
       const denominator = v[0]! + v[2]! - v[1]! - v[3]!, saddle = denominator ? (v[0]! * v[2]! - v[1]! * v[3]!) / denominator : v.reduce((a, b) => a + b, 0) / 4
-      if ((saddle < 0) === (v[0]! < 0)) { shore(keys[0]!, keys[1]!); shore(keys[2]!, keys[3]!) }
+      if ((saddle <= 0) === (v[0]! <= 0)) { shore(keys[0]!, keys[1]!); shore(keys[2]!, keys[3]!) }
       else { shore(keys[0]!, keys[3]!); shore(keys[1]!, keys[2]!) }
     }
   }
   const border = (x: number, y: number, horizontal: boolean) => {
-    const i = y * stride + x, j = i + (horizontal ? 1 : stride), a = values[i]! < 0, b = values[j]! < 0
+    const i = y * stride + x, j = i + (horizontal ? 1 : stride), a = values[i]! <= 0, b = values[j]! <= 0
     if (a && b) add(node(x, y), node(x + Number(horizontal), y + Number(!horizontal)))
     else if (a || b) add(a ? node(x, y) : node(x + Number(horizontal), y + Number(!horizontal)), crossing(x, y, horizontal))
   }
@@ -88,5 +89,10 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
   }
   loops.sort((a, b) => b.area - a.area)
   for (let i = 0; i < loops.length; i++) for (let j = i - 1; j >= 0; j--) if (inside(loops[i]!.polygon[0]!, loops[j]!.polygon)) { loops[i]!.parent = j; loops[i]!.depth = loops[j]!.depth + 1; break }
-  return loops.flatMap((loop, i) => loop.depth % 2 ? [] : [{ polygon: loop.polygon, holes: loops.filter(hole => hole.parent === i && hole.depth % 2 === 1).map(hole => hole.polygon) }])
+  const regions = loops.flatMap((loop, i) => loop.depth % 2 ? [] : [{ polygon: loop.polygon, holes: loops.filter(hole => hole.parent === i && hole.depth % 2 === 1).map(hole => hole.polygon) }])
+  if (!input.finiteVolumeCellSize || !regions.length) return regions
+  const field = finiteVolumeShoreField({ ...input, regions, columns: cols, rows, origin, cellSize: input.finiteVolumeCellSize })
+  const reconstructed = contourConnectedSea({ ...input, finiteVolumeCellSize: undefined, elevation: field })
+  // Never erase a real island or split/join water bodies for generalization.
+  return shoreReconstructionPreserves(regions, reconstructed, input.finiteVolumeCellSize) ? reconstructed : regions
 }

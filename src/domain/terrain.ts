@@ -13,6 +13,7 @@ import { extendHeadwaterPath, runoffSourceModel } from './channel-headwaters.ts'
 import { clipWaterRegion } from './terrain-water.ts'
 import type { WaterRegion } from './terrain-water.ts'
 import { extractDepressionLakes } from './depression-lakes.ts'
+import { partitionWaterAreas } from './water-partition'
 import { coastalWindow } from './coastal-window.ts'
 import { regionQuery } from './region-query.ts'
 import { contourNaturalLand } from './land-use'
@@ -250,7 +251,8 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   const regional = (p: Point): Point => { const q = offset(p); return { x: anchor.x + q.x, y: anchor.y + q.y } }
   const cropOrigin = regional({ x: 0, y: 0 })
   const local = (p: Point): Point => ({ x: localAnchor.x + mirror * (cosine * (p.x - anchor.x) + sine * (p.y - anchor.y)), y: localAnchor.y - sine * (p.x - anchor.x) + cosine * (p.y - anchor.y) })
-  const lakeAt = (p: Point) => standingWater.at(regional(p))
+  let seaAt: (p: Point) => boolean = () => false
+  const lakeAt = (p: Point) => seaAt(p) ? null : standingWater.at(regional(p))
   const coastalSurface = (p: Point) => {
     // Reconstruct the evolved regional ground, without post-simulation relief
     // noise that would change shore geometry outside the sediment ledger.
@@ -456,13 +458,20 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   })
   if (oceanInSurvey) {
     const nx = Math.ceil(w / 12), ny = Math.ceil(h / 12), sx = w / nx, sy = h / ny, mx = Math.ceil(1000 / sx), my = Math.ceil(1000 / sy)
-    const seas = contourConnectedSea({ width: (nx + mx * 2) * sx, height: (ny + my * 2) * sy, columns: nx + mx * 2, rows: ny + my * 2, origin: { x: -mx * sx, y: -my * sy }, elevation: p => coastalSurface(regional(p)), regionalOcean: p => world.ocean[indexAt(regional(p))] === 1 })
+    const seas = contourConnectedSea({ width: (nx + mx * 2) * sx, height: (ny + my * 2) * sy, columns: nx + mx * 2, rows: ny + my * 2, origin: { x: -mx * sx, y: -my * sy }, finiteVolumeCellSize: world.resolution, elevation: p => coastalSurface(regional(p)), regionalOcean: p => world.ocean[indexAt(regional(p))] === 1 })
     fullWaterRegions.push(...seas)
     fullSeaRegions.push(...seas)
     const netArea = (region: WaterRegion) => Math.abs(area(region.polygon)) - (region.holes ?? []).reduce((sum, hole) => sum + Math.abs(area(hole)), 0)
     const visibleSea = seas.flatMap(sea => clipWaterRegion(sea, w, h)).sort((a, b) => netArea(b) - netArea(a))
     for (const [count, part] of visibleSea.entries()) areas.push({ id: count ? `sea-${count}` : 'sea', kind: 'water', waterLevel: 0, ...part, name: count ? undefined : '青凪湾' })
   }
+  // The lake extractor uses the regional four-neighbour ocean mask, while the
+  // shoreline uses the continuous reconstructed bed. A sub-grid sea connection
+  // can drown a formerly closed negative basin; never keep its lower lake level
+  // or label on top of the actual sea surface.
+  areas.splice(0, areas.length, ...partitionWaterAreas(areas))
+  seaAt = regionQuery(fullSeaRegions)
+  for (let i = visibleLakes.length - 1; i >= 0; i--) if (!areas.some(area => area.id.startsWith(`${visibleLakes[i]!.id}-`))) visibleLakes.splice(i, 1)
   const waterAt = regionQuery(areas.filter(a => a.kind === 'water'))
   const continuedWaterAt = regionQuery(fullWaterRegions), continuedSeaAt = regionQuery(fullSeaRegions)
   type RiverSegment = { a: Point; b: Point; widthA: number; widthB: number; zA: number; zB: number; riverId: string }

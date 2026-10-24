@@ -73,6 +73,16 @@ export interface CivicAccessRetention {
 }
 export interface UnresolvedCivicAccess { roadId: string; year: number; parcelIds: string[]; reason: string }
 
+/** Closing a campus releases its internal paths, not the already constructed
+ * external approach land. Keep that paving reserved while cadastral housing is
+ * placed; the dated retention survey below still decides whether any used
+ * section can remain a road. This mask never reopens a retired road or overrides
+ * an actual railway/controlled-road/physical acquisition. */
+export function retireCivicPavementReservations(records: readonly { to?: number }[], roadId: string, externalApproachId: string, year: number): void {
+  if (roadId === externalApproachId) return
+  for (const record of records) record.to = Math.min(record.to ?? Infinity, year)
+}
+
 /** Adopt only still-used, physically available pieces of an already surveyed
  * driveway. Campus retirement and street retirement are separate decisions.
  *

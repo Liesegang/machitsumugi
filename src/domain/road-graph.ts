@@ -21,7 +21,7 @@ export const controlledRoad = (road: { role?: string; controlledAccess?: boolean
 /** Ramps are stored from the surface entrance toward the elevated mainline. */
 export const roadLevelAt = (road: Pick<Road, 'role' | 'level' | 'points'>, point: Point) => road.role === 'ramp' && dist(road.points[0]!, point) < .04 ? 0 : road.level ?? 0
 const routingKey = (road: Pick<Road, 'role' | 'level' | 'points'>, point: Point) => `${roadLevelAt(road, point)}:${key(point)}`
-function canConnect(path: Point[], metadata: RoadMetadata, other: Road, point: Point) {
+function canConnect(path: Point[], metadata: Pick<Road, 'role' | 'level' | 'controlledAccess'>, other: Road, point: Point) {
   const road = { ...metadata, points: path }
   if (roadLevelAt(road, point) !== roadLevelAt(other, point)) return false
   if (!controlledRoad(road) && !controlledRoad(other)) return true
@@ -41,6 +41,49 @@ function intersect(a: Point, b: Point, c: Point, d: Point) {
   if (Math.abs(det) < 1e-8) return null
   const t = ((c.x - a.x) * v - (c.y - a.y) * u) / det, s = ((c.x - a.x) * y - (c.y - a.y) * x) / det
   return t >= -.00001 && t <= 1.00001 && s >= -.00001 && s <= 1.00001 ? { point: at(a, b, Math.max(0, Math.min(1, t))), t: Math.max(0, Math.min(1, t)) } : null
+}
+
+/** Recover an exact physical T-junction from saved routes without moving either
+ * route. Earlier insertion could omit a contact within4cm of a stored vertex,
+ * while routing rounded those two positions to different5cm keys. Only an
+ * endpoint actually ON another compatible centreline is split here; nearby
+ * streets, ordinary line crossings and grade-separated roads are not joined. */
+export function materializeRoadJunctions<T extends Road>(roads: readonly T[]): T[] {
+  type ContactSegment = { road: T; index: number; a: Point; b: Point }
+  const bins = new Map<string, ContactSegment[]>(), epsilon = 1e-7
+  const keys = (a: Point, b: Point, pad = 0) => {
+    const result: string[] = []
+    for (let x = Math.floor((Math.min(a.x, b.x) - pad) / 100); x <= Math.floor((Math.max(a.x, b.x) + pad) / 100); x++) for (let y = Math.floor((Math.min(a.y, b.y) - pad) / 100); y <= Math.floor((Math.max(a.y, b.y) + pad) / 100); y++) result.push(`${x}:${y}`)
+    return result
+  }
+  for (const road of roads) for (let i = 1; i < road.points.length; i++) {
+    const segment = { road, index: i, a: road.points[i - 1]!, b: road.points[i]! }
+    for (const k of keys(segment.a, segment.b)) { const bucket = bins.get(k) ?? []; bucket.push(segment); bins.set(k, bucket) }
+  }
+  const cuts = new Map<T, Map<number, { point: Point; t: number }[]>>()
+  for (const road of roads) for (const point of [road.points[0], road.points.at(-1)]) {
+    if (!point) continue
+    const nearby = new Set<ContactSegment>()
+    for (const k of keys(point, point, epsilon)) for (const segment of bins.get(k) ?? []) nearby.add(segment)
+    for (const segment of nearby) {
+      if (segment.road === road || !canConnect(road.points, road, segment.road, point) || dist(point, segment.a) < epsilon || dist(point, segment.b) < epsilon) continue
+      const projection = projectOnRoadSegment(point, segment.a, segment.b)
+      if (projection.t <= 0 || projection.t >= 1 || dist(point, projection.point) > epsilon) continue
+      const bySegment = cuts.get(segment.road) ?? new Map<number, { point: Point; t: number }[]>(), sites = bySegment.get(segment.index) ?? []
+      if (!sites.some(site => dist(site.point, point) < epsilon)) sites.push({ point, t: projection.t })
+      bySegment.set(segment.index, sites); cuts.set(segment.road, bySegment)
+    }
+  }
+  return roads.map(road => {
+    const bySegment = cuts.get(road)
+    if (!bySegment) return road
+    const points: Point[] = [road.points[0]!]
+    for (let i = 1; i < road.points.length; i++) {
+      for (const cut of (bySegment.get(i) ?? []).sort((a, b) => a.t - b.t)) points.push({ ...cut.point })
+      points.push(road.points[i]!)
+    }
+    return { ...road, points }
+  })
 }
 type Segment = { a: Point; b: Point; road: SimulatedRoad }
 
@@ -188,10 +231,10 @@ export class PlanarRoadGraph {
     return false
   }
   private insert(road: SimulatedRoad, point: Point) {
-    if (road.points.some(p => dist(p, point) < .04)) return
+    if (road.points.some(p => dist(p, point) < 1e-7)) return
     for (let i = 1; i < road.points.length; i++) {
       const projection = projectOnRoadSegment(point, road.points[i - 1]!, road.points[i]!)
-      if (dist(point, projection.point) < .04 && projection.t > .00001 && projection.t < .99999) { road.points.splice(i, 0, point); return }
+      if (dist(point, projection.point) < 1e-7 && projection.t > 0 && projection.t < 1) { road.points.splice(i, 0, point); return }
     }
   }
   /** Mark an exactly on-street transport entrance without shifting the old road. */
@@ -235,7 +278,7 @@ export class PlanarRoadGraph {
         hits.push(cross); junctions.push({ road: s.road, point: cross.point })
       }
       hits.sort((x, y) => x.t - y.t)
-      for (const hit of hits) if (dist(normalized.at(-1)!, hit.point) > .04) normalized.push(hit.point)
+      for (const hit of hits) if (dist(normalized.at(-1)!, hit.point) > 1e-7) normalized.push(hit.point)
       if (dist(normalized.at(-1)!, b) > (metadata.preserveEndpoint && i === path.length - 1 ? 1e-8 : .04)) normalized.push(b)
     }
     if (normalized.length < 2) return null
@@ -267,7 +310,10 @@ export class PlanarRoadGraph {
     const staged = new PlanarRoadGraph()
     staged.retiredVersions = [...this.retiredVersions]
     staged.versionStart = new Map(this.versionStart)
-    staged.roads.push(...this.roads.map(road => ({ ...road, points: road.points.map(p => ({ ...p })) })))
+    // Normal graphs already have an index and exact shared contacts. Raw saved
+    // roads need this one import normalization, rather than every planning fork.
+    const roads = this.segments.length ? this.roads : materializeRoadJunctions(this.roads)
+    staged.roads.push(...roads.map(road => ({ ...road, points: road.points.map(p => ({ ...p })) })))
     for (const road of staged.roads) for (let i = 1; i < road.points.length; i++) {
       const segment = { a: road.points[i - 1]!, b: road.points[i]!, road }
       staged.segments.push(segment)
@@ -303,7 +349,7 @@ export class PlanarRoadGraph {
     // A relocated section cannot sever a branch or quietly move its junction.
     const required = previous.points.filter((point, i) => i === 0 || i === previous.points.length - 1 || this.roads.some(road => road !== previous && road.points.some(p => dist(p, point) < .04)))
     for (const point of required) if (!points.slice(1).some((end, i) => dist(projectOnRoadSegment(point, points[i]!, end).point, point) < .04)) return null
-    for (const point of required) if (!points.some(p => dist(p, point) < .04)) for (let i = 1; i < points.length; i++) if (dist(projectOnRoadSegment(point, points[i - 1]!, points[i]!).point, point) < .04) { points.splice(i, 0, { ...point }); break }
+    for (const point of required) if (!points.some(p => dist(p, point) < 1e-7)) for (let i = 1; i < points.length; i++) if (dist(projectOnRoadSegment(point, points[i - 1]!, points[i]!).point, point) < .04) { points.splice(i, 0, { ...point }); break }
     this.retiredVersions.push({ from: this.versionStart.get(id) ?? previous.builtYear, to: year, value: { ...previous, points: previous.points.map(p => ({ ...p })) } })
     this.versionStart.set(id, year)
     const updated = { ...previous, ...change, points, modifiedYear: year }

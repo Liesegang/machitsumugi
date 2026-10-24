@@ -1,5 +1,5 @@
 import type { Point, Road } from './types'
-import { controlledRoad, projectOnRoadSegment, roadLevelAt, roadTravelSpeed } from './road-graph'
+import { controlledRoad, materializeRoadJunctions, projectOnRoadSegment, roadLevelAt, roadTravelSpeed } from './road-graph'
 
 export interface TrafficSite { point: Point; households: number; roadId?: string }
 export interface TrafficDestination { point: Point; weight: number; activeYear?: number }
@@ -37,7 +37,7 @@ class Queue {
  * assignments feed capacity/junction delay back into path choice. This is a
  * strategic road-flow model, not a car-following or signal-cycle simulation. */
 export function assignRoadTraffic(input: { roads: readonly Road[]; cells: TrafficSite[]; destinations: TrafficDestination[]; year: number }) {
-  const roads = input.roads.slice(), coordinates: Point[] = [], keys = new Map<string, number>()
+  const roads = materializeRoadJunctions(input.roads), coordinates: Point[] = [], keys = new Map<string, number>()
   const node = (p: Point, r: Road) => { const surface = !controlledRoad(r) || r.role === 'ramp' && distance(p, r.points[0]!) < .04; const k = `${roadLevelAt(r, p)}:${surface ? 'street' : 'controlled'}:${Math.round(p.x * 20)}:${Math.round(p.y * 20)}`; let n = keys.get(k); if (n === undefined) { n = coordinates.length; keys.set(k, n); coordinates.push(p) } return n }
   type Segment = { road: Road; a: Point; b: Point; length: number; anchors: { t: number; node: number }[]; pieces: { lo: number; hi: number; edge: number }[] }
   const segments: Segment[] = [], bins = new Map<string, Segment[]>(), surfaceRoads = new Map<string, Segment[]>()
