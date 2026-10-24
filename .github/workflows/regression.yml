@@ -1,15 +1,7 @@
 name: Extended terrain and city regressions
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/domain/**'
-      - 'src/map/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'vitest.config.ts'
-      - '.github/workflows/regression.yml'
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -17,11 +9,12 @@ permissions:
 
 concurrency:
   group: city-regressions
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       files: ${{ steps.suites.outputs.files }}
     steps:
@@ -43,6 +36,9 @@ jobs:
     name: Regression (${{ matrix.file }})
     needs: discover
     runs-on: ubuntu-latest
+    # Test timers cannot interrupt a synchronous numeric kernel or object diff.
+    # Keep an OS-enforced job deadline instead of GitHub's six-hour default.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +50,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      # These cases still run automatically, but do not hold a checked release
-      # behind several independent multi-minute world simulations.
+      - name: Verify the production numeric kernel
+        run: node scripts/build-wasm.mjs --check
+      # Core changes cannot be published until every discovered suite succeeds.
       - name: Test full numerical grids and independent complete worlds
-        run: npm exec -- vitest run "${{ matrix.file }}"
+        run: npm exec -- vitest run --config vitest.heavy.config.ts "${{ matrix.file }}"

@@ -1,4 +1,4 @@
-name: Quick checks and deploy to GitHub Pages
+name: Check and deploy to GitHub Pages
 
 on:
   push:
@@ -12,9 +12,71 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      core: ${{ steps.changes.outputs.core }}
+    steps:
+      - name: Checkout the complete push range
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Determine whether complete-world regressions are required
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          ACTIONS_REPOSITORY: ${{ github.repository }}
+          ACTIONS_API_URL: ${{ github.api_url }}
+          ACTIONS_READ_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const before = process.env.PUSH_BEFORE ?? '', after = process.env.PUSH_AFTER ?? '';
+          const commit = /^[a-f0-9]{40}$/i;
+          const exact = new Set(['package.json', 'package-lock.json', 'vite.config.ts', 'vitest.config.ts', 'vitest.heavy.config.ts', '.github/workflows/deploy.yml', '.github/workflows/regression.yml']);
+          const prefixes = ['src/domain/', 'src/map/', 'src/compute/', 'wasm/', 'public/compute/', 'scripts/'];
+          const typescriptConfig = /(^|\/)tsconfig[^/]*\.json$/;
+          let core = true, reason = 'Manual, initial or unknown push range: run all regressions';
+          if (process.env.EVENT_NAME === 'push' && commit.test(before) && !/^0+$/.test(before) && commit.test(after)) {
+            try {
+              for (const ref of [before, after]) execFileSync('git', ['cat-file', '-e', `${ref}^{commit}`], { stdio: 'pipe' });
+              // Compare the entire push, not HEAD^; disabling rename detection
+              // also retains a deleted core path when it is moved into the UI.
+              const changed = execFileSync('git', ['diff', '--no-ext-diff', '--no-renames', '--name-only', '-z', before, after, '--'], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).split('\0').filter(Boolean);
+              core = changed.some(file => exact.has(file) || typescriptConfig.test(file) || prefixes.some(prefix => file.startsWith(prefix)));
+              reason = `${changed.length} changed paths across the complete push; core=${core}`;
+              if (!core) {
+                // UI-only changes must not publish a core commit whose previous
+                // checks failed. Query this exact before SHA in this workflow,
+                // not the most recent successful run on another commit.
+                const url = new URL(`/repos/${process.env.ACTIONS_REPOSITORY}/actions/workflows/deploy.yml/runs`, process.env.ACTIONS_API_URL);
+                url.search = new URLSearchParams({ head_sha: before, status: 'success', per_page: '100' });
+                const response = await fetch(url, { headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${process.env.ACTIONS_READ_TOKEN}`, 'X-GitHub-Api-Version': '2022-11-28' }, signal: AbortSignal.timeout(10_000) });
+                if (!response.ok) throw new Error('Cannot verify the preceding workflow');
+                const runs = (await response.json()).workflow_runs;
+                const verified = Array.isArray(runs) && runs.some(run => run.head_sha === before && run.status === 'completed' && run.conclusion === 'success');
+                core = !verified;
+                reason = verified ? 'UI-only change from an exact successful workflow SHA: complete-world regressions unchanged' : 'Preceding SHA has no successful workflow: run all regressions';
+              }
+            } catch {
+              core = true;
+              reason = 'Push history or preceding workflow verification unavailable: run all regressions';
+            }
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `core=${core}\n`);
+          console.log(reason);
+          NODE
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -41,8 +103,23 @@ jobs:
         with:
           path: dist
 
+  regression:
+    needs: changes
+    if: ${{ needs.changes.outputs.core == 'true' }}
+    uses: ./.github/workflows/regression.yml
+    permissions:
+      contents: read
+
   deploy:
-    needs: build
+    needs: [changes, build, regression]
+    # A conditionally skipped regression job must not skip a UI-only release.
+    # An unknown range, failed core suite, failed build or cancellation cannot
+    # satisfy this gate and therefore cannot publish its artifact.
+    if: >-
+      ${{ always() && !cancelled() && needs.changes.result == 'success' &&
+          needs.build.result == 'success' &&
+          (needs.regression.result == 'success' ||
+           (needs.changes.outputs.core == 'false' && needs.regression.result == 'skipped')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
