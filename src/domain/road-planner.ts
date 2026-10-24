@@ -1,4 +1,4 @@
-import type { Area, Point, Road } from './types'
+import type { Area, Point, Railway, Road } from './types'
 import { MinHeap, roadLength } from './road-graph'
 import type { RoadRole } from './road-graph'
 import { alignmentDiagnostics, resampleAlignment, splineAlignment, tangentAlignment } from './road-alignment'
@@ -29,6 +29,7 @@ export interface PlannedRoute { points: Point[]; length: number; cost: number; b
 export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; alignment?: 'natural' | 'planned'; maximumGrade?: number }
 type PlanningField = { water: boolean; sea: boolean; grade: number; cost: number; coreDistance: number }
 type EarthField = { grade: number; cost: number }
+type WidthRailSegment = { a: Point; b: Point; id: string; along: number; length: number; levels?: [number, number]; bridges: [number, number][] }
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y)
 const lerp = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
 const turn = (a: number) => Math.atan2(Math.sin(a), Math.cos(a))
@@ -59,12 +60,36 @@ export class RoadPlanner {
   private dryRouteCache = new Map<string, PlannedRoute | null>()
   private dryComponents = new Map<number, { columns: number; rows: number; labels: Int32Array }>()
   private railwayCorridors: RailwayCorridor[] = []
+  private widthRailBuckets = new Map<string, WidthRailSegment[]>()
   private railwayConstraints: RailwayRoadConstraints | null = null
   private railwayRevision = 0
   get transportRevision() { return this.railwayRevision }
   setRailwayCorridors(corridors: RailwayCorridor[]) {
     if (corridors.length === this.railwayCorridors.length && corridors.every((corridor, i) => corridor === this.railwayCorridors[i])) return
     this.railwayCorridors = corridors.slice()
+    this.widthRailBuckets.clear()
+    for (const corridor of corridors) {
+      if (corridor.mode === 'subway') continue
+      const detailed = corridor as RailwayCorridor & Partial<Pick<Railway, 'elevations' | 'structures'>>
+      const chainage = [0]
+      for (let i = 1; i < corridor.points.length; i++) chainage.push(chainage[i - 1]! + distance(corridor.points[i - 1]!, corridor.points[i]!))
+      const along = (point: Point) => {
+        let best = Infinity, at = 0
+        for (let i = 1; i < corridor.points.length; i++) {
+          const a = corridor.points[i - 1]!, b = corridor.points[i]!, dx = b.x - a.x, dy = b.y - a.y, t = Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / (dx * dx + dy * dy || 1))), d = distance(point, lerp(a, b, t))
+          if (d < best) { best = d; at = chainage[i - 1]! + t * (chainage[i]! - chainage[i - 1]!) }
+        }
+        return at
+      }
+      const bridges = (detailed.structures ?? []).filter(s => s.kind === 'bridge').map(s => { const a = along(s.from), b = along(s.to); return [Math.min(a, b), Math.max(a, b)] as [number, number] })
+      for (let i = 1; i < corridor.points.length; i++) {
+        const a = corridor.points[i - 1]!, b = corridor.points[i]!, length = distance(a, b)
+        if (length < .001) continue
+        const levels = detailed.elevations?.[i - 1] !== undefined && detailed.elevations?.[i] !== undefined ? [detailed.elevations[i - 1]!, detailed.elevations[i]!] as [number, number] : undefined
+        const segment: WidthRailSegment = { a, b, id: corridor.id, along: chainage[i - 1]!, length, levels, bridges }
+        for (let x = Math.floor(Math.min(a.x, b.x) / 100); x <= Math.floor(Math.max(a.x, b.x) / 100); x++) for (let y = Math.floor(Math.min(a.y, b.y) / 100); y <= Math.floor(Math.max(a.y, b.y) / 100); y++) { const key = `${x}:${y}`, list = this.widthRailBuckets.get(key) ?? []; list.push(segment); this.widthRailBuckets.set(key, list) }
+      }
+    }
     this.railwayConstraints = corridors.length ? new RailwayRoadConstraints(corridors) : null
     this.railwayRevision++; this.dryRouteCache.clear()
   }
@@ -74,6 +99,50 @@ export class RoadPlanner {
   }
   railwayAllows(path: Point[], role: RoadRole) {
     return Number.isFinite(this.railwayConstraints?.pathCost(path, role) ?? 0)
+  }
+  /** Widening keeps the inherited centreline and legal crossing, but cannot
+   * purchase a strip along the running track. A bridge is exempt only where
+   * its actual profile proves clearance above this ground-level pavement. */
+  railwayWidthAllows(path: Point[], oldWidth: number, newWidth: number, role: RoadRole) {
+    if (path.length < 2 || path.some(p => !Number.isFinite(p.x) || !Number.isFinite(p.y)) || !Number.isFinite(oldWidth) || !Number.isFinite(newWidth) || oldWidth <= 0 || newWidth <= 0) return false
+    if (newWidth <= oldWidth || !this.widthRailBuckets.size) return true
+    if (!this.railwayAllows(path, role)) return false
+    const clearance = 3, half = newWidth / 2 + clearance, windows = new Map<string, [number, number][]>()
+    for (const hit of this.railwayConstraints?.crossings(path) ?? []) {
+      const reach = half / Math.max(.5, Math.sin(hit.angle)), list = windows.get(hit.railwayId) ?? []
+      list.push([hit.chainage - reach, hit.chainage + reach]); windows.set(hit.railwayId, list)
+    }
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1]!, b = path[i]!, length = distance(a, b)
+      if (length < .001) continue
+      const ux = (b.x - a.x) / length, uy = (b.y - a.y) / length, found = new Set<WidthRailSegment>()
+      for (let x = Math.floor((Math.min(a.x, b.x) - half) / 100); x <= Math.floor((Math.max(a.x, b.x) + half) / 100); x++) for (let y = Math.floor((Math.min(a.y, b.y) - half) / 100); y <= Math.floor((Math.max(a.y, b.y) + half) / 100); y++) for (const segment of this.widthRailBuckets.get(`${x}:${y}`) ?? []) found.add(segment)
+      for (const segment of found) {
+        let lo = 0, hi = 1
+        const local = (p: Point) => ({ x: (p.x - a.x) * ux + (p.y - a.y) * uy, y: -(p.x - a.x) * uy + (p.y - a.y) * ux }), start = local(segment.a), end = local(segment.b)
+        for (const [v, d, lower, upper] of [[start.x, end.x - start.x, -clearance, length + clearance], [start.y, end.y - start.y, -half, half]]) {
+          if (Math.abs(d!) < 1e-10) { if (v! < lower! || v! > upper!) { hi = -1; break } }
+          else { const p = (lower! - v!) / d!, q = (upper! - v!) / d!; lo = Math.max(lo, Math.min(p, q)); hi = Math.min(hi, Math.max(p, q)) }
+        }
+        if (hi - lo < 1e-8) continue
+        const from = segment.along + lo * segment.length, to = segment.along + hi * segment.length, allowed = [...windows.get(segment.id) ?? []]
+        if (segment.levels && segment.levels.every(Number.isFinite) && this.environment.terrain) for (const bridge of segment.bridges) {
+          const low = Math.max(from, bridge[0]), high = Math.min(to, bridge[1])
+          if (high <= low) continue
+          const count = Math.max(1, Math.ceil((high - low) / 6))
+          let above = true
+          for (let j = 0; j <= count; j++) {
+            const at = low + (high - low) * j / count, t = (at - segment.along) / segment.length, ground = this.environment.terrain.elevation(lerp(segment.a, segment.b, t)), level = segment.levels[0] + (segment.levels[1] - segment.levels[0]) * t
+            if (!Number.isFinite(ground) || level - ground < 4.5) { above = false; break }
+          }
+          if (above) allowed.push([low, high])
+        }
+        let covered = from
+        for (const [low, high] of allowed.sort((x, y) => x[0] - y[0])) { if (low > covered + 1e-6) break; covered = Math.max(covered, high); if (covered >= to - 1e-6) break }
+        if (covered < to - 1e-6) return false
+      }
+    }
+    return true
   }
   constructor(environment: PlanningEnvironment) {
     this.environment = environment
@@ -367,7 +436,11 @@ export class RoadPlanner {
     if (options.endHeading !== undefined) coarse.push(goal)
     // Preserve the least-cost corridor. Farthest-visible simplification erased
     // terrain/ownership response and left kilometre-long rays joined by elbows.
-    const controls = resampleAlignment(coarse, options.role === 'expressway' ? 260 : options.role === 'highway' ? 140 : major ? 100 : 65)
+    // Both endpoint tangents need their own control. A three-control short
+    // corridor made the goal pin overwrite the start pin at controls[1].
+    const spacingForControls = options.role === 'expressway' ? 260 : options.role === 'highway' ? 140 : major ? 100 : 65
+    const bothPinned = options.startHeading !== undefined && options.endHeading !== undefined
+    const controls = resampleAlignment(coarse, bothPinned ? Math.min(spacingForControls, roadLength(coarse) / 3) : spacingForControls)
     if (controls.length < 3) controls.splice(1, 0, lerp(start, goal, .5))
     const firstPinned = options.startHeading !== undefined, lastPinned = options.endHeading !== undefined
     if (firstPinned) controls[1] = { x: start.x + Math.cos(options.startHeading!) * Math.min(120, distance(start, searchStart)), y: start.y + Math.sin(options.startHeading!) * Math.min(120, distance(start, searchStart)) }
@@ -407,6 +480,14 @@ export class RoadPlanner {
   }
   plan(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
     const route = this.planGeometry(start, goal, options)
+    if (route) {
+      const first = route.points[0]!, last = route.points.at(-1)!, next = route.points.find(p => distance(first, p) > 1e-6), before = [...route.points].reverse().find(p => distance(last, p) > 1e-6)
+      // Validate the canonical sampled pavement, not just the spline controls.
+      // Five-metre chords on the minimum 50m collector radius fit within 0.1rad;
+      // a 15m-radius local lane needs up to 0.2rad for the same sampling interval.
+      const tolerance = ['highway', 'collector', 'expressway', 'ramp'].includes(options.role) ? .1 : .2
+      if (!next || !before || options.startHeading !== undefined && Math.abs(turn(Math.atan2(next.y - first.y, next.x - first.x) - options.startHeading)) > tolerance || options.endHeading !== undefined && Math.abs(turn(Math.atan2(last.y - before.y, last.x - before.x) - options.endHeading)) > tolerance) return null
+    }
     if (route && options.maximumGrade !== undefined && this.environment.terrain && (!(options.maximumGrade > 0) || !surveyedRoadGradeAllowed(route, options.maximumGrade, p => this.environment.terrain!.elevation(p)))) return null
     return route && Number.isFinite(route.cost) ? route : null
   }
