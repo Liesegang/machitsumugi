@@ -122,15 +122,54 @@ describe('dated reuse of surviving civic driveway frontages', () => {
     expect(result.retained.find(r => r.roadId === parent.id)!.from).toBe(1950)
   })
 
-  it('rejects a later private structure or title acquiring the old paving too', () => {
-    for (const privateTitle of [false, true]) {
-      const map = fixture()
-      if (privateTitle) map.timeline!.parcels.push({ from: 1970, value: { ...parcel('new-title', 125), createdYear: 1970, developedYear: undefined, polygon: rectangle(95, 120, 10, 10), roadId: 'street' } })
-      else map.timeline!.buildings.push({ from: 1970, value: { ...house(parcel('new-title', 125)), polygon: rectangle(95, 120, 10, 10) } })
-      const result = retainCivicAccess(map)
-      expect(versions(result.map).at(-1)!.to).toBe(1970)
-      expect(result.unresolved[0]).toMatchObject({ roadId: driveway.id, year: 1970 })
-    }
+  it('rejects a later private structure across already adopted paving', () => {
+    const map = fixture()
+    map.timeline!.buildings.push({ from: 1970, value: { ...house(parcel('new-title', 125)), polygon: rectangle(95, 120, 10, 10) } })
+    const result = retainCivicAccess(map)
+    expect(versions(result.map).at(-1)!.to).toBe(1970)
+    expect(result.unresolved[0]).toMatchObject({ roadId: driveway.id, year: 1970 })
+  })
+
+  it('keeps a continuously adopted public prefix through a later private title whose building clears its paving', () => {
+    const map = fixture(), newTitle: Parcel = { ...parcel('new-title', 125), createdYear: 1970, developedYear: 1970, polygon: rectangle(95, 118, 20, 12), roadId: 'street' }
+    map.timeline!.parcels.push({ from: 1970, value: newTitle })
+    map.timeline!.buildings.push({ from: 1970, value: { ...house(newTitle), polygon: rectangle(105, 119, 8, 8), builtYear: 1970 } })
+    const before = JSON.stringify(map), result = retainCivicAccess(map)
+    expect(result.unresolved).toEqual([])
+    expect(versions(result.map).map(v => [v.from, v.to])).toEqual([[1880, 1950], [1950, undefined]])
+    for (const year of [1950, 1969, 1970, 2025]) expect(sliceCityAtYear(result.map, year).roads.some(r => r.id === driveway.id)).toBe(true)
+    expect(result.map.timeline!.parcels).toBe(map.timeline!.parcels)
+    expect(result.map.timeline!.buildings).toBe(map.timeline!.buildings)
+    expect(JSON.stringify(map)).toBe(before)
+  })
+
+  it('still refuses a new title taking retired paving before its first adoption', () => {
+    const map = fixture()
+    map.timeline!.parcels.push({ from: 1950, value: { ...parcel('new-title', 125), createdYear: 1950, developedYear: undefined, polygon: rectangle(95, 120, 10, 10), roadId: 'street' } })
+    const result = retainCivicAccess(map)
+    expect(result.retained).toEqual([])
+    expect(result.unresolved[0]).toMatchObject({ roadId: driveway.id, year: 1950, reason: expect.stringContaining('new-title') })
+  })
+
+  it('canonically repairs a saved closed service interval without duplicating history or changing another adopted road', () => {
+    const map = fixture(), other: Road = { ...driveway, id: 'facility-access-hospital', points: [{ x: 200, y: 100 }, { x: 200, y: 180 }] }
+    const p: Parcel = { ...parcel('hospital-frontage', 140), polygon: rectangle(205, 135, 20, 10), entrance: { x: 205, y: 140 }, roadId: other.id }
+    map.timeline!.roads.push({ from: 1880, to: 1950, value: other })
+    map.timeline!.parcels.push({ from: 1900, value: p })
+    map.timeline!.buildings.push({ from: 1900, value: { ...house(p), polygon: rectangle(210, 137, 8, 6) } })
+    const complete = retainCivicAccess(map).map, saved = structuredClone(complete)
+    saved.timeline!.roads = saved.timeline!.roads.map(v => v.value.id === driveway.id && v.from === 1950 ? { ...v, to: 1970 } : v)
+    saved.roads = saved.roads.filter(r => r.id !== driveway.id)
+    const before = JSON.stringify(saved), repaired = retainCivicAccess(saved)
+    expect(repaired.unresolved).toEqual([])
+    expect(repaired.map.timeline!.roads).toEqual(complete.timeline!.roads)
+    expect(repaired.map.roads).toEqual(complete.roads)
+    expect(repaired.map.timeline!.roads.filter(v => v.value.id === other.id)).toEqual(saved.timeline!.roads.filter(v => v.value.id === other.id))
+    expect(repaired.map.events).toEqual(complete.events)
+    expect(new Set(repaired.map.events!.map(e => e.id)).size).toBe(repaired.map.events!.length)
+    expect(repaired.map.timeline!.events).toEqual(complete.timeline!.events)
+    expect(retainCivicAccess(repaired.map).map).toBe(repaired.map)
+    expect(JSON.stringify(saved)).toBe(before)
   })
 
   it('allows subway geometry while still honoring an optional exact physical survey', () => {

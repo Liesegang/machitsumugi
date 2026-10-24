@@ -83,6 +83,25 @@ export function retainCivicAccess(map: CityMap, validate?: (road: Road, year: nu
   map: CityMap; retained: CivicAccessRetention[]; unresolved: UnresolvedCivicAccess[]
 } {
   const history = map.timeline
+  if (!history?.roads.some(v => v.value.reason === SERVICE_REASON)) return retainOriginalCivicAccess(map, validate)
+  // Service versions are derived from the original dated stock. Recompute them
+  // canonically, including a previously closed service interval: skipping its
+  // whole ID would hide later access gaps in a saved completed map.
+  const roads = history.roads.filter(v => v.value.reason !== SERVICE_REASON)
+  const originalEvents = (events: GrowthEvent[] | undefined) => events?.filter(e => !(e.kind === 'road' && e.reason === SERVICE_REASON && e.id.startsWith('event-road-service-')))
+  const originalSnapshots = (values: CityMap['snapshots']) => values?.map(s => ({ ...s, roads: roads.filter(v => active(v, s.year)).length }))
+  const original: CityMap = { ...map, roads: roads.filter(v => active(v, map.year ?? history.throughYear)).map(v => v.value), events: originalEvents(map.events), snapshots: originalSnapshots(map.snapshots),
+    timeline: { ...history, roads, events: originalEvents(history.events), snapshots: originalSnapshots(history.snapshots) } }
+  const result = retainOriginalCivicAccess(original, validate)
+  const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  const unchanged = (['roads', 'events', 'snapshots'] as const).every(key => equal(result.map[key], map[key]) && equal(result.map.timeline?.[key], history[key]))
+  return unchanged ? { ...result, map } : result
+}
+
+function retainOriginalCivicAccess(map: CityMap, validate?: (road: Road, year: number) => string | undefined): {
+  map: CityMap; retained: CivicAccessRetention[]; unresolved: UnresolvedCivicAccess[]
+} {
+  const history = map.timeline
   if (!history) return { map, retained: [], unresolved: [] }
   const alreadyRetained = new Set(history.roads.filter(v => v.value.reason === SERVICE_REASON).map(v => v.value.id))
   const candidates = history.roads.filter(v => v.to !== undefined && civicAccess(v.value) && connectable(v.value) && !alreadyRetained.has(v.value.id)
@@ -107,9 +126,10 @@ export function retainCivicAccess(map: CityMap, validate?: (road: Road, year: nu
     ...history.areas.filter(v => v.value.kind === 'water' || v.value.kind === 'park' || v.value.id.startsWith('castle-')),
     ...history.buildings,
   ].map(v => ({ ...v, bounds: boundsOf(v.value.polygon) }))
-  // Older title polygons can already contain a surveyed public right-of-way.
-  // Only a new title acquired after closure can take the retired paving back;
-  // all standing structures, including later buildings on old titles, block it.
+  // Title polygons can contain an existing public right-of-way. A title taken
+  // before first adoption can still block retired paving; a later private title
+  // alone cannot terminate an uninterrupted adopted service prefix. All actual
+  // structures and public reserves remain physical constraints in either case.
   masks.push(...history.parcels.map(v => ({ ...v, bounds: boundsOf(v.value.polygon), titleAcquired: v.value.createdYear })))
   // A retained local driveway cannot acquire a new railway crossing or a
   // viaduct. Existing station/railway land remains a physical constraint.
@@ -200,7 +220,7 @@ export function retainCivicAccess(map: CityMap, validate?: (road: Road, year: nu
         let reason: string | undefined
         for (let i = 1; i < value.points.length && !reason; i++) {
           const polygon = corridorPolygon(value.points[i - 1]!, value.points[i]!, value.width / 2), bounds = boundsOf(polygon)
-          for (const mask of nearbyMasks(bounds)) if (active(mask, year) && (mask.titleAcquired === undefined || mask.titleAcquired >= state.original.to!) && polygonOverlapsRegion(polygon, mask.value)
+          for (const mask of nearbyMasks(bounds)) if (active(mask, year) && (mask.titleAcquired === undefined || !state.previous && mask.titleAcquired >= state.original.to!) && polygonOverlapsRegion(polygon, mask.value)
             && (!mask.railway || railwayPavingContact(mask.railway, mask.segment!, polygon, history.terrainSurfaces.find(v => active(v, year))?.value) !== 'separated')
             && intersectRegions({ polygon }, mask.value).reduce((n, p) => n + regionArea(p), 0) > .01) { reason = `継承する舗装が取得済みの用地と重なります: ${mask.value.id}`; break }
         }
