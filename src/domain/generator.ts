@@ -27,6 +27,7 @@ import { surveyCastleLayout } from './castle-layout'
 import { surveyCastleAccess } from './castle-access'
 import { buildDistricts } from './districts'
 import { civicTransportAcquisitions } from './civic-transport'
+import { finalizeCivicRoadHistory } from './rail-access-acquisition'
 import { resolveGenerationConfig } from './generation-config'
 import type { RegionalPreview } from './regional-terrain'
 import { planSubway } from './subway'
@@ -789,6 +790,6 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
     facilities: civicFacilityHistory, areas: areaVersions,
     terrainSurfaces: harbor ? [{ from: 1650, to: 1920, value: naturalSurface }, { from: 1920, value: surface() }] : [{ from: 1650, value: naturalSurface }],
   })
-  return map
+  return finalizeCivicRoadHistory(map).map
 
 }
