@@ -71,9 +71,9 @@ npm run preview
 `dist/`が静的サイトの出力先です。GitHub Pages用のbase pathは`/machitsumugi/`です。`.github/workflows/deploy.yml`がmainへのpush時にテストとビルドを実行し、成功した成果物をGitHub Pagesへ公開します。PagesのSourceはGitHub Actionsを使用します。
 
 公開用CIはlint、短いアルゴリズム・幾何・履歴・保存の検査、TypeScript検査とビルドの成功を待ちます。
-生成・描画・計算カーネルなどの変更時は、`Extended terrain and city regressions`の13ファイルすべての完全回帰が成功してから公開します。各ファイルを本番WASMで並列実行し、ジョブごとに20分の上限を設けます。
+生成・描画・計算カーネルなどの変更時は、`Extended terrain and city regressions`の完全回帰が成功してから公開します。12ファイルの回帰と再現性検査の3回の独立生成を、本番WASMの別ジョブで並列実行し、各ジョブに20分の上限を設けます。
 UI・配信情報だけの変更では、直前の公開用CIの成功を確認できる場合に限り、重い回帰を省きます。実行中のCIは後続pushによってキャンセルしません。
-検査ケースは削除せず、再現性検査も独立した3回の生成を維持しています。`npm test`ではすべてを実行できます。
+再現性検査は同一シード2回・別シード1回の完全な都市生成を維持しています。CIでは全地図のcanonical SHA-256、建物のSHA-256、設定、版、commit、棟数を小さな成果物として比較し、一致・差異と3件の完全性を確認します。元の直列検査は残しているので、`npm test`ではローカルで全検査を実行できます。
 
 ghqでの取得例：
 

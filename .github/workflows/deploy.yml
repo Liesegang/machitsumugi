@@ -43,7 +43,7 @@ jobs:
           import { execFileSync } from 'node:child_process';
           const before = process.env.PUSH_BEFORE ?? '', after = process.env.PUSH_AFTER ?? '';
           const commit = /^[a-f0-9]{40}$/i;
-          const exact = new Set(['package.json', 'package-lock.json', 'vite.config.ts', 'vitest.config.ts', 'vitest.heavy.config.ts', '.github/workflows/deploy.yml', '.github/workflows/regression.yml']);
+          const exact = new Set(['package.json', 'package-lock.json', 'vite.config.ts', 'vitest.config.ts', 'vitest.heavy.config.ts', 'vitest.repro.config.ts', '.github/workflows/deploy.yml', '.github/workflows/regression.yml']);
           const prefixes = ['src/domain/', 'src/map/', 'src/compute/', 'wasm/', 'public/compute/', 'scripts/'];
           const typescriptConfig = /(^|\/)tsconfig[^/]*\.json$/;
           let core = true, reason = 'Manual, initial or unknown push range: run all regressions';

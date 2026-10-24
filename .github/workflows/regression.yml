@@ -27,6 +27,12 @@ jobs:
           const files = readdirSync('src/domain')
             .filter(file => /^generator.*\.test\.ts$/.test(file))
             .map(file => `src/domain/${file}`);
+          // The three independent generations and complete-world comparison
+          // in generator.test.ts move intact to reproduction + compare jobs.
+          // Keep that original suite unchanged for local npm test runs.
+          const reproducibility = files.indexOf('src/domain/generator.test.ts');
+          if (reproducibility < 0) throw new Error('Missing local reproducibility suite');
+          files.splice(reproducibility, 1);
           files.push('src/domain/station-access.test.ts', 'src/domain/railway-planner.test.ts', 'src/domain/terrain.test.ts');
           if (!files.every(file => existsSync(file))) throw new Error('Missing regression suite');
           appendFileSync(process.env.GITHUB_OUTPUT, `files=${JSON.stringify(files.sort())}\n`);
@@ -55,3 +61,54 @@ jobs:
       # Core changes cannot be published until every discovered suite succeeds.
       - name: Test full numerical grids and independent complete worlds
         run: npm exec -- vitest run --config vitest.heavy.config.ts "${{ matrix.file }}"
+
+  reproduction:
+    name: Independent world (${{ matrix.case }})
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [same-a, same-b, different]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Verify the production numeric kernel
+        run: node scripts/build-wasm.mjs --check
+      - name: Generate one independent complete world
+        env:
+          REPRO_CASE: ${{ matrix.case }}
+          REPRO_OUTPUT_DIR: ${{ runner.temp }}/world-reproduction
+        run: npm exec -- vitest run --config vitest.repro.config.ts
+      - name: Upload canonical complete-world and building digests
+        uses: actions/upload-artifact@v7
+        with:
+          name: world-reproduction-${{ matrix.case }}
+          path: ${{ runner.temp }}/world-reproduction/${{ matrix.case }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  compare:
+    name: Compare all three independent complete worlds
+    needs: reproduction
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: world-reproduction-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/world-reproduction
+      - name: Validate identity, complete-world equality and different-seed buildings
+        env:
+          REPRO_ARTIFACT_DIRECTORY: ${{ runner.temp }}/world-reproduction
+        run: node scripts/ci-world-repro-compare.mjs "$REPRO_ARTIFACT_DIRECTORY"
