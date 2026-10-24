@@ -3,6 +3,9 @@ import { getRegionalTerrain, sampleRegional, sampleRegionalCubic } from './regio
 import type { RegionalPreview, RegionalTerrain } from './regional-terrain.ts'
 import { contourConnectedSea } from './sea-contour.ts'
 import { evolveChannel } from './river-evolution.ts'
+import { channelHasCrossings } from './channel-topology'
+import { surveyChannelWidths } from './channel-hydraulic-geometry.ts'
+import { channelFootprint } from './channel-footprint.ts'
 import { reworkChannelBed } from './channel-sediment.ts'
 import type { ChannelBedSection, ChannelSedimentBudget } from './channel-sediment.ts'
 import type { AbandonedChannel } from './channel-cutoff.ts'
@@ -292,13 +295,13 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     const dx = b.x - a.x, dy = b.y - a.y, t = clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy || 1))
     return { t, distance: Math.hypot(p.x - a.x - dx * t, p.y - a.y - dy * t) }
   }
-  const smoothOpen = (path: Point[]) => {
+  const smoothOpen = (path: Point[], tension = .9) => {
     const tangents = path.map((p, i) => {
       const a = path[Math.max(0, i - 1)]!, b = path[Math.min(path.length - 1, i + 1)]!
       const length = Math.hypot(b.x - a.x, b.y - a.y) || 1
       const left = i ? Math.hypot(p.x - a.x, p.y - a.y) : Math.hypot(b.x - p.x, b.y - p.y)
       const right = i + 1 < path.length ? Math.hypot(b.x - p.x, b.y - p.y) : left
-      const scale = Math.min(left, right) * .9 / length
+      const scale = Math.min(left, right) * tension / length
       return { x: (b.x - a.x) * scale, y: (b.y - a.y) * scale }
     })
     const result: Point[] = [path[0]!]
@@ -317,6 +320,8 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   const rivers: TerrainRiver[] = [], channelEvolution: TerrainModel['hydrology']['channelEvolution'] = []
   const initialSections: ChannelBedSection[] = [], abandoned: (AbandonedChannel & { id: string; sourceRiverId: string; level: number })[] = []
   const mobileSediment = (world as RegionalTerrain & { alluvium?: Float32Array }).alluvium
+  const channelGround = (p: Point) => { const q = regional(p); return sampleRegionalCubic(world, world.rawDEM, q.x, q.y) }
+  const channelAlluvium = mobileSediment ? (p: Point) => { if (lakeAt(p)) return 0; const q = regional(p); return sampleRegional(world, mobileSediment, q.x, q.y) } : undefined
   for (const [pathIndex, selectedPath] of cellPaths.entries()) {
     const fullPath = extendHeadwaterPath({ cells: selectedPath, flowTo: world.flowTo, accumulatedArea: world.accumulatedArea, ocean: world.ocean, columns: world.columns, rows: world.rows, sourceArea: sourceModel.sourceArea })
     const visible = fullPath.map(i => local(worldPoint(i)))
@@ -327,7 +332,9 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     // Junctions are shared geometric constraints. Smoothing a whole trunk would
     // move its confluences away from the tributary endpoints and break the water.
     const knots = [0, ...cells.flatMap((cell, i) => i > 0 && i < cells.length - 1 && upstream(cell).length > 1 ? [i] : []), cells.length - 1]
-    const evolved = evolveChannel({ points: original, widths: cells.map((cell, i) => sourceModel.width(pathIndex > 0 && i === cells.length - 1 ? Math.min(world.accumulatedArea[cell]!, world.accumulatedArea[cells[i - 1]!]! * 1.02) : world.accumulatedArea[cell]!)), pinned: knots, allowCutoff, valleyElevation: p => { const q = regional(p); return sampleRegionalCubic(world, world.rawDEM, q.x, q.y) }, alluvium: mobileSediment ? p => { if (lakeAt(p)) return 0; const q = regional(p); return sampleRegional(world, mobileSediment, q.x, q.y) } : undefined })
+    const referenceWidths = cells.map((cell, i) => sourceModel.width(pathIndex > 0 && i === cells.length - 1 ? Math.min(world.accumulatedArea[cell]!, world.accumulatedArea[cells[i - 1]!]! * 1.02) : world.accumulatedArea[cell]!))
+    const originalWidths = surveyChannelWidths({ points: original, referenceWidths, surfaceElevation: cells.map(cell => world.ocean[cell] ? 0 : world.hydroDEM[cell]!), groundElevation: channelGround, alluvium: channelAlluvium })
+    const evolved = evolveChannel({ points: original, widths: originalWidths, pinned: knots, allowCutoff, valleyElevation: channelGround, alluvium: channelAlluvium })
     const sourceRiverId = pathIndex === 0 ? 'river' : `river-branch-${pathIndex}`
     channelEvolution.push({ id: sourceRiverId, steps: evolved.steps, maxMigration: evolved.maxMigration, cutoffs: evolved.abandoned.length })
     const levelAt = (p: Point) => { const q = regional(p); return world.ocean[indexAt(q)] ? 0 : sampleRegional(world, world.hydroDEM, q.x, q.y) }
@@ -340,10 +347,18 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
         const run = simplifyLine(line.slice(pinned[i - 1]!, pinned[i]! + 1), 2.5)
         controls.push(...(controls.length ? run.slice(1) : run))
       }
-      return smoothOpen(controls)
+      // Hermite handles can overshoot a nearly contacting bend even when the
+      // migrated centreline is simple. Reduce only that reconstruction's
+      // tension; if simplifying a narrow neck made a crossed chord, retain the
+      // surveyed, already smooth evolved line with all confluence pins intact.
+      for (const tension of [.9, .45, .15, 0]) {
+        const rounded = smoothOpen(controls, tension)
+        if (!channelHasCrossings(rounded)) return rounded
+      }
+      return line
     }
     const attributes = (line: Point[]) => {
-      const widths: number[] = [], drainageArea: number[] = [], surfaceElevation: number[] = []
+      const referenceWidths: number[] = [], drainageArea: number[] = [], surfaceElevation: number[] = []
       let lastElevation = Infinity, lastArea = 0
       for (const p of line) {
         let closest = 0, fraction = 0, d = Infinity
@@ -352,10 +367,10 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
         const areaA = world.accumulatedArea[a]!, areaB = pathIndex > 0 && closest + 1 === cells.length - 1 ? Math.min(world.accumulatedArea[b]!, areaA * 1.02) : world.accumulatedArea[b]!
         const accumulated = Math.max(lastArea, areaA * (1 - fraction) + areaB * fraction)
         const z = Math.min(lastElevation, (world.ocean[a] ? 0 : world.hydroDEM[a]!) * (1 - fraction) + (world.ocean[b] ? 0 : world.hydroDEM[b]!) * fraction)
-        widths.push(sourceModel.width(accumulated))
+        referenceWidths.push(sourceModel.width(accumulated))
         drainageArea.push(accumulated); surfaceElevation.push(z); lastArea = accumulated; lastElevation = z
       }
-      return { widths, drainageArea, surfaceElevation }
+      return { widths: surveyChannelWidths({ points: line, referenceWidths, surfaceElevation, groundElevation: channelGround, alluvium: channelAlluvium }), drainageArea, surfaceElevation }
     }
     // Initial and evolved beds use the exact same reconstruction and width
     // rule. Mapping simplification itself must not be counted as bank erosion.
@@ -409,15 +424,11 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     if (visible) visibleLakes.push({ id: body.id, level: body.level, kind: body.kind, area: body.area, volume: body.volume })
   }
   for (const river of rivers) {
-    const left: Point[] = [], right: Point[] = []
-    for (let i = 0; i < river.points.length; i++) {
-      const p = river.points[i]!, a = river.points[Math.max(0, i - 1)]!, b = river.points[Math.min(river.points.length - 1, i + 1)]!
-      const length = Math.hypot(b.x - a.x, b.y - a.y) || 1, nx = -(b.y - a.y) / length, ny = (b.x - a.x) / length, half = river.widths[i]! / 2
-      left.push({ x: p.x + nx * half, y: p.y + ny * half }); right.push({ x: p.x - nx * half, y: p.y - ny * half })
-    }
-    const region = { polygon: [...cleanBank(left), ...cleanBank(right).reverse()] }
-    fullWaterRegions.push(region)
-    for (const [i, part] of clipWaterRegion(region, w, h).entries()) if (part.polygon.length > 3 && Math.abs(area(part.polygon)) > 4) areas.push({ id: i ? `${river.id}-part-${i}` : river.id, kind: 'water', ...part, name: river.id === 'river' && !i ? '水杜川' : undefined })
+    const sections = channelFootprint(river.points, river.widths)
+    fullWaterRegions.push(...sections)
+    // A channel can leave/re-enter the viewport. Even a small triangular bank
+    // sliver is real water; the former 4 m²/four-vertex filter exposed it as land.
+    for (const [i, part] of sections.flatMap(region => clipWaterRegion(region, w, h)).entries()) if (part.polygon.length >= 3 && Math.abs(area(part.polygon)) > 1e-6) areas.push({ id: i ? `${river.id}-part-${i}` : river.id, kind: 'water', ...part, name: river.id === 'river' && !i ? '水杜川' : undefined })
   }
   for (const lake of abandoned) {
     const left: Point[] = [], right: Point[] = []

@@ -10,12 +10,13 @@ import { developmentClimbMinutes, surveyDevelopmentSite } from './development-te
 import type { DevelopmentSiteSurvey } from './development-terrain'
 import { isConstructionYear, simulationEndYear, simulationYears } from './simulation-calendar'
 
-export const GENERATOR_VERSION = '2.3.0'
+export const GENERATOR_VERSION = '2.3.1'
 export { EPOCH_YEAR } from './simulation-calendar'
 
 interface Candidate {
   parcel: Parcel; footprint: Point[]; frontage: Point; road: Road; segment: number
   area: number; reluctance: number; capacity: number; formation: DevelopmentSiteSurvey; form: 'house' | 'apartment' | 'retail' | 'workshop'; building?: Building
+  availableYear?: number; infillParent?: Candidate
 }
 interface DevelopmentInput {
   config: CityConfig; roads: Road[]; center: Point; stations: Station[]
@@ -198,6 +199,7 @@ export function developLand(input: DevelopmentInput) {
           const transform = (x: number, y: number): Point => ({ x: Math.round((frontage.x + x * ux - (setback + y) * uy * side) * 10) / 10, y: Math.round((frontage.y + x * uy + (setback + y) * ux * side) * 10) / 10 })
           let polygon = [transform(-width / 2 + .4, 0), transform(width / 2 - .4, 0), transform(width / 2 - .4, depth), transform(-width / 2 + .4, depth)]
           let rear: { polygon: Point[]; footprint: Point[]; entrance: Point; access: Point[] } | undefined
+          let inheritedRear = false
           // A rear subdivision is a flag-shaped property with its own 2.8m
           // connection to the public road. It is considered only when the whole
           // stem and rear garden fit; never stamp an inaccessible second row.
@@ -211,25 +213,44 @@ export function developLand(input: DevelopmentInput) {
               rear = { polygon: back, footprint: [transform(-width * .32, depth + 4), transform(width * .32, depth + 4), transform(width * .32, depth + 17), transform(-width * .32, depth + 17)], entrance: transform(width / 2 - 1.8, 0), access: [transform(width / 2 - 1.8, -setback), transform(width / 2 - 1.8, depth + 3), transform(width * .28, depth + 3)] }
             }
           }
+          // Some old street family holdings include a separately titled rear
+          // garden. Survey both shares now, including space beside the first
+          // house; a later owner may buy the garden for infill without moving
+          // that house or taking a neighbour's land. The same survey runs for
+          // historic views, so future demand cannot rewrite the old titles.
+          const gardenRandom = seededRandom(`${config.seed}:inherited-garden:${road.id}:${serial}:${side}`)
+          if (old && form === 'house' && road.role !== 'farm' && width >= 17.5 && gardenRandom() < .35) {
+            const stemLeft = width / 2 - 3.2, backDepth = 24 + gardenRandom() * 8
+            const full = [transform(-width / 2 + .4, 0), transform(width / 2 - .4, 0), transform(width / 2 - .4, depth + backDepth), transform(-width / 2 + .4, depth + backDepth)]
+            const front = [transform(-width / 2 + .4, 0), transform(stemLeft - .4, 0), transform(stemLeft - .4, depth), transform(-width / 2 + .4, depth)]
+            const back = [transform(stemLeft, 0), transform(width / 2 - .4, 0), transform(width / 2 - .4, depth + backDepth), transform(-width / 2 + .4, depth + backDepth), transform(-width / 2 + .4, depth + 1), transform(stemLeft, depth + 1)]
+            const footprint = [transform(-width * .32, depth + 4), transform(width * .32, depth + 4), transform(width * .32, depth + 18), transform(-width * .32, depth + 18)]
+            if (canPlace(full, year) && full.every(point => slope(point) <= .18) && survey(footprint).viable && !lots.query(boundsOf(full)).some(lot => polygonsOverlap(lot.polygon, full))) {
+              polygon = front; inheritedRear = true
+              rear = { polygon: back, footprint, entrance: transform(width / 2 - 1.8, 0), access: [transform(width / 2 - 1.8, -setback), transform(width / 2 - 1.8, depth + 3), transform(width * .28, depth + 3)] }
+            }
+          }
           const bounds = boundsOf(polygon)
           if (!canPlace(polygon, year) || slope(transform(0, depth / 2)) > .22 || lots.query(bounds).some(lot => polygonsOverlap(lot.polygon, polygon))) continue
           const id = `parcel-${road.id}-${serial}-${side}`
-          const reluctant = lotRandom(), buildingWidth = (width - (rear ? 3.6 : 0)) * (industrial ? .8 : form === 'apartment' || form === 'retail' ? .86 : old ? .80 : .67), buildingDepth = depth * (industrial ? .8 : form === 'apartment' ? .43 : form === 'retail' ? .76 : old ? .56 : .46)
+          const hasSideAccess = rear
+          const reluctant = lotRandom(), buildingWidth = (width - (hasSideAccess ? 3.6 : 0)) * (industrial ? .8 : form === 'apartment' || form === 'retail' ? .86 : old ? .80 : .67), buildingDepth = depth * (industrial ? .8 : form === 'apartment' ? .43 : form === 'retail' ? .76 : old ? .56 : .46)
           const garden = old ? 1.2 : form === 'retail' ? 2 : 4 + lotRandom() * 3
           const cutCorner = form === 'house' && lotRandom() < .35
-          const house = (x: number, y: number) => transform(x - (rear ? 1.8 : 0), y)
+          const house = (x: number, y: number) => transform(x - (hasSideAccess ? 1.8 : 0), y)
           const footprint = cutCorner ? [house(-buildingWidth / 2, garden), house(buildingWidth / 2, garden), house(buildingWidth / 2, garden + buildingDepth * .63), house(buildingWidth * .18, garden + buildingDepth * .63), house(buildingWidth * .18, garden + buildingDepth), house(-buildingWidth / 2, garden + buildingDepth)] : [house(-buildingWidth / 2, garden), house(buildingWidth / 2, garden), house(buildingWidth / 2, garden + buildingDepth), house(-buildingWidth / 2, garden + buildingDepth)]
           const formation = survey(footprint)
           if (!formation.viable) continue
           const parcel: Parcel = { id, polygon, entrance: transform(0, 0), roadId: road.id, createdYear: year, use: industrial ? 'industrial' : 'residential' }
-          candidates.push({ parcel, footprint, frontage, road, segment, area: width * depth, reluctance: reluctant, capacity: 1, formation, form })
+          const candidate: Candidate = { parcel, footprint, frontage, road, segment, area: width * depth, reluctance: reluctant, capacity: 1, formation, form }
+          candidates.push(candidate)
           lots.add({ polygon, bounds })
           if (rear) {
             const rearFormation = survey(rear.footprint)
             if (!rearFormation.viable) continue
             const rearParcel: Parcel = { id: `${id}-rear`, polygon: rear.polygon, entrance: rear.entrance, access: rear.access, roadId: road.id, createdYear: year, use: 'residential' }
             const rearFrontage = transform(width / 2 - 1.8, -setback)
-            candidates.push({ parcel: rearParcel, footprint: rear.footprint, frontage: rearFrontage, road, segment, area: width * 24 + depth * 2.8, reluctance: lotRandom(), capacity: 1, formation: rearFormation, form: 'house' })
+            candidates.push({ parcel: rearParcel, footprint: rear.footprint, frontage: rearFrontage, road, segment, area: width * 24 + depth * 2.8, reluctance: lotRandom(), capacity: 1, formation: rearFormation, form: 'house', ...(inheritedRear ? { availableYear: 1955, infillParent: candidate } : {}) })
             lots.add({ polygon: rear.polygon, bounds: boundsOf(rear.polygon) })
           }
         }
@@ -329,7 +350,7 @@ export function developLand(input: DevelopmentInput) {
     // Reuse existing capacity before making a new development commitment.
     const shortage = Math.max(0, Math.ceil(households * 1.035) - capacity)
     if (shortage > 0 && constructionYear) {
-      const ranked = candidates.filter(c => !c.parcel.retiredYear && !c.building && c.parcel.createdYear <= year && (c.parcel.use !== 'industrial' || year >= (industry?.activeYear ?? 1750))).map(c => {
+      const ranked = candidates.filter(c => !c.parcel.retiredYear && !c.building && c.parcel.createdYear <= year && (c.availableYear ?? c.parcel.createdYear) <= year && (!c.infillParent || c.infillParent.building && !c.infillParent.parcel.retiredYear && c.infillParent.parcel.use === 'residential' && c.infillParent.building.height <= 2 && c.infillParent.building.use !== 'lodging') && (c.parcel.use !== 'industrial' || year >= (industry?.activeYear ?? 1750))).map(c => {
         const time = travel(c)
         const station = activeStations.length ? Math.min(...activeStations.map(s => distance(c.frontage, s.point))) : Infinity
         const urban = Math.exp(-time * (year < 1900 ? 2.7 : year < 1950 ? 1.5 : 1) / 7)
@@ -343,6 +364,7 @@ export function developLand(input: DevelopmentInput) {
         if (added >= shortage) break
         if (c.parcel.use === 'industrial' && industrialJobs >= jobs * .45) continue
         if (!canPlace(c.footprint, year)) continue
+        if (c.infillParent && !canPlace(c.parcel.polygon, year)) continue
         const random = seededRandom(`${config.seed}:building:${c.parcel.id}`)
         const zone = zoning(c.frontage, year)
         const commercial = !c.parcel.access && c.parcel.use !== 'industrial' && c.form !== 'apartment' && (c.form === 'retail' || time < 10 && c.road.role !== 'farm' && random() < zone.retailShare)
@@ -351,6 +373,7 @@ export function developLand(input: DevelopmentInput) {
         c.parcel.developedYear = year
         const height = Math.min(zone.maximumFloors, c.formation.maximumFloors, c.parcel.use === 'industrial' ? 1 : commercial ? year < 1900 ? 2 : 3 + Math.floor(random() * (settlement === 'metropolis' ? 9 : 3)) : apartment ? settlement === 'metropolis' ? 7 + Math.floor(random() * 10) : 3 + Math.floor(random() * 5) : 1 + Math.floor(random() * 2))
         if (height < 1) { c.parcel.developedYear = undefined; continue }
+        if (c.infillParent) events.push({ id: `infill-acquire-${year}-${c.parcel.id}`, year, kind: 'acquisition', entityId: c.parcel.id, reason: '旧街道沿いの裏庭の既存持分を取得し、側方の専用通路で住宅地へ転用' })
         c.capacity = c.parcel.use === 'industrial' ? 0 : apartment ? height * 2 : commercial ? 1 : 1
         c.building = { id: `building-${c.parcel.id}`, parcelId: c.parcel.id, builtYear: year, polygon: c.footprint, kind: c.parcel.use, height }
         built.push(c); capacity += c.capacity; added += c.capacity

@@ -23,7 +23,7 @@ import { agriculturalPlots, agriculturalPlotSuitable, agriculturalRemnantSuitabl
 import { agriculturalAccessSurvey } from './agricultural-access'
 import { applyHarborTerrain } from './harbor-terrain'
 import type { HarborPlatform } from './harbor-terrain'
-import { castleLayout } from './castle-layout'
+import { surveyCastleLayout } from './castle-layout'
 import { surveyCastleAccess } from './castle-access'
 import { buildDistricts } from './districts'
 import { civicTransportAcquisitions } from './civic-transport'
@@ -168,9 +168,8 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   const preview = (roads: CityMap['roads'] = [], railways: CityMap['railways'] = [], stations: CityMap['stations'] = [], houses: Building[] = buildings, previewPhase: CityMap['previewPhase'] = 'hydrology', asOf = year) => onPreview?.({ width: W, height: H, config, buildings: houses, roads, areas, railways, stations, facilities, districts: [], description: '生成途中', generatorVersion: GENERATOR_VERSION, year: asOf, previewPhase, terrainSurface: surface(), regionalContext })
   preview()
   for (const area of areas) if (area.id === 'river') area.name = `${config.name.replace(/[市町村]$/, '')}川`
-  const hasCore = config.type === 'castle' || config.type === 'temple'
-  const castle = config.type === 'castle' ? castleLayout(origin, config.seed, terrain.channelAt(origin)?.tangent) : null
-  const core: Point[] | null = castle?.core ?? (hasCore ? rectangle(origin.x - 170, origin.y - 155, 340, 310) : null)
+  const castle = config.type === 'castle' ? surveyCastleLayout(origin, config.seed, { width: W, height: H, terrain, waterAreas: areas.filter(area => area.kind === 'water'), riverTangent: terrain.channelAt(origin)?.tangent }) : null
+  const core: Point[] | null = castle?.core ?? (config.type === 'temple' ? rectangle(origin.x - 170, origin.y - 155, 340, 310) : null)
   if (core) {
     const kind = config.type === 'castle' ? 'castle' : 'shrine', selected = config.facilities.includes(kind)
     const name = kind === 'castle' ? `${config.name.replace(/[市町村]$/, '')}城跡` : '水明大社'
@@ -181,9 +180,9 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
       const samples = [...polygon, origin, ...polygon.map((p, i) => ({ x: (p.x + polygon[(i + 1) % polygon.length]!.x) / 2, y: (p.y + polygon[(i + 1) % polygon.length]!.y) / 2 }))]
       if (samples.every(p => pointInPolygon(p, core) && !naturalTerrain.waterAt(p) && naturalTerrain.slope(p) < .15 && !naturalTerrain.areas.some(area => area.kind !== 'field' && pointInRegion(p, area)))) buildings.push({ id: 'origin-shrine-building', polygon, kind: 'public', height: 2, builtYear: 1650, name })
     }
-    if (kind === 'castle') {
-      areas.push(...castle!.areas, ...castle!.grounds)
-      if (selected) buildings.push(...castle!.structures)
+    if (kind === 'castle' && castle) {
+      areas.push(...castle.areas, ...castle.grounds)
+      if (selected) buildings.push(...castle.structures)
     }
   }
 
@@ -238,6 +237,7 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   const civicPopulations = new Map<number, { point: Point; households: number }[]>()
   const growth = simulateUrbanGrowth({ ...config, width: W, height: H, seed: config.seed, type: config.type, center: origin, core, areas, arterial: config.arterial, railway: config.railway && year >= 1900, stationPoints: [], onRailwayPlanning: config.railway && year >= 1900 ? configureRailway : undefined, terrainModel: terrain, bridgeSites: terrain.bridgeSites, untilYear: year, era: config.era, density: config.density, onProgress: year => onProgress?.(`街路・土地利用を計算 · ${year}年`), onPreview: (roads, asOf) => preview(roads, railways, stations, buildings, 'roads', asOf), onCivicPopulation: config.facilities.includes('park') ? (asOf, population) => civicPopulations.set(asOf, population) : undefined })
   const roads: Road[] = growth.roads
+  onProgress?.('街区と既存道路への接続を整理中…')
   const retiredCivicRoads: TimelineVersion<Road>[] = []
   const growthRoadIds = new Set(growth.roadHistory.map(version => version.value.id))
   const roadsAt = (asOf: number): Road[] => [...growth.roadHistory.filter(version => version.from <= asOf && (version.to === undefined || asOf < version.to)).map(version => version.value), ...retiredCivicRoads.filter(version => version.from <= asOf && asOf < version.to!).map(version => version.value), ...roads.filter(road => !growthRoadIds.has(road.id) && (road.builtYear ?? 1650) <= asOf)]
@@ -410,15 +410,17 @@ export function generateCity(input: CityConfig, onProgress?: (label: string) => 
   // The requested kind's target bearing is stable when the selected end year
   // makes additional facilities eligible. Site and access surveys use only the
   // roads/constraints present when that facility was first constructed.
-  const facilityOrder = [...new Set(config.facilities)].filter(kind => kind !== 'shop' && !(hasCore && kind === (config.type === 'castle' ? 'castle' : 'shrine')))
+  const facilityOrder = [...new Set(config.facilities)].filter(kind => kind !== 'shop' && !(config.type === 'castle' && kind === 'castle') && !(config.type === 'temple' && kind === 'shrine'))
   type CivicIdentity = { id: string; name: string; neighbourhood: boolean }
   type CivicSite = { kind: FacilityKind; year: number; version: number; point: Point; facility: Facility; lot: ReturnType<typeof facilityLot>; accessRoad: Road; paths: Road[]; buildings: Building[]; areas: Area[]; active: boolean; identity?: CivicIdentity }
   const civicSites: CivicSite[] = [], civicEvents: GrowthEvent[] = [], facilityDates = new Map<Facility, number>(), civicUnavailable = new Map<FacilityKind, string>()
+  if (config.type === 'castle' && !castle) civicUnavailable.set('castle', '城郭全体の乾燥地盤・斜面・堀と城門への接近路を満たす用地を確保できませんでした。')
   const woodlandClearings: WoodlandClearing[] = []
   const civicRouteRecords = new Map<string, Segment[]>()
   let historicThermalCenter: Point | undefined
   const placedYear = (facility: Facility) => facilityDates.get(facility) ?? (facility.id === 'facility-port' && harbor ? 1920 : facilityInception[facility.kind])
   const placeFacility = (kind: FacilityKind, constructionYear: number, version = 0, relocationTarget?: Point, identity?: CivicIdentity): CivicSite | null => {
+    onProgress?.(`${identity?.name ?? facilityNames[kind]}の用地・接道を計算 · ${constructionYear}年`)
     const allowWoodland = kind === 'park' || kind === 'university'
     const index = facilityOrder.indexOf(kind)
     const visibleAreas = areas.filter(area => (obstacles.find(obstacle => obstacle.polygon === area.polygon)?.year ?? 0) <= constructionYear && (landRetired.get(area.polygon) ?? Infinity) > constructionYear)

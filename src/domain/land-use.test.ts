@@ -200,6 +200,30 @@ describe('land conversion and remaining cover', () => {
     }
   })
 
+  it('surveys an adjoining hillside separately from its level old access road', () => {
+    const road: Road = { id: 'terrace-access', points: [{ x: 80, y: 400 }, { x: 1120, y: 400 }], kind: 'local', width: 3.5, role: 'farm', builtYear: 1650 }
+    const terrain = {
+      // A level valley road has a diagonally sloping terrace to its north.
+      // Sampling only on the road used to impose its east-west field axis on
+      // that whole terrace, even though the local contour turns by 45 degrees.
+      elevation: (p: Point) => 5 + Math.max(0, 360 - p.y) * .02 + p.x * .02 * Math.max(0, Math.min(1, (360 - p.y) / 40)),
+      slope: () => .03, wetness: () => .1, channelAt: () => null,
+      cultivable: (p: Point) => p.y >= 60,
+    }
+    const plots = agriculturalPlots(1200, 800, 'terrace-holdings', [], terrain, [road])
+    const north = plots.filter(p => p.center.y > 70 && p.center.y < 270 && p.center.x > 150 && p.center.x < 1050).map(p => surveyAxis(p.polygon)).filter(axis => axis.alignment > .999999)
+    expect(north.length).toBeGreaterThan(10)
+    expect(north.every(axis => bearingDifference(axis.angle, Math.PI / 4) < 1e-7)).toBe(true)
+    expect(plots.every(plot => plot.sourceRoadId === road.id)).toBe(true)
+    // Surveying the terrace must not double-allocate land where its axis meets
+    // the valley holdings. This is geometry ownership, not visual jitter.
+    const sample = plots.filter(p => p.center.y > 200 && p.center.y < 430)
+    for (let i = 0; i < sample.length; i++) for (let j = i + 1; j < sample.length; j++) {
+      if (!overlaps(boundsOf(sample[i]!.polygon), boundsOf(sample[j]!.polygon))) continue
+      expect(intersectRegions(sample[i]!, sample[j]!).reduce((sum, r) => sum + regionArea(r), 0)).toBeLessThan(.01)
+    }
+  })
+
   it('requires flat land and an attainable water supply for rice fields rather than wetness alone', () => {
     const plot = rectangle(100, 100, 35, 75)
     const irrigable = {

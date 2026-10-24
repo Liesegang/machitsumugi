@@ -57,7 +57,10 @@ describe('regional terrain and local suitability', { timeout: 180000 }, () => {
     expect(model.rivers.length).toBeGreaterThan(0)
     for (const river of model.rivers) for (let i = 1; i < river.points.length; i++) {
       expect(river.drainageArea[i]).toBeGreaterThanOrEqual(river.drainageArea[i - 1]!)
-      expect(river.widths[i]).toBeGreaterThanOrEqual(river.widths[i - 1]!)
+      // Discharge increases downstream, but a resistant narrowing or steeper
+      // reach can legitimately be narrower than the preceding alluvial reach.
+      expect(Number.isFinite(river.widths[i])).toBe(true)
+      expect(river.widths[i]).toBeGreaterThanOrEqual(0)
       expect(river.surfaceElevation[i]).toBeLessThanOrEqual(river.surfaceElevation[i - 1]!)
     }
   })
@@ -68,6 +71,17 @@ describe('regional terrain and local suitability', { timeout: 180000 }, () => {
       const joined = model.rivers.some(other => other !== river && other.points.some(p => Math.hypot(p.x - endpoint.x, p.y - endpoint.y) < .01))
       expect(joined).toBe(true)
       expect(model.waterAt(endpoint)).toBe(true)
+    }
+  })
+  it('keeps the surveyed centre and interior cross-section of every visible river wet', () => {
+    for (const river of model.rivers) for (let i = 1; i < river.points.length; i++) {
+      const a = river.points[i - 1]!, b = river.points[i]!, length = Math.hypot(b.x - a.x, b.y - a.y), half = (river.widths[i - 1]! + river.widths[i]!) / 4
+      if (!length || half < .05) continue
+      for (const side of [-.6, 0, .6]) {
+        const p = { x: (a.x + b.x) / 2 - (b.y - a.y) / length * half * side, y: (a.y + b.y) / 2 + (b.x - a.x) / length * half * side }
+        if (p.x <= 0 || p.y <= 0 || p.x >= defaults.width || p.y >= defaults.height) continue
+        expect(model.waterAt(p), `${river.id} section ${i}`).toBe(true)
+      }
     }
   })
   it('selects bridge candidates on water with dry, gently sloping banks', () => {

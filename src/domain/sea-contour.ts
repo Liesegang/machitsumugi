@@ -1,4 +1,5 @@
 import type { Point } from './types'
+import { isobathCrossing, refineIsobath } from './coast-isobath'
 
 interface SeaContourInput { width: number; height: number; step?: number; columns?: number; rows?: number; origin?: Point; elevation(p: Point): number; regionalOcean(p: Point): boolean }
 export interface SeaPolygon { polygon: Point[]; holes: Point[][] }
@@ -38,8 +39,7 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
   const crossing = (x: number, y: number, horizontal: boolean) => {
     const key = `${horizontal ? 'h' : 'v'}${x}:${y}`
     if (!vertices.has(key)) {
-      const i = y * stride + x, a = values[i]!, b = values[i + (horizontal ? 1 : stride)]!, t = a / (a - b)
-      vertices.set(key, { x: origin.x + (x + (horizontal ? t : 0)) * sx, y: origin.y + (y + (horizontal ? 0 : t)) * sy })
+      vertices.set(key, isobathCrossing({ x: origin.x + x * sx, y: origin.y + y * sy }, { x: origin.x + (x + Number(horizontal)) * sx, y: origin.y + (y + Number(!horizontal)) * sy }, input.elevation))
     }
     return key
   }
@@ -47,12 +47,18 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
     const i = y * stride + x, v = [values[i]!, values[i + 1]!, values[i + stride + 1]!, values[i + stride]!]
     const keys: (string | null)[] = [(v[0]! < 0) !== (v[1]! < 0) ? crossing(x, y, true) : null, (v[1]! < 0) !== (v[2]! < 0) ? crossing(x + 1, y, false) : null, (v[2]! < 0) !== (v[3]! < 0) ? crossing(x, y + 1, true) : null, (v[3]! < 0) !== (v[0]! < 0) ? crossing(x, y, false) : null]
     const found = keys.filter((k): k is string => k !== null)
-    if (found.length === 2) add(found[0]!, found[1]!)
+    const shore = (a: string, b: string) => {
+      const refined = refineIsobath(vertices.get(a)!, vertices.get(b)!, { elevation: input.elevation, bounds: { minX: origin.x + x * sx, minY: origin.y + y * sy, maxX: origin.x + (x + 1) * sx, maxY: origin.y + (y + 1) * sy } })
+      let previous = a
+      for (let j = 1; j < refined.length - 1; j++) { const key = `s${x}:${y}:${a}:${b}:${j}`; vertices.set(key, refined[j]!); add(previous, key); previous = key }
+      add(previous, b)
+    }
+    if (found.length === 2) shore(found[0]!, found[1]!)
     else if (found.length === 4) {
       // Bilinear saddle/asymptotic decision, instead of a fixed diagonal bias.
       const denominator = v[0]! + v[2]! - v[1]! - v[3]!, saddle = denominator ? (v[0]! * v[2]! - v[1]! * v[3]!) / denominator : v.reduce((a, b) => a + b, 0) / 4
-      if ((saddle < 0) === (v[0]! < 0)) { add(keys[0]!, keys[1]!); add(keys[2]!, keys[3]!) }
-      else { add(keys[0]!, keys[3]!); add(keys[1]!, keys[2]!) }
+      if ((saddle < 0) === (v[0]! < 0)) { shore(keys[0]!, keys[1]!); shore(keys[2]!, keys[3]!) }
+      else { shore(keys[0]!, keys[3]!); shore(keys[1]!, keys[2]!) }
     }
   }
   const border = (x: number, y: number, horizontal: boolean) => {
@@ -77,7 +83,7 @@ export function contourConnectedSea(input: SeaContourInput): SeaPolygon[] {
       previous = current; current = following
     }
     if (current !== start || polygon.length < 3 || Math.abs(signedArea(polygon)) < 100) continue
-    const split = Math.floor(polygon.length / 2), reduced = [...simplify(polygon.slice(0, split + 1), 1.2).slice(0, -1), ...simplify([...polygon.slice(split), polygon[0]!], 1.2).slice(0, -1)]
+    const split = Math.floor(polygon.length / 2), reduced = [...simplify(polygon.slice(0, split + 1), .15).slice(0, -1), ...simplify([...polygon.slice(split), polygon[0]!], .15).slice(0, -1)]
     loops.push({ polygon: reduced, area: Math.abs(signedArea(reduced)), parent: -1, depth: 0 })
   }
   loops.sort((a, b) => b.area - a.area)

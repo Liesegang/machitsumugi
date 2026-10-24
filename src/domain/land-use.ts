@@ -140,6 +140,7 @@ export interface AgriculturalTerrain {
   wetness(point: Point): number
   channelAt(point: Point): { bankDistance: number; surfaceElevation: number; point?: Point; tangent?: Point; riverId?: string } | null
   rivers?: { id: string; points: Point[]; surfaceElevation: number[] }[]
+  cultivable?(point: Point): boolean
 }
 
 /** Acquisitions do not turn every leftover triangle into a productive field.
@@ -253,9 +254,9 @@ export function agriculturalPlots(width: number, height: number, seed: string, r
   const random = seededRandom(`${seed}:agricultural-ownership-v3`)
   type SurveySite = { point: Point; bearing?: number; roadId?: string }
   const sites: SurveySite[] = []
-  const addSite = (site: SurveySite) => {
+  const addSite = (site: SurveySite, spacing = 210) => {
     const p = site.point
-    if (p.x < -200 || p.y < -200 || p.x > width + 200 || p.y > height + 200 || sites.some(s => distance(s.point, p) < 210)) return
+    if (p.x < -200 || p.y < -200 || p.x > width + 200 || p.y > height + 200 || sites.some(s => distance(s.point, p) < spacing)) return
     sites.push(site)
   }
   // Farm-road projects have priority over through roads. Their individual
@@ -267,7 +268,23 @@ export function agriculturalPlots(width: number, height: number, seed: string, r
     const count = Math.max(1, Math.ceil(length / 380))
     for (let i = 0; i < count; i++) {
       const t = (i + .5) / count, point = pathPointAt(road.points, t), span = Math.min(.4, 65 / Math.max(length, 1)), a = pathPointAt(road.points, Math.max(0, t - span)), b = pathPointAt(road.points, Math.min(1, t + span))
-      if (distance(a, b) > 1) addSite({ point, bearing: Math.atan2(b.y - a.y, b.x - a.x), roadId: road.id })
+      if (distance(a, b) <= 1) continue
+      const bearing = Math.atan2(b.y - a.y, b.x - a.x)
+      addSite({ point, bearing, roadId: road.id })
+      // A survey taken on a level road cannot describe both adjoining terrace
+      // slopes. Allocate separate, accessible holdings on each side before
+      // measuring their local grade. Both still inherit the same old access;
+      // no imaginary farm road or independently rotated field is introduced.
+      for (const side of [-1, 1]) {
+        const holding = { x: point.x - Math.sin(bearing) * side * 120, y: point.y + Math.cos(bearing) * side * 120 }
+        if (!terrain) continue
+        if (terrain?.cultivable && !terrain.cultivable(holding)) continue
+        if (terrain.slope(holding) > .18 || (terrain.channelAt(holding)?.bankDistance ?? 1) < 0) continue
+        const gx = (terrain.elevation({ x: holding.x + 30, y: holding.y }) - terrain.elevation({ x: holding.x - 30, y: holding.y })) / 60
+        const gy = (terrain.elevation({ x: holding.x, y: holding.y + 30 }) - terrain.elevation({ x: holding.x, y: holding.y - 30 })) / 60
+        const contour = Math.atan2(gy, gx) + Math.PI / 2
+        if (Math.hypot(gx, gy) > .006 && Math.abs(Math.sin(2 * (bearing - contour))) > Math.sin(Math.PI / 8)) addSite({ point: holding, bearing, roadId: road.id }, 100)
+      }
     }
   }
   // Callers without historical roads still receive shared districts. Their
@@ -278,7 +295,7 @@ export function agriculturalPlots(width: number, height: number, seed: string, r
     const p = site.point, channel = terrain?.channelAt(p)
     let channelBearing = channel?.tangent ? Math.atan2(channel.tangent.y, channel.tangent.x) : undefined
     if (channelBearing === undefined && river.length > 1) {
-      let closest = Infinity
+      let closest = 450
       for (let i = 1; i < river.length; i++) { const a = river[i - 1]!, b = river[i]!, d = distance(p, projectPoint(p, a, b)); if (d < closest) { closest = d; channelBearing = Math.atan2(b.y - a.y, b.x - a.x) } }
     }
     const gx = terrain ? (terrain.elevation({ x: p.x + 30, y: p.y }) - terrain.elevation({ x: p.x - 30, y: p.y })) / 60 : 0
@@ -320,20 +337,28 @@ export function agriculturalPlots(width: number, height: number, seed: string, r
     const alongSlope = terrain ? Math.abs(terrain.elevation(world(0, 30)) - terrain.elevation(world(0, -30))) : 0
     const shortAcross = crossSlope > alongSlope
     const longSide = lowland ? 85 + rng() * 40 : 48 + rng() * 24, shortSide = lowland ? 24 + rng() * 10 : 38 + rng() * 20
-    const columns = divisions(bounds.minX, bounds.maxX, Math.max(1, Math.ceil((bounds.maxX - bounds.minX) / (shortAcross ? shortSide : longSide))), rng)
+    const columnCount = Math.max(1, Math.ceil((bounds.maxX - bounds.minX) / (shortAcross ? shortSide : longSide)))
+    const columns = divisions(bounds.minX, bounds.maxX, columnCount, rng)
     const rows = divisions(bounds.minY, bounds.maxY, Math.max(1, Math.ceil((bounds.maxY - bounds.minY) / (shortAcross ? longSide : shortSide))), rng)
-    for (let row = 1; row < rows.length; row++) for (let col = 1; col < columns.length; col++) {
-      const bank = lowland ? .9 : .6, x0 = columns[col - 1]! + bank, x1 = columns[col]! - bank, y0 = rows[row - 1]! + bank, y1 = rows[row]! - bank
-      if (x1 <= x0 || y1 <= y0) continue
-      // The group boundary exists before individual ownership is measured.
-      // Its straight shared edge can end a surveyed lot; a later natural
-      // suitability isoline may only reject that lot, never cut it into arcs.
-      const polygon = surveyIntersection([world(x0, y0), world(x1, y0), world(x1, y1), world(x0, y1)], district, 1.2)
-      if (polygon.length < 3 || polygonArea(polygon) < 200) continue
-      const perimeter = polygon.reduce((sum, p, i) => sum + distance(p, polygon[(i + 1) % polygon.length]!), 0)
-      if (polygonArea(polygon) * 2 / perimeter < 7) continue
-      const center = { x: polygon.reduce((sum, p) => sum + p.x, 0) / polygon.length, y: polygon.reduce((sum, p) => sum + p.y, 0) / polygon.length }
-      plots.push({ id: `survey-${index}-${row}-${col}`, polygon, center, districtId: `survey-${index}`, ...(site.roadId ? { sourceRoadId: site.roadId } : {}), landUse: terrain ? agriculturalUse(polygon, terrain) : 'dry-field' })
+    for (let row = 1; row < rows.length; row++) {
+      // Flat irrigated units retain a common canal allocation. Dry-field
+      // holdings are inherited in contour-aligned bands: each band has its own
+      // frontage divisions, so ownership edges end at real T junctions rather
+      // than repeating one set of cuts across the entire district.
+      const rowColumns = lowland || Math.max(crossSlope, alongSlope) <= .36 ? columns : divisions(bounds.minX, bounds.maxX, columnCount, seededRandom(`${seed}:survey-${index}:holding-band-${row}`))
+      for (let col = 1; col < rowColumns.length; col++) {
+        const bank = lowland ? .9 : .6, x0 = rowColumns[col - 1]! + bank, x1 = rowColumns[col]! - bank, y0 = rows[row - 1]! + bank, y1 = rows[row]! - bank
+        if (x1 <= x0 || y1 <= y0) continue
+        // The group boundary exists before individual ownership is measured.
+        // Its straight shared edge can end a surveyed lot; a later natural
+        // suitability isoline may only reject that lot, never cut it into arcs.
+        const polygon = surveyIntersection([world(x0, y0), world(x1, y0), world(x1, y1), world(x0, y1)], district, 1.2)
+        if (polygon.length < 3 || polygonArea(polygon) < 200) continue
+        const perimeter = polygon.reduce((sum, p, i) => sum + distance(p, polygon[(i + 1) % polygon.length]!), 0)
+        if (polygonArea(polygon) * 2 / perimeter < 7) continue
+        const center = { x: polygon.reduce((sum, p) => sum + p.x, 0) / polygon.length, y: polygon.reduce((sum, p) => sum + p.y, 0) / polygon.length }
+        plots.push({ id: `survey-${index}-${row}-${col}`, polygon, center, districtId: `survey-${index}`, ...(site.roadId ? { sourceRoadId: site.roadId } : {}), landUse: terrain ? agriculturalUse(polygon, terrain) : 'dry-field' })
+      }
     }
   }
   return plots

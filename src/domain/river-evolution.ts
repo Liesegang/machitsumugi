@@ -1,6 +1,7 @@
 import type { Point } from './types'
 import { findNeckCutoff, severChannelNeck } from './channel-cutoff.ts'
 import type { AbandonedChannel, NeckCutoff } from './channel-cutoff.ts'
+import { preventChannelCrossings } from './channel-topology'
 
 export interface ChannelEvolutionInput {
   points: Point[]; widths: number[]; pinned: number[]
@@ -34,7 +35,7 @@ export function evolveChannel(input: ChannelEvolutionInput): ChannelEvolutionRes
   for (let pass = 0; pass < 12; pass++) {
     const next = points.map(p => ({ ...p }))
     for (let i = 1; i < count - 1; i++) if (!pinned.has(i)) { next[i]!.x = points[i]!.x * .5 + (points[i - 1]!.x + points[i + 1]!.x) * .25; next[i]!.y = points[i]!.y * .5 + (points[i - 1]!.y + points[i + 1]!.y) * .25 }
-    points = next
+    points = preventChannelCrossings(points, next, pinned)
   }
   const along = new Float64Array(count), taper = new Float64Array(count).fill(1)
   for (let i = 1; i < count; i++) along[i] = along[i - 1]! + distance(points[i - 1]!, points[i]!)
@@ -47,10 +48,11 @@ export function evolveChannel(input: ChannelEvolutionInput): ChannelEvolutionRes
     const t = taper[i]! * taper[i]! * (3 - 2 * taper[i]!)
     return { x: p.x * (1 - t) + x / total * t, y: p.y * (1 - t) + y / total * t }
   })
-  const initialPoints = resolve(points)
+  const initialPoints = preventChannelCrossings(points, resolve(points), pinned)
   const steps = input.steps ?? (input.alluvium ? 360 : 72)
   let cutoff: NeckCutoff | null = null, completed = 0, lastSafe = points.map(p => ({ ...p }))
   for (let step = 0; step < steps; step++) {
+    const previous = points
     const curvature = new Float64Array(count), tangents: Point[] = points.map(() => ({ x: 0, y: 1 }))
     // The flow response is resolved over channel-width scales. Computing it at
     // individual sample vertices creates an unphysical grid-scale instability.
@@ -109,6 +111,7 @@ export function evolveChannel(input: ChannelEvolutionInput): ChannelEvolutionRes
         points[i] = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
       }
     }
+    points = preventChannelCrossings(previous, points, pinned)
     completed = step + 1
     if (input.alluvium && step % 8 === 7) {
       cutoff = findNeckCutoff({ points, widths, pinned: fixed, elevation: input.valleyElevation, alluvium: input.alluvium })
@@ -119,7 +122,7 @@ export function evolveChannel(input: ChannelEvolutionInput): ChannelEvolutionRes
       lastSafe = points.map(p => ({ ...p }))
     }
   }
-  const resolved = cutoff ? points : resolve(points)
+  const resolved = cutoff ? points : preventChannelCrossings(points, resolve(points), pinned)
   // Arc-length redistribution moves sample indices along an unchanged channel.
   // Measure physical distance to the initial line, not displacement of indices.
   const maxMigration = Math.max(...resolved.map(p => {

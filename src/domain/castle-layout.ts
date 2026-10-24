@@ -1,15 +1,25 @@
 import ClipperLib from 'clipper-lib'
-import { corridorPolygon, polygonOverlapsRegion, rectangle, seededRandom, subtractRegions } from './geometry'
+import { corridorPolygon, pointInPolygon, polygonOverlapsRegion, rectangle, seededRandom, subtractRegions } from './geometry'
+import type { PlanningTerrain } from './road-planner'
 import type { Area, Building, Point, Road } from './types'
+
+interface CastleSurveyInput {
+  width: number
+  height: number
+  terrain: Pick<PlanningTerrain, 'elevation' | 'slope' | 'waterAt'>
+  riverTangent?: Point
+  waterAreas?: readonly Area[]
+}
+interface EnclosureDesign { angle: number; scaleX: number; scaleY: number }
 
 /** A fictional flatland castle: an offset honmaru, an enclosing ninomaru,
  * broad wall faces, a separate outer ditch and two dry gate crossings.
  * Small repeated square notches are not a substitute for these enclosures.
  */
-export function castleLayout(origin: Point, seed: string, riverTangent?: Point) {
+export function castleLayout(origin: Point, seed: string, riverTangent?: Point, design?: EnclosureDesign) {
   const random = seededRandom(`${seed}:castle-enclosures`)
-  const angle = (riverTangent ? Math.atan2(riverTangent.y, riverTangent.x) - Math.PI / 2 : 0) + (random() - .5) * .18
-  const sx = .90 + random() * .12, sy = .90 + random() * .12, shear = (random() - .5) * .12
+  const angle = design?.angle ?? (riverTangent ? Math.atan2(riverTangent.y, riverTangent.x) - Math.PI / 2 : 0) + (random() - .5) * .18
+  const sx = design?.scaleX ?? .90 + random() * .12, sy = design?.scaleY ?? .90 + random() * .12, shear = design ? 0 : (random() - .5) * .12
   const c = Math.cos(angle), s = Math.sin(angle)
   const transform = (p: Point): Point => {
     const x = p.x * sx + p.y * shear, y = p.y * sy
@@ -75,4 +85,72 @@ export function castleLayout(origin: Point, seed: string, riverTangent?: Point) 
     enclosures: { honmaru: honmaru.map(transform), ninomaru: coreLocal.map(transform) },
     gateCrossings: [innerGate.map(transform), outerGate.map(transform)],
   }
+}
+
+/** Choose a complete enclosure on a real terrace or ridge, before reserving its
+ * land. Long faces can follow a contour while the gate faces the lower approach.
+ * The same transform moves walls, dry gate cuts, palaces and access paths: terrain
+ * adaptation never consists of displacing just the visible moat vertices. */
+export function surveyCastleLayout(origin: Point, seed: string, input: CastleSurveyInput) {
+  const { terrain } = input
+  const dx = terrain.elevation({ x: origin.x + 60, y: origin.y }) - terrain.elevation({ x: origin.x - 60, y: origin.y })
+  const dy = terrain.elevation({ x: origin.x, y: origin.y + 60 }) - terrain.elevation({ x: origin.x, y: origin.y - 60 })
+  const downhill = Math.atan2(-dy, -dx), grade = Math.hypot(dx, dy) / 120
+  const inherited = input.riverTangent ? Math.atan2(input.riverTangent.y, input.riverTangent.x) - Math.PI / 2 : 0
+  const preferred = grade > .012 ? [downhill - Math.PI / 2, downhill + Math.PI / 2, inherited] : [inherited, downhill - Math.PI / 2, downhill + Math.PI / 2]
+  const angles = [...preferred, inherited + Math.PI, inherited + Math.PI / 2, inherited - Math.PI / 2]
+    .filter((angle, i, all) => !all.slice(0, i).some(other => Math.abs(Math.atan2(Math.sin(angle - other), Math.cos(angle - other))) < .01))
+  const baseShapes = [{ scaleX: .98, scaleY: .96 }, { scaleX: 1.12, scaleY: .72 }, { scaleX: .82, scaleY: .82 }]
+  // The inherited enclosure has its own proportions even on a level terrace.
+  // One coherent transform moves every compound, gate, wall and building; it
+  // is surveyed below just like the unmodified fallback designs. Seeded
+  // proportions never displace vertices after their physical checks.
+  const random = seededRandom(`${seed}:castle-site-proportions`), scaleX = .97 + random() * .06, scaleY = .97 + random() * .06
+  const shapes = [...baseShapes.map(shape => ({ scaleX: shape.scaleX * scaleX, scaleY: shape.scaleY * scaleY })), ...baseShapes]
+  let best: { castle: ReturnType<typeof castleLayout>; score: number; design: EnclosureDesign; relief: number } | null = null
+  const bounded = (point: Point) => point.x >= 16 && point.y >= 16 && point.x <= input.width - 16 && point.y <= input.height - 16
+  for (const shape of shapes) for (const angle of angles) {
+    const design = { ...shape, angle }, castle = castleLayout(origin, seed, undefined, design)
+    if (input.waterAreas?.some(area => polygonOverlapsRegion(castle.core, area))) continue
+    // Boundary sampling and a genuine interior survey catch tributaries and
+    // steep hollows missed by the old eight probes around a 270m circle.
+    const samples = [...castle.core]
+    for (let i = 0; i < castle.core.length; i++) {
+      const a = castle.core[i]!, b = castle.core[(i + 1) % castle.core.length]!, count = Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 20)
+      for (let j = 1; j < count; j++) samples.push({ x: a.x + (b.x - a.x) * j / count, y: a.y + (b.y - a.y) * j / count })
+    }
+    const minX = Math.min(...castle.core.map(p => p.x)), maxX = Math.max(...castle.core.map(p => p.x)), minY = Math.min(...castle.core.map(p => p.y)), maxY = Math.max(...castle.core.map(p => p.y))
+    for (let y = minY + 10; y < maxY; y += 20) for (let x = minX + 10; x < maxX; x += 20) if (pointInPolygon({ x, y }, castle.core)) samples.push({ x, y })
+    if (samples.some(point => !bounded(point) || terrain.waterAt(point) || !Number.isFinite(terrain.elevation(point)) || !Number.isFinite(terrain.slope(point)) || terrain.slope(point) > .20)) continue
+    const levels = samples.map(point => terrain.elevation(point)), relief = Math.max(...levels) - Math.min(...levels)
+    if (relief > 32) continue
+    if (castle.structures.some(building => {
+      const levels = building.polygon.map(point => terrain.elevation(point))
+      return Math.max(...levels) - Math.min(...levels) > 4.5 || building.polygon.some(point => !Number.isFinite(terrain.slope(point)) || terrain.slope(point) > .15)
+    })) continue
+    // A gate must open onto a dry, walkable approach, not a bluff or river.
+    const inside = castle.gate.inside, outside = castle.gate.outside, gx = outside.x - inside.x, gy = outside.y - inside.y
+    const lead = { x: outside.x + gx * 2.4, y: outside.y + gy * 2.4 }
+    let approach = true, previous = inside
+    for (let i = 0; i <= 10; i++) {
+      const point = { x: inside.x + (lead.x - inside.x) * i / 10, y: inside.y + (lead.y - inside.y) * i / 10 }
+      if (!bounded(point) || terrain.waterAt(point) || !Number.isFinite(terrain.slope(point)) || !Number.isFinite(terrain.elevation(point)) || terrain.slope(point) > .16 || (i && Math.abs(terrain.elevation(point) - terrain.elevation(previous)) > Math.hypot(point.x - previous.x, point.y - previous.y) * .14 + 1e-8)) { approach = false; break }
+      previous = point
+    }
+    if (!approach) continue
+    const gateLevel = terrain.elevation(outside), keepLevel = terrain.elevation(castle.point)
+    const compactPenalty = shape.scaleX * shape.scaleY < .7 ? 2.5 : 0
+    const score = relief * (grade > .012 ? 1 : .25) + Math.max(0, gateLevel - keepLevel) * 3 + terrain.slope(outside) * 45 + compactPenalty
+    if (!best || score < best.score - 1e-8) best = { castle, score, design, relief }
+  }
+  if (!best) return null
+  const dryDitches: Area[] = [], waterMoats: Area[] = []
+  for (const area of best.castle.areas) {
+    const levels = area.polygon.map(point => terrain.elevation(point)), relief = Math.max(...levels) - Math.min(...levels)
+    // A continuous water surface has one level. High-relief defensive ditches
+    // are earthworks, not blue water following the hillside uphill and downhill.
+    if (relief > 2.5) dryDitches.push({ ...area, id: area.id.replace('moat-', 'castle-dry-ditch-'), kind: 'field', landUse: 'vacant' })
+    else waterMoats.push(area)
+  }
+  return { ...best.castle, areas: waterMoats, grounds: [...best.castle.grounds, ...dryDitches], survey: { ...best.design, relief: best.relief, dryDitches: dryDitches.length, waterMoats: waterMoats.length } }
 }

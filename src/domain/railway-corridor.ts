@@ -99,11 +99,27 @@ export function railwayCorridors(input: RailwayCorridorInput): RailwayCorridor[]
     for (const candidate of candidates) if (exits.filter(e => e.side === side).every(e => distance(points[e.index]!, points[candidate.index]!) > 400)) { exits.push(candidate); if (exits.filter(e => e.side === side).length >= 2) break }
   }
   const settlements = input.settlements.filter(s => s.demand > 0).sort((a, b) => b.demand - a.demand), hub = settlements[0]?.point ?? input.origin
-  const stationCandidates = [{ point: hub, access: 0 }, ...[150, 300, 450, 650, 850].flatMap(radius => Array.from({ length: 12 }, (_, i) => ({ point: { x: hub.x + Math.cos(i * Math.PI / 6) * radius, y: hub.y + Math.sin(i * Math.PI / 6) * radius }, access: radius })))].filter(({ point: p }) => p.x > 100 && p.y > 100 && p.x < input.width - 100 && p.y < input.height - 100)
+  const stationSites = [{ point: hub, access: 0 }, ...[150, 300, 450, 650, 850].flatMap(radius => Array.from({ length: 12 }, (_, i) => ({ point: { x: hub.x + Math.cos(i * Math.PI / 6) * radius, y: hub.y + Math.sin(i * Math.PI / 6) * radius }, access: radius })))].filter(({ point: p }) => p.x > 100 && p.y > 100 && p.x < input.width - 100 && p.y < input.height - 100)
     .map(candidate => ({ ...candidate, cell: index(candidate.point), f: field(candidate.point) }))
     .filter(c => !c.f.blocked && !c.f.water && c.f.grade < .09 && !forests.some(a => occupied(c.point, a)))
     .sort((a, b) => a.access * .6 + a.f.grade * 2500 + a.f.cost * 100 - b.access * .6 - b.f.grade * 2500 - b.f.cost * 100)
-    .filter((candidate, i, all) => all.findIndex(c => c.cell === candidate.cell) === i).slice(0, 9)
+    .filter((candidate, i, all) => all.findIndex(c => c.cell === candidate.cell) === i)
+  const stationCandidates: typeof stationSites = []
+  // Nine neighbouring points around the same market can all require the same
+  // infeasible bend into town. Keep the same bounded survey budget, but survey
+  // distinct terraces before discarding a valid station a little farther away.
+  // This is candidate coverage; the later grade/curvature/earthwork checks remain
+  // unchanged and can still reject every site on genuinely unsuitable terrain.
+  for (const candidate of stationSites) {
+    if (stationCandidates.every(previous => distance(previous.point, candidate.point) >= 200)) stationCandidates.push(candidate)
+    if (stationCandidates.length >= 9) break
+  }
+  // A confined valley can have only a few distinct terraces. Its remaining
+  // feasible nearby alternatives still deserve the unused survey capacity.
+  for (const candidate of stationSites) {
+    if (stationCandidates.length >= 9) break
+    if (!stationCandidates.includes(candidate)) stationCandidates.push(candidate)
+  }
   const plans: RailwayCorridor[] = []
   for (const station of stationCandidates) for (const a of exits) {
     const first = route(a.index, station.cell)
