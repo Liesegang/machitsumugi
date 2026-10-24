@@ -67,7 +67,12 @@ export function transportSediment(input: SedimentInput): SedimentStep {
     const channelWidth = Math.min(cellSize, Math.max(1, .0048 * Math.sqrt(waterArea[i]!)))
     const width = standing ? cellSize : channelWidth
     const dischargePerWidth = (input.runoffMetresPerYear ?? .7) * waterArea[i]! / width
-    const length = Math.max(cellSize, (input.transportLengthFactor ?? .018) * dischargePerWidth * (standing ? .075 : 1))
+    const fluvialLength = Math.max(cellSize, (input.transportLengthFactor ?? .018) * dischargePerWidth * (standing ? .075 : 1))
+    // Fine suspended material can travel across the marine shelf before it
+    // settles. L = background speed * settling time(depth / fall velocity).
+    // These fictional washload parameters are not a calibrated current or
+    // grain-sorting model. Enclosed lakes keep their original trapping closure.
+    const length = marine[i] ? Math.max(fluvialLength, .05 * Math.max(1, sea - elevation[i]!) / .00004) : fluvialLength
     // Exact attenuation over one cell keeps all fractions bounded for any dx.
     // Submerged accommodation is finite; excess crosses the next cell rather
     // than forming an unbounded numerical mound in one long 250-year step.

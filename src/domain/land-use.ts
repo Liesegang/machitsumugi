@@ -24,19 +24,34 @@ export function contourNaturalLand(width: number, height: number, sample: (point
     const t2 = t * t, t3 = t2 * t
     return [(1 - 3 * t + 3 * t2 - t3) / 6, (4 - 6 * t2 + 3 * t3) / 6, (1 + 3 * t + 3 * t2 - 3 * t3) / 6, t3 / 6]
   }
-  const reconstructed = (p: Point) => {
-    const gx = Math.max(0, Math.min(columns, p.x / sx)), gy = Math.max(0, Math.min(rows, p.y / sy))
-    const ix = Math.floor(gx), iy = Math.floor(gy), wx = weights(gx - ix), wy = weights(gy - iy)
-    let value = 0
-    for (let y = 0; y < 4; y++) {
-      const offset = (iy + y + 1) * stride + ix + 1
-      value += wy[y]! * (values[offset]! * wx[0]! + values[offset + 1]! * wx[1]! + values[offset + 2]! * wx[2]! + values[offset + 3]! * wx[3]!)
-    }
-    return value
-  }
   // World-space chords stay short at house-level zoom. This is shared polygon
   // geometry, not a renderer-only curve which would disagree with saved maps.
-  return contourLand(width, height, reconstructed, Math.min(4, sampleStep / 4))
+  const step = Math.min(4, sampleStep / 4), fineColumns = Math.ceil(width / step) + 2, fineRows = Math.ceil(height / step) + 2
+  const fineX = width / (fineColumns - 2), fineY = height / (fineRows - 2)
+  // The same fine-grid coordinates recur along every row/column. Cache only
+  // their indices and weights, preserving the original f64 arithmetic order.
+  // No signed values are replaced: mixed-cell intersections stay identical.
+  const axis = (count: number, fineCell: number, coarseCell: number, limit: number) => Array.from({ length: count + 1 }, (_, i) => {
+    const position = Math.max(0, Math.min(limit, (i - 1) * fineCell / coarseCell)), index = Math.floor(position)
+    return { index, weights: weights(position - index) }
+  })
+  const horizontal = axis(fineColumns, fineX, sx, columns), vertical = axis(fineRows, fineY, sy, rows)
+  const fine: number[][] = []
+  for (let y = 0; y <= fineRows; y++) {
+    const row: number[] = [], { index: iy, weights: wy } = vertical[y]!
+    for (let x = 0; x <= fineColumns; x++) {
+      if (!x || !y || x === fineColumns || y === fineRows) { row.push(-1); continue }
+      const { index: ix, weights: wx } = horizontal[x]!
+      let value = 0
+      for (let dy = 0; dy < 4; dy++) {
+        const offset = (iy + dy + 1) * stride + ix + 1
+        value += wy[dy]! * (values[offset]! * wx[0]! + values[offset + 1]! * wx[1]! + values[offset + 2]! * wx[2]! + values[offset + 3]! * wx[3]!)
+      }
+      row.push(value)
+    }
+    fine.push(row)
+  }
+  return contourSamples(fineColumns, fineRows, fineX, fineY, fine)
 }
 
 /** Linear interpolation for physical suitability cuts; never a binary-cell outline. */
@@ -45,6 +60,10 @@ export function contourLand(width: number, height: number, sample: (point: Point
   const sx = width / (columns - 2), sy = height / (rows - 2)
   const values: number[][] = []
   for (let y = 0; y <= rows; y++) values.push(Array.from({ length: columns + 1 }, (_, x) => x === 0 || y === 0 || x === columns || y === rows ? -1 : sample({ x: (x - 1) * sx, y: (y - 1) * sy })))
+  return contourSamples(columns, rows, sx, sy, values)
+}
+
+function contourSamples(columns: number, rows: number, sx: number, sy: number, values: number[][]): PolygonRegion[] {
   type Segment = { a: Point; b: Point; used: boolean }
   const segments: Segment[] = [], at = new Map<string, Segment[]>()
   const key = (p: Point) => `${Math.round(p.x * 1000)}:${Math.round(p.y * 1000)}`
@@ -53,7 +72,9 @@ export function contourLand(width: number, height: number, sample: (point: Point
     for (const p of [a, b]) { const group = at.get(key(p)) ?? []; group.push(segment); at.set(key(p), group) }
   }
   for (let y = 0; y < rows; y++) for (let x = 0; x < columns; x++) {
-    const v = [values[y]![x]!, values[y]![x + 1]!, values[y + 1]![x + 1]!, values[y + 1]![x]!]
+    const a = values[y]![x]!, b = values[y]![x + 1]!, c = values[y + 1]![x + 1]!, d = values[y + 1]![x]!
+    if ((a > 0) === (b > 0) && (a > 0) === (c > 0) && (a > 0) === (d > 0)) continue
+    const v = [a, b, c, d]
     const corners = [{ x: (x - 1) * sx, y: (y - 1) * sy }, { x: x * sx, y: (y - 1) * sy }, { x: x * sx, y: y * sy }, { x: (x - 1) * sx, y: y * sy }]
     const crossings: { edge: number; point: Point }[] = []
     for (let edge = 0; edge < 4; edge++) {

@@ -1,4 +1,5 @@
-import type { Building, CityConfig, GrowthEvent, Parcel, Point, Road, SimulationSnapshot, Station } from './types'
+import type { Building, BuildingState, CityConfig, GrowthEvent, Parcel, Point, Road, SimulationSnapshot, Station, TimelineVersion } from './types'
+import { buildingGeometry } from './timeline'
 import { boundsOf, distance, overlaps, pointInPolygon, polygonArea, polygonsOverlap, projectPoint, seededRandom } from './geometry'
 import type { Bounds } from './geometry'
 import { scenarioDemandAtYear } from './urban-growth'
@@ -9,7 +10,7 @@ import { developmentClimbMinutes, surveyDevelopmentSite } from './development-te
 import type { DevelopmentSiteSurvey } from './development-terrain'
 import { isConstructionYear, simulationEndYear, simulationYears } from './simulation-calendar'
 
-export const GENERATOR_VERSION = '2.1.0'
+export const GENERATOR_VERSION = '2.2.0'
 export { EPOCH_YEAR } from './simulation-calendar'
 
 interface Candidate {
@@ -18,6 +19,7 @@ interface Candidate {
 }
 interface DevelopmentInput {
   config: CityConfig; roads: Road[]; center: Point; stations: Station[]
+  roadHistory?: TimelineVersion<Road>[]
   /** A surveyed bath/spring centre; onsen scenarios otherwise use their historic nucleus. */
   thermalCenter?: Point
   centers?: { point: Point; activeYear: number; catchment: number; weight: number; kind?: string }[]
@@ -56,6 +58,7 @@ function index<T extends { bounds: Bounds }>() {
 
 /** Shared-point road graph. Curve samples are degree-two vertices, not intersections. */
 function accessibility(roads: Road[], destinations: Point[]) {
+  const activeById = new Map(roads.map(road => [road.id, road]))
   const ids = new Map<string, number[]>(), points: Point[] = [], edges: { to: number; cost: number }[][] = []
   const node = (p: Point, road: Road) => {
     const x = Math.floor(p.x * 5), y = Math.floor(p.y * 5)
@@ -98,14 +101,22 @@ function accessibility(roads: Road[], destinations: Point[]) {
     const item = pop(); if (item.cost !== times[item.node]) continue
     for (const edge of edges[item.node]!) if (item.cost + edge.cost < times[edge.to]!) { times[edge.to] = item.cost + edge.cost; push({ node: edge.to, cost: times[edge.to]! }) }
   }
+  const values = new WeakMap<Candidate, number>()
   return (candidate: Candidate) => {
+    const cached = values.get(candidate)
+    if (cached !== undefined) return cached
     const nodes = roadNodes.get(candidate.road.id)
     if (!nodes) return Infinity
-    const a = Math.min(candidate.segment - 1, nodes.length - 1), b = Math.min(candidate.segment, nodes.length - 1)
+    const road = activeById.get(candidate.road.id)!
+    let segment = 1, nearest = Infinity
+    for (let i = 1; i < road.points.length; i++) { const d = distance(candidate.frontage, projectPoint(candidate.frontage, road.points[i - 1]!, road.points[i]!)); if (d < nearest) { nearest = d; segment = i } }
+    const a = segment - 1, b = segment
     let direct = Infinity
-    const speed = roadTravelSpeed(candidate.road)
-    for (const source of sources) if (source.roadId === candidate.road.id && source.segment === candidate.segment) direct = Math.min(direct, source.walking + distance(source.point, candidate.frontage) / speed)
-    return Math.min(direct, times[nodes[a]!]! + distance(candidate.frontage, candidate.road.points[a]!) / speed, times[nodes[b]!]! + distance(candidate.frontage, candidate.road.points[b]!) / speed)
+    const speed = roadTravelSpeed(road)
+    for (const source of sources) if (source.roadId === road.id && source.segment === segment) direct = Math.min(direct, source.walking + distance(source.point, candidate.frontage) / speed)
+    const value = Math.min(direct, times[nodes[a]!]! + distance(candidate.frontage, road.points[a]!) / speed, times[nodes[b]!]! + distance(candidate.frontage, road.points[b]!) / speed)
+    values.set(candidate, value)
+    return value
   }
 }
 
@@ -123,8 +134,43 @@ export function developLand(input: DevelopmentInput) {
   const zoning = createUrbanZoning({ roads: input.roads, stations, center, thermalCenter, centers: input.centers, metropolitan: settlement === 'metropolis', terrain })
   const industry = input.centers?.find(c => c.kind === 'industrial')
   const end = simulationEndYear(config), candidates: Candidate[] = [], events: GrowthEvent[] = [], snapshots: SimulationSnapshot[] = []
+  const history = { buildings: [] as TimelineVersion<Building>[], parcels: [] as TimelineVersion<Parcel>[], buildingStates: [] as BuildingState[] }
+  const liveBuildings = new Map<string, TimelineVersion<Building>>(), liveParcels = new Map<string, TimelineVersion<Parcel>>()
+  const occupancyStates = new Map<string, BuildingState>()
+  function recordStock(year: number, stock: Candidate[]) {
+    const existing = new Set(stock.map(c => c.building!.id))
+    for (const [id, version] of liveBuildings) if (!existing.has(id)) { version.to = year; liveBuildings.delete(id); occupancyStates.delete(id) }
+    for (const c of stock) {
+      const building = c.building!
+      if (!liveBuildings.has(building.id)) {
+        const version = { from: year, value: buildingGeometry(building) }
+        history.buildings.push(version); liveBuildings.set(building.id, version)
+      }
+      const previous = occupancyStates.get(building.id)
+      if (!previous || previous.occupancy !== building.occupancy || previous.occupiedHouseholds !== building.occupiedHouseholds) {
+        const state = { id: building.id, from: year, occupancy: building.occupancy, occupiedHouseholds: building.occupiedHouseholds }
+        history.buildingStates.push(state); occupancyStates.set(building.id, state)
+      }
+    }
+    for (const c of candidates) {
+      const parcel = c.parcel
+      if (parcel.createdYear > year) continue
+      const previous = liveParcels.get(parcel.id)
+      if (parcel.retiredYear !== undefined && parcel.retiredYear <= year) {
+        if (previous) { previous.to = year; liveParcels.delete(parcel.id) }
+        continue
+      }
+      if (previous && previous.value.use === parcel.use && previous.value.developedYear === parcel.developedYear) continue
+      if (previous) previous.to = year
+      const version = { from: year, value: { ...parcel } }
+      history.parcels.push(version); liveParcels.set(parcel.id, version)
+    }
+  }
   const lots = index<{ polygon: Point[]; bounds: Bounds }>()
-  const roads = input.roads.filter(road => (road.builtYear ?? 1700) <= end).sort((a, b) => (a.builtYear ?? 1700) - (b.builtYear ?? 1700) || a.id.localeCompare(b.id))
+  const earliestRoads = new Map<string, Road>()
+  for (const version of [...(input.roadHistory ?? [])].sort((a, b) => a.from - b.from)) if (!earliestRoads.has(version.value.id)) earliestRoads.set(version.value.id, version.value)
+  for (const road of input.roads) if (!earliestRoads.has(road.id)) earliestRoads.set(road.id, road)
+  const roads = [...earliestRoads.values()].filter(road => (road.builtYear ?? 1700) <= end).sort((a, b) => (a.builtYear ?? 1700) - (b.builtYear ?? 1700) || a.id.localeCompare(b.id))
   for (const road of roads) {
     if (road.bridge || road.role === 'bridge' || controlledRoad(road)) continue
     const year = road.builtYear ?? 1700, random = seededRandom(`${config.seed}:parcels:${road.id}`)
@@ -195,9 +241,10 @@ export function developLand(input: DevelopmentInput) {
   let capacity = 0, industrialJobs = 0
   let lodgingSerial = 0, lastHotelYear = -Infinity
   const built: Candidate[] = []
+  const versionedIds = new Set(input.roadHistory?.map(version => version.value.id))
   for (const year of simulationYears(end)) {
     const constructionYear = isConstructionYear(year)
-    const activeRoads = roads.filter(r => (r.builtYear ?? 1700) <= year)
+    const activeRoads = input.roadHistory ? [...input.roadHistory.filter(version => version.from <= year && (version.to === undefined || year < version.to)).map(version => version.value), ...roads.filter(road => !versionedIds.has(road.id) && (road.builtYear ?? 1700) <= year)] : roads.filter(r => (r.builtYear ?? 1700) <= year)
     const activeStations = year >= 1900 ? stations : []
     const destinations = input.centers?.filter(c => c.activeYear <= year).map(c => c.point) ?? [center]
     const travel = accessibility(activeRoads, [...destinations, ...activeStations.map(s => s.point)])
@@ -355,7 +402,8 @@ export function developLand(input: DevelopmentInput) {
       residents -= used
       Object.assign(c.building!, { occupiedHouseholds: used, occupancy: c.building!.use === 'lodging' ? 'occupied' : c.capacity === 0 ? jobs < industrialJobs * .6 ? 'underused' : 'occupied' : used === 0 ? 'vacant' : used < c.capacity ? 'underused' : 'occupied' })
     }
+    recordStock(year, built)
     if (year % 25 === 0 || year === end || year === 1930) snapshots.push({ year, households, capacity, vacant: Math.max(0, capacity - households), unmet: Math.max(0, households - capacity), roads: activeRoads.length, buildings: built.length })
   }
-  return { buildings: built.map(c => c.building!), parcels: candidates.map(c => c.parcel), events, snapshots }
+  return { buildings: built.map(c => c.building!), parcels: candidates.map(c => c.parcel), events, snapshots, history }
 }

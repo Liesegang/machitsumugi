@@ -2,6 +2,8 @@ import type { Area, Building, CityMap, Point } from '../domain/types'
 import { terrainContours } from './contours'
 import { waterGeometry } from './water-surfaces'
 import { areaLabelPoint } from './area-labels'
+import { seaDepthRaster, seaDepthRgb } from './bathymetry'
+import { landPaintGroups } from './land-paint'
 
 export type LayerSettings = {
   buildings: boolean
@@ -139,7 +141,7 @@ function renderRelief(ctx: CanvasRenderingContext2D, map: CityMap) {
     for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
       const i = y * canvas.width + x, h = z[i]!, dx = (z[y * canvas.width + Math.min(canvas.width - 1, x + 1)]! - z[y * canvas.width + Math.max(0, x - 1)]!) / (surface.cellSize * 2), dy = (z[Math.min(canvas.height - 1, y + 1) * canvas.width + x]! - z[Math.max(0, y - 1) * canvas.width + x]!) / (surface.cellSize * 2)
       const shade = Math.max(.45, Math.min(1.22, .88 + (-dx * .7 - dy * .7) * 3)), t = Math.min(1, Math.max(0, h / 650))
-      const rgb = h <= (map.previewSeaLevel ?? 0) ? [87, 150, 175] : [156 + t * 46, 184 + t * 8, 137 + t * 37]
+      const rgb = h <= (map.previewSeaLevel ?? 0) ? seaDepthRgb((map.previewSeaLevel ?? 0) - h) : [156 + t * 46, 184 + t * 8, 137 + t * 37]
       for (let c = 0; c < 3; c++) pixels.data[i * 4 + c] = Math.min(255, rgb[c]! * shade)
       pixels.data[i * 4 + 3] = 255
     }
@@ -149,7 +151,7 @@ function renderRelief(ctx: CanvasRenderingContext2D, map: CityMap) {
 }
 function renderContours(ctx: CanvasRenderingContext2D, map: CityMap, scale: number, style: MapStyle) {
   if (!map.terrainSurface) return
-  const lines = terrainContours(map.terrainSurface)
+  const lines = terrainContours(map.terrainSurface, map.areas.some(area => area.id === 'sea' || area.id.startsWith('sea-')))
   ctx.save(); ctx.lineJoin = 'round'; ctx.lineCap = 'round'
   for (const line of lines) {
     tracePath(ctx, line.points)
@@ -189,10 +191,16 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
   if (options.contours && map.terrainSurface) { ctx.globalAlpha = .35; renderRelief(ctx, map); ctx.globalAlpha = 1 }
 
   if (layers.terrain) {
-    for (const area of map.areas) {
-      if (area.kind === 'water') continue
+    for (const group of landPaintGroups(map.areas)) {
       if (options.contours && map.terrainSurface) continue
-      traceRegion(ctx, area)
+      const area = group[0]!
+      ctx.beginPath()
+      for (const part of group) for (const ring of [part.polygon, ...part.holes ?? []]) {
+        if (!ring.length) continue
+        ctx.moveTo(ring[0]!.x, ring[0]!.y)
+        for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i]!.x, ring[i]!.y)
+        ctx.closePath()
+      }
       ctx.fillStyle = areaColor(area, style)
       ctx.fill('evenodd')
       if (area.kind === 'forest') {
@@ -200,7 +208,15 @@ export function renderMap(ctx: CanvasRenderingContext2D, map: CityMap, options: 
       }
     }
     const water = waterGeometry(map.areas)
-    for (const area of water.surfaces) { traceRegion(ctx, area); ctx.fillStyle = areaColor(area, style); ctx.fill('evenodd') }
+    for (const area of water.surfaces) {
+      traceRegion(ctx, area); ctx.fillStyle = areaColor(area, style); ctx.fill('evenodd')
+      if (map.terrainSurface && (area.id === 'sea' || area.id.startsWith('sea-'))) {
+        ctx.save(); ctx.clip('evenodd'); ctx.imageSmoothingEnabled = true
+        const s = map.terrainSurface
+        ctx.drawImage(seaDepthRaster(s, style), -s.cellSize / 2, -s.cellSize / 2, s.columns * s.cellSize, s.rows * s.cellSize)
+        ctx.restore()
+      }
+    }
     ctx.lineWidth = .6 / scale; ctx.strokeStyle = colors.waterEdge
     for (const shoreline of water.shorelines) { traceRegion(ctx, shoreline); ctx.stroke() }
   }

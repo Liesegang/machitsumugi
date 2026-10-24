@@ -34,6 +34,18 @@ describe('as-of historical development', () => {
     expect(before.snapshots.at(-1)!.year).toBe(1957)
     expect(before.events.every(event => event.year <= 1957)).toBe(true)
   })
+  it('retains demolished geometry and old occupancy in one completed simulation', () => {
+    const present = run(2025), past = run(1955)
+    const visible = present.history.buildings.filter(version => version.from <= 1955 && (version.to === undefined || 1955 < version.to)).map(version => version.value)
+    const geometry = (buildings: typeof visible) => buildings.map(({ occupancy: _status, occupiedHouseholds: _households, ...building }) => building).sort((a, b) => a.id.localeCompare(b.id))
+    expect(geometry(visible)).toEqual(geometry(past.buildings))
+    const retired = present.history.buildings.filter(version => version.to !== undefined)
+    expect(retired.length).toBeGreaterThan(0)
+    expect(retired.every(version => present.events.some(event => event.kind === 'acquisition' && event.entityId === version.value.id && event.year === version.to))).toBe(true)
+    // Geometry is stored per construction, not copied once for every date.
+    expect(present.history.buildings.length).toBeLessThan(present.snapshots.reduce((sum, snapshot) => sum + snapshot.buildings, 0))
+    expect(present.history.buildings.every(version => version.value.occupancy === undefined)).toBe(true)
+  })
   it('does not plan a future railway at1899 and opens it once at1900 despite an older era preset', () => {
     const input = { width: 1200, height: 1000, seed: 'timeline-rail', type: 'post' as const, center: { x: 600, y: 500 }, core: null, areas: [], arterial: false, railway: true, stationPoints: [], density: 0, era: 'historic' as const }
     const before = simulateUrbanGrowth({ ...input, targetYear: 1899, onRailwayPlanning: () => { throw new Error('future railway') } })

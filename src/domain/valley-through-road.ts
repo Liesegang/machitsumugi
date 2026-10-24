@@ -3,6 +3,7 @@ import { alignmentDiagnostics } from './road-alignment'
 import type { PlannedRoute, RoadPlanner } from './road-planner'
 import type { RegionalRoadPlanner } from './regional-road-planner'
 import { onSurveyedBridge, surveyedRoadGradeAllowed } from './surveyed-road-profile'
+import { projectOnRoadSegment, type PlanarRoadGraph, type RoadProject } from './road-graph'
 
 const distance = (a: Point, b: Point) => Math.hypot(b.x - a.x, b.y - a.y)
 const mix = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
@@ -71,36 +72,100 @@ export function valleyBoundaryPortals(input: ValleyBoundaryInput): Point[][] { r
 
 export interface ValleyThroughRoad {
   route: PlannedRoute; width: number; fundingLimit: number
+  attachment: Point
   headwaterPass: boolean
   sections: { points: Point[]; bridge: boolean; length: number }[]
+}
+
+/** Rebuilding an inherited bridge is one funded modification, not a second
+ * bridge drawn over the old deck. Its junctions and earlier width stay dated. */
+export function commitValleyThroughRoad(graph: PlanarRoadGraph, project: ValleyThroughRoad, input: { year: number; reason: string; nextId: () => string }) {
+  if (!graph.nearest(project.attachment, .2)) return null
+  const projects: RoadProject[] = []
+  for (const section of project.sections) {
+    const inherited = section.bridge ? graph.roads.filter(road => road.bridge && road.width < project.width && road.points.every(point => section.points.slice(1).some((end, i) => distance(point, projectOnRoadSegment(point, section.points[i]!, end).point) < .04))) : []
+    // Two inherited decks need a separate replacement survey; never silently
+    // retire one or bypass the ordinary duplicate-corridor check.
+    if (inherited.length > 1) return null
+    const existing = inherited[0]
+    projects.push({ points: section.points, metadata: { id: existing?.id ?? input.nextId(), builtYear: input.year, phase: 'suburban', role: section.bridge ? 'bridge' : 'highway', bridge: section.bridge, reason: input.reason, width: project.width, kind: 'arterial', constructionCost: project.route.cost * section.length / project.route.length, boundaryContinuation: true, preserveEndpoint: true }, requireConnection: false, ...(existing ? { modifies: existing.id } : {}) })
+  }
+  return graph.addBatch(projects)
 }
 
 /** A user-selected regional road has a separately bounded regional appropriation;
  * its two neighbouring valleys do not lose their traffic when the local village
  * declines. The allowance is a fictional scenario, in construction credits. */
-export function planValleyThroughRoad(input: { width: number; height: number; origin: Point; river: Point[]; planner: RoadPlanner; regionalPlanner: RegionalRoadPlanner }): ValleyThroughRoad | null {
+interface ValleyThroughRoadInput { width: number; height: number; origin: Point; river: Point[]; planner: RoadPlanner; regionalPlanner: RegionalRoadPlanner; connectionPoints?: Point[] }
+
+export function planValleyThroughRoad(input: ValleyThroughRoadInput): ValleyThroughRoad | null {
+  const terrain = input.planner.environment.terrain
+  const score = (point: Point) => distance(point, input.origin) + (terrain?.slope(point) ?? 0) * 6000 + Math.max(0, (terrain?.elevation(point) ?? 0) - (terrain?.elevation(input.origin) ?? 0)) * 5
+  const sites = [{ point: input.origin, score: score(input.origin) }, ...(input.connectionPoints ?? []).filter(point => distance(point, input.origin) <= 700 && (terrain?.slope(point) ?? 0) <= .08 && input.planner.suitable(point, 14)).map(point => ({ point, score: score(point) }))].sort((a, b) => a.score - b.score)
+  const chosen: Point[] = []
+  for (const site of sites) {
+    if (chosen.some(point => distance(point, site.point) < 120)) continue
+    chosen.push(site.point)
+    if (chosen.length === 3) break
+  }
+  for (const origin of chosen) {
+    const project = planValleyConnection({ ...input, origin })
+    if (project) return project
+  }
+  return null
+}
+
+function planValleyConnection(input: ValleyThroughRoadInput): ValleyThroughRoad | null {
   const { regionalPlanner, origin } = input, width = 8.5
   const fundingLimit = (input.width + input.height) * 4
   const survey = surveyValleyBoundary({ ...input, roadWidth: width }), [upstream, downstream] = survey.directions
-  if (!upstream?.length || !downstream?.length) return null
+  if (input.river.length < 2) return null
+  const passes = regionalPlanner.boundaryPortals(origin, { width, maxCandidates: 12 })
+  function* goals(portals: Point[] | undefined) {
+    // Prefer river-valley exits, but a road may continue along a mountain front
+    // into a neighbouring valley. Its two regional destinations need not share
+    // the river's local axis. Every pass still requires a complete real survey.
+    const visited: Point[] = []
+    for (const portal of (portals ?? []).slice(0, 4)) { const point = regionalPlanner.beyondBoundary(portal); visited.push(point); yield { point, pass: false } }
+    for (const point of passes) if (visited.every(previous => distance(previous, point) >= 180)) yield { point, pass: true }
+  }
   const maxNodes = Math.ceil((input.width + 900) / 45) * Math.ceil((input.height + 900) / 45)
   const terrain = input.planner.environment.terrain
   const elevation = (p: Point) => p.x < 0 || p.y < 0 || p.x > input.width || p.y > input.height ? terrain?.continuationTerrain?.elevation(p) ?? terrain?.elevation(p) ?? 0 : terrain?.elevation(p) ?? 0
   const gradeAllowed = (route: PlannedRoute) => surveyedRoadGradeAllowed(route, .10, elevation)
-  let first: PlannedRoute | null = null
-  for (const portal of upstream) {
-    const candidate = regionalPlanner.plan(origin, regionalPlanner.beyondBoundary(portal), { role: 'highway', width, allowBridge: true, maxNodes })
-    if (candidate && candidate.cost < fundingLimit && gradeAllowed(candidate)) { first = candidate; break }
-  }
-  if (!first) return null
-  const before = first.points[1]!, at = first.points[0]!, startHeading = Math.atan2(at.y - before.y, at.x - before.x)
-  for (const portal of downstream) {
-    const second = regionalPlanner.plan(origin, regionalPlanner.beyondBoundary(portal), { role: 'highway', width, allowBridge: true, startHeading, maxNodes })
-    if (!second || first.cost + second.cost > fundingLimit || !gradeAllowed(second)) continue
-    const points = first.points.slice().reverse().concat(second.points.slice(1))
-    if (alignmentDiagnostics(points).minimumRadius < 85 || !regionalPlanner.validate(points, width, first.bridgeLength + second.bridgeLength > 0)) continue
-    const spans = [...(first.surveyedBridgeSpans ?? []), ...(second.surveyedBridgeSpans ?? [])]
-    const route: PlannedRoute = { ...first, points, length: first.length + second.length, cost: first.cost + second.cost, bridgeLength: first.bridgeLength + second.bridgeLength, boundaryContinuation: true, ...(spans.length ? { surveyedBridgeSpans: spans } : {}) }
+  let searches = 0
+  const maxSearches = 12
+  for (const firstGoal of goals(upstream)) {
+    if (searches >= maxSearches) break
+    searches++
+    const first = regionalPlanner.plan(origin, firstGoal.point, { role: 'highway', width, allowBridge: true, maxNodes, maximumGrade: .10 })
+    if (!first || first.cost >= fundingLimit || !gradeAllowed(first)) continue
+    const before = first.points[1]!, at = first.points[0]!, startHeading = Math.atan2(at.y - before.y, at.x - before.x)
+    for (const goal of goals(downstream)) {
+    if (distance(goal.point, first.points.at(-1)!) < 240) continue
+    const a = first.points.at(-1)!, ax = a.x - origin.x, ay = a.y - origin.y, bx = goal.point.x - origin.x, by = goal.point.y - origin.y
+    if ((ax * bx + ay * by) / (Math.hypot(ax, ay) * Math.hypot(bx, by) || 1) > -.15) continue
+    if (searches >= maxSearches) break
+    searches++
+    let pairFirst = first
+    let second = regionalPlanner.plan(origin, goal.point, { role: 'highway', width, allowBridge: true, startHeading, maxNodes, maximumGrade: .10 })
+    if ((!second || !gradeAllowed(second)) && searches + 2 <= maxSearches) {
+      // A cheap unconstrained first leg can leave the attachment pointing into
+      // a cliff when reversed. Survey a shared through tangent for both legs,
+      // rather than declaring the second destination physically unreachable.
+      const heading = Math.atan2(firstGoal.point.y - goal.point.y, firstGoal.point.x - goal.point.x)
+      searches++
+      const alternative = regionalPlanner.plan(origin, firstGoal.point, { role: 'highway', width, allowBridge: true, startHeading: heading, maxNodes, maximumGrade: .10 })
+      if (alternative && alternative.cost < fundingLimit && gradeAllowed(alternative)) {
+        pairFirst = alternative; searches++
+        second = regionalPlanner.plan(origin, goal.point, { role: 'highway', width, allowBridge: true, startHeading: heading + Math.PI, maxNodes, maximumGrade: .10 })
+      }
+    }
+    if (!second || pairFirst.cost + second.cost > fundingLimit || !gradeAllowed(second)) continue
+    const points = pairFirst.points.slice().reverse().concat(second.points.slice(1))
+    if (alignmentDiagnostics(points).minimumRadius < 85 || !regionalPlanner.validate(points, width, pairFirst.bridgeLength + second.bridgeLength > 0)) continue
+    const spans = [...(pairFirst.surveyedBridgeSpans ?? []), ...(second.surveyedBridgeSpans ?? [])]
+    const route: PlannedRoute = { ...pairFirst, points, length: pairFirst.length + second.length, cost: pairFirst.cost + second.cost, bridgeLength: pairFirst.bridgeLength + second.bridgeLength, boundaryContinuation: true, ...(spans.length ? { surveyedBridgeSpans: spans } : {}) }
     // Keep the same canonical alignment and the physical abutment-to-abutment
     // decks. Clipping the deck to the water mask would lose dry bank approaches.
     const sections: ValleyThroughRoad['sections'] = []
@@ -120,7 +185,8 @@ export function planValleyThroughRoad(input: { width: number; height: number; or
     }
     if (run.length > 1) sections.push({ points: run, bridge: bridge ?? false, length: runLength })
     if (sections.some(section => !regionalPlanner.validate(section.points, width, section.bridge))) continue
-    return { route, width, fundingLimit, sections, headwaterPass: survey.headwaterPass }
+    return { route, width, fundingLimit, attachment: origin, sections, headwaterPass: survey.headwaterPass || firstGoal.pass || goal.pass }
+    }
   }
   return null
 }

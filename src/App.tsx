@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, startTransition, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Eye, EyeOff, FileJson, HelpCircle, Image, LoaderCircle, MapPin, Menu, MousePointer2, PanelLeftClose, Save, Trash2, Upload, X } from 'lucide-react'
 import type { CityConfig, CityMap, Point } from './domain/types'
 import type { MapFeature } from './map/inspect'
@@ -19,6 +19,7 @@ import { TimelineControl } from './components/TimelineControl'
 import { DistrictNaming } from './components/DistrictNaming'
 import { parseNameProposals } from './ai/district-names'
 import type { NameProposal } from './ai/district-names'
+import { renameTimelineDistricts, sliceCityAtYear } from './domain/timeline'
 import RegionalContext from './components/RegionalContext'
 import './App.css'
 
@@ -42,7 +43,6 @@ function sessionDraft(fallback: CityConfig): CityConfig {
   } catch { return fallback }
 }
 const normalizeConfig = (config: CityConfig): CityConfig => ({ ...config, era: config.era ?? 'present', relief: config.relief ?? 'hills', terrain: (config.type === 'port' || config.facilities.includes('port')) && config.terrain === 'plain' ? 'coast' : config.terrain })
-const timelineKey = (config: CityConfig) => JSON.stringify(Object.fromEntries(Object.entries({ ...config, targetYear: config.targetYear ?? ({ historic: 1800, railway: 1930, present: 2025 }[config.era ?? 'present']) }).sort(([a], [b]) => a.localeCompare(b))))
 const newProject = (): Project => ({ version: 2, config: livePreview ? sessionDraft(DEFAULT_CONFIG) : DEFAULT_CONFIG, layers: DEFAULT_LAYERS, annotations: [], style: 'standard' })
 const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', facilities: '施設', grid: '100 m グリッド' }
 const eraNames = { historic: '近世の街', railway: '鉄道開通後', present: '郊外拡大後' }
@@ -94,7 +94,8 @@ function App() {
   const activeWorker = useRef<Worker | null>(null)
   const workerBusy = useRef(false)
   const completedProject = useRef<Project | null>(null)
-  const timelineCache = useRef(new Map<string, CityMap>())
+  const [displayYear, setDisplayYear] = useState(project.config.targetYear ?? ({ historic: 1800, railway: 1930, present: 2025 }[project.config.era ?? 'present']))
+  const requestedDisplayYear = useRef(displayYear)
   const importSequence = useRef(0)
   const restoreSequence = useRef(0)
   const saveFailureNotified = useRef(false)
@@ -114,6 +115,8 @@ function App() {
       if (request !== restoreSequence.current) return
       if (saved) {
         const restored = saved.snapshot ? saved : { ...saved, config: normalizeConfig(saved.config) }
+        requestedDisplayYear.current = restored.config.targetYear ?? restored.snapshot?.year ?? 2025
+        setDisplayYear(requestedDisplayYear.current)
         setProject(restored); setDraft(sessionDraft(restored.config)); setMap(restored.snapshot ?? null); setGenerating(!restored.snapshot)
       }
       setRestoring(false)
@@ -152,14 +155,15 @@ function App() {
       workerBusy.current = false
       if (event.data.error) {
         setGenerating(false); setPreviewMap(null); setError(event.data.error)
-        if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null) }
+        if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null); const year = completedProject.current.snapshot?.year ?? 2025; requestedDisplayYear.current = year; setDisplayYear(year) }
       }
       else if (event.data.map) {
-        const generated = event.data.map
+        const generated = event.data.map.timeline ? sliceCityAtYear(event.data.map, requestedDisplayYear.current) : event.data.map
         setGenerating(false)
         setMap(generated)
         setPreviewMap(null)
         setProject(old => ({ ...old, config: generated.config, snapshot: generated }))
+        setDraft(old => ({ ...old, targetYear: generated.year ?? requestedDisplayYear.current }))
         setError('')
         if (generated.unplacedFacilities?.length) setToast(`施設${generated.unplacedFacilities.length}件は成立しませんでした。詳細は「使い方」で確認できます。`)
       }
@@ -169,7 +173,7 @@ function App() {
       workerBusy.current = false; instance.terminate()
       if (activeWorker.current === instance) activeWorker.current = null
       setGenerating(false); setPreviewMap(null); setError('地図を生成できませんでした。ページを再読み込みしてください。')
-      if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null) }
+      if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null); const year = completedProject.current.snapshot?.year ?? 2025; requestedDisplayYear.current = year; setDisplayYear(year) }
     }
     instance.addEventListener('message', handleMessage)
     instance.addEventListener('error', handleError)
@@ -183,12 +187,6 @@ function App() {
     }
   }, [project.config, project.snapshot, restoring, generating])
   useEffect(() => { if (project.snapshot) completedProject.current = project }, [project])
-  useEffect(() => {
-    if (!project.snapshot) return
-    const cache = timelineCache.current, key = timelineKey(project.snapshot.config)
-    cache.delete(key); cache.set(key, project.snapshot)
-    while (cache.size > 3) cache.delete(cache.keys().next().value!)
-  }, [project.snapshot])
   useEffect(() => {
     // Keep the last completed map in storage if a new generation fails or is interrupted.
     if (livePreview || restoring || !project.snapshot) return
@@ -207,6 +205,8 @@ function App() {
   function generate() {
     if (restoring || !draft.name.trim() || !draft.seed.trim()) return
     const config = normalizeConfig({ ...draft, name: draft.name.trim(), seed: draft.seed.trim() })
+    requestedDisplayYear.current = config.targetYear ?? ({ historic: 1800, railway: 1930, present: 2025 }[config.era ?? 'present'])
+    setDisplayYear(requestedDisplayYear.current)
     sequence.current += 1
     if (workerBusy.current) { activeWorker.current?.terminate(); activeWorker.current = null; workerBusy.current = false }
     importSequence.current += 1
@@ -224,28 +224,27 @@ function App() {
     location.reload()
   }
   function showYear(targetYear: number) {
-    const base = project
-    if (!map && !base.snapshot) return
-    const config = { ...base.config, targetYear }
-    if ((base.snapshot?.year ?? map?.year ?? 2025) === targetYear && !generating) return
-    sequence.current += 1
-    if (workerBusy.current) { activeWorker.current?.terminate(); activeWorker.current = null; workerBusy.current = false }
-    const cached = timelineCache.current.get(timelineKey(config))
-    const restored = cached ? { ...cached, config } : undefined
+    if (!generating && !map?.timeline) return
+    requestedDisplayYear.current = targetYear
+    setDisplayYear(targetYear)
+    // A date request during the initial full simulation changes only the
+    // requested view. It never cancels, restarts or reconfigures that worker.
+    if (generating) return
+    if (!map?.timeline) return
     setFeature(null); setSelected(null); setPinMode(false); setPreviewMap(null); setError('')
-    setGenerationLabel(`${targetYear}年までの歴史を計算中…`)
-    setProject({ ...base, config, snapshot: restored })
-    // Changing the date must not silently apply other unfinished settings.
+    startTransition(() => {
+      const restored = sliceCityAtYear(map, targetYear)
+      setMap(restored)
+      setProject(old => ({ ...old, config: restored.config, snapshot: restored }))
+    })
     setDraft(old => ({ ...old, targetYear }))
-    if (restored) { setMap(restored); setGenerating(false) }
-    else setGenerating(true)
   }
   function applyDistrictNames(proposals: NameProposal[]) {
     if (!map || !project.snapshot || generating) return false
     try {
       const checked = parseNameProposals(JSON.stringify({ names: proposals }), map.districts)
       const names = new Map(checked.map(p => [p.id, p]))
-      const renamed = { ...map, districts: map.districts.map(d => ({ ...d, name: names.get(d.id)!.name, nameOrigin: names.get(d.id)!.reason, namingSource: names.get(d.id)!.source ?? 'llm' as const })) }
+      const renamed = renameTimelineDistricts(map, district => { const name = names.get(district.id); return name ? { ...district, name: name.name, nameOrigin: name.reason, namingSource: name.source ?? 'llm' as const } : district })
       setMap(renamed); setProject(old => ({ ...old, snapshot: renamed })); setFeature(null)
       setError('')
       setToast('確認した地名を地図に反映しました。')
@@ -260,6 +259,8 @@ function App() {
     setPreviewMap(null)
     if (completedProject.current) {
       setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null); setPreviewMap(null)
+      const year = completedProject.current.snapshot?.year ?? 2025
+      requestedDisplayYear.current = year; setDisplayYear(year)
     }
     setToast('生成を中止しました。設定を変えて生成できます。')
   }
@@ -302,7 +303,8 @@ function App() {
       activeWorker.current?.terminate(); activeWorker.current = null
       workerBusy.current = false
       restoreSequence.current += 1
-      timelineCache.current.clear()
+      requestedDisplayYear.current = next.config.targetYear ?? next.snapshot?.year ?? 2025
+      setDisplayYear(requestedDisplayYear.current)
       setRestoring(false)
       setProject(next); setDraft(next.config); setSelected(null); setFeature(null); setPinMode(false); setError('')
       setGenerating(!next.snapshot)
@@ -342,7 +344,7 @@ function App() {
         {displayedMap && <div className={`map-view-2d ${viewMode === '3d' ? 'view-hidden' : ''}`} aria-hidden={viewMode === '3d'}><MapCanvas ref={mapRef} map={displayedMap} options={options} pinMode={pinMode} onPick={pick} onAnnotationPick={pin => { if (!generating && project.snapshot) setSelected(pin) }} /></div>}
         {displayedMap && viewMode === '3d' && <div className="map-view-3d"><Suspense fallback={<div className="map-view-loading" role="status">3D表示を読み込み中…</div>}><Map3D map={displayedMap} /></Suspense></div>}
         {displayedMap && <RegionalContext map={displayedMap} />}
-        {map && <TimelineControl key={`${project.config.seed}:${project.config.targetYear ?? map.year ?? 2025}`} year={project.config.targetYear ?? map.year ?? 2025} generating={generating} onCommit={showYear} />}
+        {(map || generating) && <TimelineControl key={project.config.seed} year={displayYear} generating={generating} available={!!map?.timeline} onCommit={showYear} />}
         <div className="map-title"><button className="mobile-menu icon-button" aria-label="街の設定を開く" onClick={() => setSidebarOpen(true)}><Menu size={21} /></button><div><h2>{displayedMap?.config.name || project.config.name}</h2><span>{CITY_PRESETS.find(preset => preset.id === (displayedMap?.config.type || project.config.type))?.name} · {`${mapWidthKm} km × ${mapHeightKm} km`}{map?.year !== undefined ? ` · ${map.year}年` : ''}</span></div></div>
         <div className="map-tools"><div className="map-view-switch" role="group" aria-label="地図の表示方法">{([{ id: 'map', name: '地図' }, { id: 'contour', name: '等高線' }, { id: '3d', name: '3D' }] as const).map(mode => <button key={mode.id} className={viewMode === mode.id ? 'active' : ''} aria-pressed={viewMode === mode.id} onClick={() => changeView(mode.id)}>{mode.name}</button>)}</div>{viewMode !== '3d' && <><div className="map-style-switch">{([{ id: 'standard', name: '標準' }, { id: 'mono', name: 'モノクロ' }] as const).map(style => <button key={style.id} className={project.style === style.id ? 'active' : ''} aria-pressed={project.style === style.id} onClick={() => setProject(old => ({ ...old, style: style.id }))}>{style.name}</button>)}</div><div className="drawing-tools"><button className={!pinMode ? 'active' : ''} aria-label="地図を移動・建物を選択" title="地図を移動・建物を選択" aria-pressed={!pinMode} onClick={() => setPinMode(false)}><MousePointer2 size={20} /></button><button className={pinMode ? 'active' : ''} aria-label="地図にピンを追加" title="地図にピンを追加" disabled={generating || !project.snapshot} aria-pressed={pinMode} onClick={() => setPinMode(!pinMode)}><MapPin size={20} /></button></div></>}</div>
         {pinMode && <div className="mode-notice"><MapPin size={15} />ピンを置く場所をクリック<button aria-label="ピン配置をやめる" onClick={() => setPinMode(false)}><X size={15} /></button></div>}
@@ -357,7 +359,7 @@ function App() {
     {error && <div className="error-toast" role="alert"><span>{error}</span><button aria-label="エラーを閉じる" onClick={() => setError('')}><X size={17} /></button></div>}
     {selected && <Dialog title="ピンを編集" onClose={() => setSelected(null)}><div className="dialog-body"><label className="stack-field">場所の名前<input autoFocus value={selected.name} maxLength={60} placeholder="例：古書店「月読堂」" onChange={event => setSelected({ ...selected, name: event.target.value })} /></label><label className="stack-field">メモ<textarea value={selected.note} maxLength={2000} rows={4} placeholder="この場所にある手がかりや、登場人物など" onChange={event => setSelected({ ...selected, note: event.target.value })} /></label><Toggle label="GM用ピンにする" value={selected.secret} onChange={value => setSelected({ ...selected, secret: value })} icon={<EyeOff size={17} />} /><p className="muted">GM用ピンは、画像の書き出し時に隠せます。</p></div><div className="dialog-footer">{project.annotations.some(item => item.id === selected.id) ? <button className="text-button danger" onClick={() => { setProject(old => ({ ...old, annotations: old.annotations.filter(item => item.id !== selected.id) })); setSelected(null) }}><Trash2 size={16} />削除</button> : <span />}<button className="primary" disabled={!selected.name.trim()} onClick={savePin}>ピンを保存</button></div></Dialog>}
     {dialog === 'export' && <Dialog title="画像を書き出す" onClose={() => { if (!exporting) setDialog(null) }}><div className="dialog-body"><p className="muted">2D地図を、現在のレイヤーとスタイルで書き出します。等高線表示時は等高線も含みます。</p><label className="stack-field">ファイル形式<select value={format} onChange={e => setFormat(e.target.value as 'png' | 'svg')}><option value="png">PNG画像</option><option value="svg">SVG（拡大しても鮮明）</option></select></label>{format === 'png' && <label className="stack-field">画像サイズ<select value={exportWidth} onChange={e => setExportWidth(Number(e.target.value))}>{[2048, 4096, 8192].map(width => <option key={width} value={width}>{width} × {Math.round(width * (map?.height ?? 3000) / (map?.width ?? 4000))} px</option>)}</select></label>}<Toggle label="GM用ピンを含める" value={includeSecrets} onChange={setIncludeSecrets} icon={<EyeOff size={17} />} /><p className="export-note">実在の地図画像は使用していません。セッション資料や配信などに自由にお使いいただけます。</p></div><div className="dialog-footer"><span className="muted">{map?.config.name}</span><button className="primary" disabled={exporting} onClick={() => void exportImage()}>{exporting ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}{exporting ? '書き出し中…' : 'ダウンロード'}</button></div></Dialog>}
-    {dialog === 'help' && <Dialog title="架空日本地図ジェネレーターの使い方" onClose={() => setDialog(null)}><div className="dialog-body help-content"><p>街の成り立ちと地形を選び、「生成」で地図を作成します。</p><p><b>地図を探索</b>ドラッグで移動、ホイールや＋／−で拡大縮小。建物をクリックすると種類や面積を確認できます。キーボードの矢印キーでも移動できます。</p><p><b>等高線と3D</b>地図上部で表示を切り替えます。等高線は保存された標高から描画し、3Dは同じ地形と建物を立体表示します。3Dではドラッグで回転、右ドラッグで移動できます。建物の高さは階数からの仮定で、標高がない旧地図は平面地形で表示します。画像出力は2D地図です。</p><p><b>ピンを追加</b>ピンのツールで場所をクリックし、名前・メモを保存できます。GM用ピンは公開画像から除けます。</p><p><b>画像と設定を保存</b>PNG・SVGで地図全体を書き出せます。設定ファイルには地図の形・シード・表示・ピンを保存し、「レイヤー」から読み込めます。保存済みの地図は再生成せず復元します。旧形式（バージョン1）は設定とピンのみのため、現在のエンジンで生成します。</p><p><b>街の成り立ち</b>成立期から鉄道整備、郊外拡大までの成長過程を、地形・道路への接続・需要に基づく簡略モデルで扱います。「発展段階」で各時点の地図を生成できます。現実の人口動態・土地所有・水利・制度を網羅するものではなく、実在都市の再現や都市計画の検証には使えません。</p>{Boolean(map?.unplacedFacilities?.length) && <section className="unplaced-facilities"><h3>成立しなかった施設</h3><dl>{map!.unplacedFacilities!.map((facility, index) => <div key={`${facility.kind}-${index}`}><dt>{FACILITY_NAMES[facility.kind]}</dt><dd>{facility.reason}</dd></div>)}</dl></section>}{map?.terrainSimulation && <TerrainCalculation simulation={map.terrainSimulation} />}<p><b>生成エンジン</b>現行 {GENERATOR_VERSION}。表示中の地図：{map?.generatorVersion ?? '版情報なし'}{map?.year !== undefined ? `、${map.year}年` : ''}。再生成すると現在の規則で作り直し、ピンをリセットします。</p>{Boolean(map?.growthLog?.length) && <p><b>この地図の発展記録</b>{map!.growthLog!.map((stage, index) => <span key={`${stage.phase}-${index}`} style={{ display: 'block' }}>{stage.year !== undefined ? `${stage.year}年 · ` : ''}{({ regional: '街道の成立', oldtown: '旧市街の発展', railway: '鉄道開通と駅前の発展', suburban: '郊外への拡大', industrial: '産業地の発展' } as Record<string, string>)[stage.phase] ?? stage.phase}：道路 {stage.roadsAdded}本{stage.reason ? `（${stage.reason}）` : ''}</span>)}</p>}<a href="https://github.com/Liesegang/machitsumugi" target="_blank" rel="noreferrer">ソースコード・生成ルールについて</a></div></Dialog>}
+    {dialog === 'help' && <Dialog title="架空日本地図ジェネレーターの使い方" onClose={() => setDialog(null)}><div className="dialog-body help-content"><p>街の成り立ちと地形を選び、「生成」で地図を作成します。</p><p><b>地図を探索</b>ドラッグで移動、ホイールや＋／−で拡大縮小。建物をクリックすると種類や面積を確認できます。キーボードの矢印キーでも移動できます。</p><p><b>等高線と3D</b>地図上部で表示を切り替えます。等高線は保存された標高から描画し、3Dは同じ地形と建物を立体表示します。3Dではドラッグで回転、右ドラッグで移動できます。建物の高さは階数からの仮定で、標高がない旧地図は平面地形で表示します。画像出力は2D地図です。</p><p><b>ピンを追加</b>ピンのツールで場所をクリックし、名前・メモを保存できます。GM用ピンは公開画像から除けます。</p><p><b>画像と設定を保存</b>PNG・SVGで地図全体を書き出せます。設定ファイルには地図の形・シード・表示・ピンを保存し、「レイヤー」から読み込めます。保存済みの地図は再生成せず復元します。旧形式（バージョン1）は設定とピンのみのため、現在のエンジンで生成します。</p><p><b>街の成り立ち</b>成立期から鉄道整備、郊外拡大までの成長過程を、地形・道路への接続・需要に基づく簡略モデルで扱います。一度の生成で建替えや道路・農地の変更を記録し、年代スライダーで保存済みの歴史を表示します。履歴のない旧地図は「街を生成」で履歴を作成できます。現実の人口動態・土地所有・水利・制度を網羅するものではなく、実在都市の再現や都市計画の検証には使えません。</p>{Boolean(map?.unplacedFacilities?.length) && <section className="unplaced-facilities"><h3>成立しなかった施設</h3><dl>{map!.unplacedFacilities!.map((facility, index) => <div key={`${facility.kind}-${index}`}><dt>{FACILITY_NAMES[facility.kind]}</dt><dd>{facility.reason}</dd></div>)}</dl></section>}{map?.terrainSimulation && <TerrainCalculation simulation={map.terrainSimulation} />}<p><b>生成エンジン</b>現行 {GENERATOR_VERSION}。表示中の地図：{map?.generatorVersion ?? '版情報なし'}{map?.year !== undefined ? `、${map.year}年` : ''}。再生成すると現在の規則で作り直し、ピンをリセットします。</p>{Boolean(map?.growthLog?.length) && <p><b>この地図の発展記録</b>{map!.growthLog!.map((stage, index) => <span key={`${stage.phase}-${index}`} style={{ display: 'block' }}>{stage.year !== undefined ? `${stage.year}年 · ` : ''}{({ regional: '街道の成立', oldtown: '旧市街の発展', railway: '鉄道開通と駅前の発展', suburban: '郊外への拡大', industrial: '産業地の発展' } as Record<string, string>)[stage.phase] ?? stage.phase}：道路 {stage.roadsAdded}本{stage.reason ? `（${stage.reason}）` : ''}</span>)}</p>}<a href="https://github.com/Liesegang/machitsumugi" target="_blank" rel="noreferrer">ソースコード・生成ルールについて</a></div></Dialog>}
   </div>
 }
 export default App

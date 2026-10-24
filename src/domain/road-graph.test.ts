@@ -142,4 +142,34 @@ describe('incremental planar road graph', () => {
     expect(graph.add([point(302, 100), point(500, 100)], metadata('far-bank'))).not.toBeNull()
     expect(Number.isFinite(graph.travelTime(point(100, 100), point(500, 100)))).toBe(true)
   })
+
+  it('commits a bridge widening and its new approaches as one dated transaction', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(100, 100), point(140, 100), point(160, 100), point(200, 100)], { ...metadata('old-bridge'), role: 'bridge', bridge: true, width: 4 }, false)
+    graph.add([point(140, 100), point(140, 220)], metadata('old-access'))
+    const projects = [
+      { points: [point(-50, 100), point(80, 100)], metadata: { ...metadata('west'), builtYear: 1955 }, requireConnection: false },
+      { points: [point(80, 100), point(220, 100)], metadata: { ...metadata('old-bridge'), builtYear: 1955, role: 'bridge' as const, bridge: true, width: 8.5, boundaryContinuation: true }, modifies: 'old-bridge' },
+      { points: [point(220, 100), point(350, 100)], metadata: { ...metadata('east'), builtYear: 1955 }, requireConnection: false },
+    ]
+    expect(graph.addBatch(projects)).toHaveLength(3)
+    expect(graph.roads.filter(road => road.bridge)).toHaveLength(1)
+    expect(graph.roads.find(road => road.id === 'old-bridge')!.points).toContainEqual(point(140, 100))
+    expect(graph.roadHistory.filter(v => v.value.id === 'old-bridge').map(v => [v.from, v.to, v.value.width, v.value.modifiedYear])).toEqual([[1700, 1955, 4, undefined], [1955, undefined, 8.5, 1955]])
+    expect(graph.roadHistory.find(v => v.value.id === 'old-bridge' && v.from === 1955)!.value.boundaryContinuation).toBe(true)
+    expect(Number.isFinite(graph.travelTime(point(140, 220), point(-50, 100)))).toBe(true)
+    expect(Number.isFinite(graph.travelTime(point(-50, 100), point(350, 100)))).toBe(true)
+  })
+
+  it('rolls back a staged widening and its archive when a later mandatory approach fails', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(100, 100), point(200, 100)], { ...metadata('old-bridge'), role: 'bridge', bridge: true, width: 4 }, false)
+    const before = structuredClone(graph.roadHistory)
+    expect(graph.addBatch([
+      { points: [point(100, 100), point(200, 100)], metadata: { ...metadata('old-bridge'), builtYear: 1955, width: 8.5 }, modifies: 'old-bridge' },
+      { points: [point(400, 100), point(500, 100)], metadata: metadata('disconnected') },
+    ])).toBeNull()
+    expect(graph.roadHistory).toEqual(before)
+    expect(graph.roads[0]!.width).toBe(4)
+  })
 })

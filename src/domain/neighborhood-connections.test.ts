@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { PlanarRoadGraph } from './road-graph'
 import { RoadPlanner } from './road-planner'
-import { neighborhoodConnections } from './neighborhood-connections'
+import { investInNeighborhood, neighborhoodConnections } from './neighborhood-connections'
+import { surveyNeighborhoodConnections } from './neighborhood-survey'
 
 const a = { x: 200, y: 350 }, b = { x: 400, y: 350 }
 function fixture() {
@@ -38,5 +39,22 @@ describe('neighbourhood connectivity investment', () => {
     const input = fixture()
     const planner = new RoadPlanner({ width: 1200, height: 1200, core: null, areas: [{ id: 'water', kind: 'water', polygon: [{ x: 250, y: 50 }, { x: 350, y: 50 }, { x: 350, y: 800 }, { x: 250, y: 800 }] }] })
     expect([...neighborhoodConnections({ ...input, planner })]).toEqual([])
+  })
+  it('funds a longer connection inside a large inhabited block from a finite resident levy without new-development income', () => {
+    const graph = new PlanarRoadGraph(), a = { x: 200, y: 600 }, b = { x: 1000, y: 600 }
+    graph.add([{ x: 200, y: 100 }, { x: 1000, y: 100 }, { x: 1000, y: 1100 }, { x: 200, y: 1100 }, { x: 200, y: 100 }], { id: 'inherited-block', builtYear: 1700, role: 'lane', kind: 'local', width: 5, phase: 'oldtown', reason: '旧街路', constructionCost: 3000 }, false)
+    const cells = [a, b].map(point => ({ point, households: 350, area: 50000, frontageDepth: 20 }))
+    expect(surveyNeighborhoodConnections({ graph, cells, maximumSpan: 300 }).some(survey => survey.chord > 300)).toBe(false)
+    expect(surveyNeighborhoodConnections({ graph, cells }).some(survey => survey.chord > 700)).toBe(true)
+    const planner = new RoadPlanner({ width: 1300, height: 1300, core: null, areas: [] }), before = graph.travelTime(a, b), developmentFees = 0, capital = 4000
+    let serial = 0
+    const investment = investInNeighborhood({ graph, planner, cells, year: 2020, funds: capital, cache: new Map(), commit: project => !!graph.add(project.route.points, { id: `connection-${serial++}`, builtYear: 2020, role: 'lane', kind: 'local', width: project.width, phase: 'suburban', reason: '既存住民による接続改善', constructionCost: project.route.cost }) })
+    expect(investment.completed).toBeGreaterThan(0)
+    expect(investment.spent).toBeGreaterThan(0)
+    expect(investment.spent).toBeLessThanOrEqual(capital)
+    expect(developmentFees).toBe(0)
+    expect(graph.travelTime(a, b)).toBeLessThan(before)
+    expect(graph.roadHistory.some(version => version.from === 2020)).toBe(true)
+    expect(graph.roads.find(road => road.id === 'inherited-block')!.builtYear).toBe(1700)
   })
 })

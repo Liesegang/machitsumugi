@@ -1,8 +1,9 @@
-import type { Point, Road } from './types'
+import type { Point, Road, TimelineVersion } from './types'
 
 export type RoadRole = 'highway' | 'collector' | 'lane' | 'access' | 'bridge' | 'farm' | 'expressway' | 'ramp'
 export interface SimulatedRoad extends Road { builtYear: number; role: RoadRole; reason: string; bridge?: boolean; phase: string; constructionCost: number }
 export interface RoadMetadata { id: string; builtYear: number; role: RoadRole; reason: string; phase: string; width: number; kind: Road['kind']; constructionCost: number; bridge?: boolean; preserveEndpoint?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean }
+export interface RoadProject { points: Point[]; metadata: RoadMetadata; requireConnection?: boolean; modifies?: string }
 export interface RoadProjection { point: Point; distance: number; road: SimulatedRoad; a: Point; b: Point; t: number }
 /** Generalized modern travel speed in m/min; historical impedance is applied by year. */
 export const roadTravelSpeed = (road: { role?: string; kind?: Road['kind'] }) => road.role === 'expressway' ? 1400 : road.role === 'ramp' ? 350 : road.role === 'highway' || (!road.role && road.kind === 'arterial') ? 450 : road.role === 'collector' ? 330 : road.role === 'farm' ? 100 : 220
@@ -39,6 +40,12 @@ type Segment = { a: Point; b: Point; road: SimulatedRoad }
 /** Mutable planar graph; inserting a junction only subdivides an existing immutable route. */
 export class PlanarRoadGraph {
   readonly roads: SimulatedRoad[] = []
+  private retiredVersions: TimelineVersion<SimulatedRoad>[] = []
+  private versionStart = new Map<string, number>()
+  /** Geometry is detached from mutable junction insertion and later upgrades. */
+  get roadHistory(): TimelineVersion<SimulatedRoad>[] {
+    return [...this.retiredVersions, ...this.roads.map(road => ({ from: this.versionStart.get(road.id) ?? road.builtYear, value: { ...road, points: road.points.map(p => ({ ...p })) } }))]
+  }
   private segments: Segment[] = []
   private buckets = new Map<string, Segment[]>()
   private revision = 0
@@ -209,6 +216,7 @@ export class PlanarRoadGraph {
       if (near) this.insert(near.road, endpoint)
     }
     this.roads.push(road)
+    this.versionStart.set(road.id, metadata.builtYear)
     for (let i = 1; i < normalized.length; i++) {
       const segment = { a: normalized[i - 1]!, b: normalized[i]!, road }
       this.segments.push(segment)
@@ -219,6 +227,8 @@ export class PlanarRoadGraph {
   }
   fork() {
     const staged = new PlanarRoadGraph()
+    staged.retiredVersions = [...this.retiredVersions]
+    staged.versionStart = new Map(this.versionStart)
     staged.roads.push(...this.roads.map(road => ({ ...road, points: road.points.map(p => ({ ...p })) })))
     for (const road of staged.roads) for (let i = 1; i < road.points.length; i++) {
       const segment = { a: road.points[i - 1]!, b: road.points[i]!, road }
@@ -229,17 +239,45 @@ export class PlanarRoadGraph {
   }
   /** Infrastructure with several mandatory accesses is committed atomically.
    * A failed ramp may not leave an inaccessible mainline in the city history. */
-  addBatch(projects: { points: Point[]; metadata: RoadMetadata; requireConnection?: boolean }[]): SimulatedRoad[] | null {
+  addBatch(projects: RoadProject[]): SimulatedRoad[] | null {
     const staged = this.fork()
     const added: SimulatedRoad[] = []
     for (const project of projects) {
-      const road = staged.add(project.points, project.metadata, project.requireConnection ?? true)
+      if (project.modifies && project.metadata.id !== project.modifies) return null
+      const road = project.modifies
+        ? staged.modify(project.modifies, project.metadata.builtYear, { points: project.points, width: project.metadata.width, role: project.metadata.role, kind: project.metadata.kind, phase: project.metadata.phase, reason: project.metadata.reason, constructionCost: project.metadata.constructionCost, ...(project.metadata.boundaryContinuation !== undefined ? { boundaryContinuation: project.metadata.boundaryContinuation } : {}) })
+        : staged.add(project.points, project.metadata, project.requireConnection ?? true)
       if (!road) return null
       added.push(road)
     }
     this.roads.splice(0, this.roads.length, ...staged.roads)
+    this.retiredVersions = staged.retiredVersions; this.versionStart = staged.versionStart
     this.segments = staged.segments; this.buckets = staged.buckets; this.revision++; this.routing = null
     return added
+  }
+  /** A funded modification keeps its identity/opening date and archives its old
+   * cross-section. All existing junctions must remain on the replacement route. */
+  modify(id: string, year: number, change: { points?: Point[]; width: number; role?: RoadRole; kind?: Road['kind']; phase?: string; reason: string; constructionCost: number; boundaryContinuation?: boolean }): SimulatedRoad | null {
+    const previous = this.roads.find(road => road.id === id)
+    if (!previous || year <= (this.versionStart.get(id) ?? previous.builtYear) || !Number.isFinite(change.width) || change.width <= 0 || !Number.isFinite(change.constructionCost) || change.constructionCost < 0) return null
+    const points = (change.points ?? previous.points).map(p => ({ ...p }))
+    if (points.length < 2 || points.some(p => !Number.isFinite(p.x) || !Number.isFinite(p.y))) return null
+    // A relocated section cannot sever a branch or quietly move its junction.
+    const required = previous.points.filter((point, i) => i === 0 || i === previous.points.length - 1 || this.roads.some(road => road !== previous && road.points.some(p => dist(p, point) < .04)))
+    for (const point of required) if (!points.slice(1).some((end, i) => dist(projectOnRoadSegment(point, points[i]!, end).point, point) < .04)) return null
+    for (const point of required) if (!points.some(p => dist(p, point) < .04)) for (let i = 1; i < points.length; i++) if (dist(projectOnRoadSegment(point, points[i - 1]!, points[i]!).point, point) < .04) { points.splice(i, 0, { ...point }); break }
+    this.retiredVersions.push({ from: this.versionStart.get(id) ?? previous.builtYear, to: year, value: { ...previous, points: previous.points.map(p => ({ ...p })) } })
+    this.versionStart.set(id, year)
+    const updated = { ...previous, ...change, points, modifiedYear: year }
+    this.roads[this.roads.indexOf(previous)] = updated
+    this.segments = []; this.buckets.clear()
+    for (const road of this.roads) for (let i = 1; i < road.points.length; i++) {
+      const segment = { a: road.points[i - 1]!, b: road.points[i]!, road }
+      this.segments.push(segment)
+      for (const k of this.keys(segment.a, segment.b)) { const bucket = this.buckets.get(k) ?? []; bucket.push(segment); this.buckets.set(k, bucket) }
+    }
+    this.revision++
+    return updated
   }
   private buildRouting() {
     if (this.routing && this.routingRevision === this.revision) return this.routing

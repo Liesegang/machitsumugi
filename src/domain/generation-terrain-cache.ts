@@ -1,5 +1,6 @@
 import { createTerrainModel } from './terrain'
 import type { TerrainModel, TerrainModelInput } from './terrain'
+import { REGIONAL_PHYSICS_VERSION } from './regional-terrain'
 
 export type GenerationTerrainSource = (input: TerrainModelInput) => TerrainModel
 const pointCopy = <T extends { x: number; y: number }>(point: T): T => ({ ...point })
@@ -24,7 +25,7 @@ export function createGenerationTerrainCache(build: GenerationTerrainSource = cr
   const cache = new Map<string, TerrainModel>()
   return input => {
     const physical: TerrainModelInput = { width: input.width, height: input.height, seed: input.seed, terrain: input.terrain, coastType: input.coastType ?? 'bay', relief: input.relief ?? 'hills', forest: input.forest, type: input.type, settlement: input.settlement ?? 'regional-city' }
-    const key = JSON.stringify(physical), cached = cache.get(key)
+    const key = `${REGIONAL_PHYSICS_VERSION}:${JSON.stringify(physical)}`, cached = cache.get(key)
     if (cached) {
       cache.delete(key); cache.set(key, cached)
       if (input.onTerrainPreview) {

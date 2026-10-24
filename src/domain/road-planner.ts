@@ -6,6 +6,7 @@ import { routeAcrossBridges } from './bridge-routing'
 import { RailwayRoadConstraints } from './railway-road-constraints'
 import type { RailwayCorridor } from './railway-road-constraints'
 import { regionQuery } from './region-query'
+import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 
 export interface PlanningTerrain {
   elevation(point: Point): number
@@ -25,7 +26,9 @@ export interface PlanningTerrain {
 export interface PlanningEnvironment { width: number; height: number; areas: Area[]; core: Point[] | null; terrain?: PlanningTerrain; bridgeSites?: Point[]; landCost?: (point: Point) => number; waterGeometryBounds?: { minX: number; minY: number; maxX: number; maxY: number } }
 export interface SurveyedBridgeSpan { bankA: Point; bankB: Point }
 export interface PlannedRoute { points: Point[]; length: number; cost: number; bridgeLength: number; method: 'direct' | 'heading-search' | 'bridge-project'; boundaryContinuation?: boolean; surveyedBridgeSpans?: SurveyedBridgeSpan[] }
-export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; alignment?: 'natural' | 'planned' }
+export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; alignment?: 'natural' | 'planned'; maximumGrade?: number }
+type PlanningField = { water: boolean; sea: boolean; grade: number; cost: number; coreDistance: number }
+type EarthField = { grade: number; cost: number }
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y)
 const lerp = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
 const turn = (a: number) => Math.atan2(Math.sin(a), Math.cos(a))
@@ -39,8 +42,10 @@ function pointSegmentDistance(p: Point, a: Point, b: Point) { const x = b.x - a.
  * Curvature is chosen during planning, before parcels exist, and is shared by collision and rendering. */
 export class RoadPlanner {
   readonly environment: PlanningEnvironment
-  private cache = new Map<number | string, { water: boolean; sea: boolean; grade: number; cost: number; coreDistance: number }>()
-  private earthCache = new Map<number | string, { grade: number; cost: number }>()
+  private cache: (PlanningField | undefined)[]
+  private earthCache: (EarthField | undefined)[]
+  private outsideCache = new Map<string, PlanningField>()
+  private outsideEarthCache = new Map<string, EarthField>()
   private readonly cacheColumns: number
   private readonly cacheRows: number
   private readonly earthColumns: number
@@ -69,6 +74,10 @@ export class RoadPlanner {
     this.cacheRows = Math.ceil(environment.height / 6) + 3
     this.earthColumns = Math.ceil(environment.width / 24) + 3
     this.earthRows = Math.ceil(environment.height / 24) + 3
+    // Keep the existing first-sample semantics of both survey grids. Only the
+    // storage changes: millions of repeated lookups need no hash table probe.
+    this.cache = new Array(this.cacheColumns * this.cacheRows)
+    this.earthCache = new Array(this.earthColumns * this.earthRows)
     this.waterAreas = environment.areas.filter(a => a.kind === 'water')
     this.seaAreas = this.waterAreas.filter(a => a.id === 'sea' || a.id.startsWith('sea-'))
     this.forests = environment.areas.filter(a => a.kind === 'forest')
@@ -80,27 +89,34 @@ export class RoadPlanner {
   }
   private field(p: Point) {
     const gx = Math.round(p.x / 6), gy = Math.round(p.y / 6)
-    const k = gx >= 0 && gy >= 0 && gx < this.cacheColumns && gy < this.cacheRows ? gy * this.cacheColumns + gx : `${gx},${gy}`
-    let value = this.cache.get(k)
+    const within = gx >= 0 && gy >= 0 && gx < this.cacheColumns && gy < this.cacheRows
+    const k = within ? gy * this.cacheColumns + gx : -1
+    const outsideKey = within ? '' : `${gx},${gy}`
+    let value = within ? this.cache[k] : this.outsideCache.get(outsideKey)
     if (value) return value
     const terrain = this.environment.terrain
     const water = terrain ? terrain.waterAt(p) : this.waterAreas.some(a => occupied(p, a))
     const sea = water && (terrain?.seaAt?.(p) ?? this.seaAreas.some(a => occupied(p, a)))
     const ex = Math.round(p.x / 24), ey = Math.round(p.y / 24)
-    const earthKey = ex >= 0 && ey >= 0 && ex < this.earthColumns && ey < this.earthRows ? ey * this.earthColumns + ex : `${ex},${ey}`
-    let earth = this.earthCache.get(earthKey)
+    const earthWithin = ex >= 0 && ey >= 0 && ex < this.earthColumns && ey < this.earthRows
+    const earthKey = earthWithin ? ey * this.earthColumns + ex : -1
+    const outsideEarthKey = earthWithin ? '' : `${ex},${ey}`
+    let earth = earthWithin ? this.earthCache[earthKey] : this.outsideEarthCache.get(outsideEarthKey)
     if (!earth) {
       const q = { x: ex * 24, y: ey * 24 }, grade = terrain?.slope(q) ?? 0
       const forest = this.forestAt(q)
       earth = { grade, cost: 1 + grade * grade * 95 + Math.max(0, terrain?.elevation(q) ?? 0) / 500 + (forest ? 2.4 : 0) + (terrain?.wetness?.(q) ?? 0) * .55 + (this.environment.landCost?.(q) ?? 0) }
-      this.earthCache.set(earthKey, earth)
+      if (earthWithin) this.earthCache[earthKey] = earth
+      else this.outsideEarthCache.set(outsideEarthKey, earth)
     }
     const grade = earth.grade
     const core = this.environment.core
     const coreDistance = core ? inside(p, core) ? -1 : Math.min(...core.map((a, i) => pointSegmentDistance(p, a, core[(i + 1) % core.length]!))) : Infinity
     // Relative construction cost, not yen or a claim of engineering calibration.
     const cost = earth.cost
-    value = { water, sea, grade, cost, coreDistance }; this.cache.set(k, value)
+    value = { water, sea, grade, cost, coreDistance }
+    if (within) this.cache[k] = value
+    else this.outsideCache.set(outsideKey, value)
     return value
   }
   waterAt(p: Point) { return this.environment.terrain?.waterAt(p) ?? this.waterAreas.some(a => occupied(p, a)) }
@@ -263,10 +279,28 @@ export class RoadPlanner {
     const margin = role === 'expressway' ? 75 : major ? 45 : 14
     return this.validSegment(start, goal, width) || this.sameDryCorridor(start, goal, width + margin, width)
   }
+  /** Longitudinal grade is different from the hillside's cross-slope. Apply an
+   * engineering limit during search, so a steep cheap route does not conceal a
+   * feasible, gentler detour that would survive the final road-profile survey. */
+  private gradeAllowed(path: Point[], maximumGrade: number) {
+    const terrain = this.environment.terrain
+    if (!terrain || maximumGrade === Infinity) return true
+    if (!(maximumGrade > 0) || !Number.isFinite(maximumGrade)) return false
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1]!, b = path[i]!, length = distance(a, b), samples = Math.max(1, Math.ceil(length / 6))
+      let previous = terrain.elevation(a)
+      for (let j = 1; j <= samples; j++) {
+        const next = terrain.elevation(lerp(a, b, j / samples))
+        if (!Number.isFinite(next) || !Number.isFinite(previous) || Math.abs(next - previous) > maximumGrade * length / samples + 1e-8) return false
+        previous = next
+      }
+    }
+    return true
+  }
   private endpointConnector(start: Point, goal: Point, options: PlanningOptions) {
     if (options.startHeading === undefined || options.endHeading === undefined || distance(start, goal) > 850) return null
     const radius = options.role === 'expressway' ? 240 : options.role === 'ramp' ? 60 : options.role === 'highway' ? 85 : options.role === 'collector' ? 50 : 15, direct = distance(start, goal)
-    const maximumGrade = options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity
+    const maximumGrade = options.maximumGrade ?? (options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity)
     const straightCost = this.cost([start, goal], options.role).cost, handles = [.38, .55, .75, 1, .22]
     const proposals = [...handles.map(a => [a, a] as const), ...handles.flatMap(a => handles.filter(b => b !== a).map(b => [a, b] as const))]
     let best: PlannedRoute | null = null
@@ -274,7 +308,7 @@ export class RoadPlanner {
       const points = tangentAlignment(start, goal, options.startHeading, options.endHeading, direct * a, direct * b)
       const diagnostics = alignmentDiagnostics(points)
       if (diagnostics.minimumRadius < radius || diagnostics.length > direct * 2.1 || !this.validate(points, options.width)) continue
-      if (this.environment.terrain && points.some((p, i) => i && Math.abs(this.environment.terrain!.elevation(p) - this.environment.terrain!.elevation(points[i - 1]!)) / (distance(p, points[i - 1]!) || 1) > maximumGrade)) continue
+      if (!this.gradeAllowed(points, maximumGrade)) continue
       const route = this.cost(points, options.role)
       if (route.cost < straightCost * 1.08) return route
       if (!best || route.cost < best.cost) best = route
@@ -287,10 +321,12 @@ export class RoadPlanner {
   private corridor(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
     const major = options.role === 'highway' || options.role === 'collector' || options.role === 'expressway' || options.role === 'ramp'
     const minimumRadius = options.role === 'expressway' ? 240 : options.role === 'ramp' ? 60 : options.role === 'highway' ? 85 : major ? 50 : 15
+    const maximumGrade = options.maximumGrade ?? (options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity)
+    const searchMaximumGrade = options.maximumGrade ?? Infinity
     const leadDistance = Math.min(250, minimumRadius * 2.5, distance(start, goal) * .35)
     const guide = (point: Point, heading: number | undefined, direction: number) => {
       if (heading === undefined) return point
-      for (const scale of [1, .7, .45]) { const p = { x: point.x + Math.cos(heading) * leadDistance * direction * scale, y: point.y + Math.sin(heading) * leadDistance * direction * scale }; if (this.validSegment(point, p, options.width)) return p }
+      for (const scale of [1, .7, .45]) { const p = { x: point.x + Math.cos(heading) * leadDistance * direction * scale, y: point.y + Math.sin(heading) * leadDistance * direction * scale }; if (this.validSegment(point, p, options.width) && this.gradeAllowed([point, p], searchMaximumGrade)) return p }
       return null
     }
     const searchStart = guide(start, options.startHeading, 1), searchGoal = guide(goal, options.endHeading, -1)
@@ -306,11 +342,11 @@ export class RoadPlanner {
     for (let n = 0; queue.size && n < (options.maxNodes ?? width * (Math.ceil(this.environment.height / spacing) + 1)); n++) {
       const current = queue.pop()!.value
       if (current.cost > (values.get(current.index) ?? Infinity)) continue
-      if (distance(current.p, searchGoal) < spacing * 1.6 && this.validSegment(current.p, searchGoal, options.width)) { last = current; break }
+      if (distance(current.p, searchGoal) < spacing * 1.6 && this.validSegment(current.p, searchGoal, options.width) && this.gradeAllowed([current.p, searchGoal], searchMaximumGrade)) { last = current; break }
       const gx = Math.round(current.p.x / spacing), gy = Math.round(current.p.y / spacing)
       for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
         const p = { x: (gx + dx!) * spacing, y: (gy + dy!) * spacing }, k = index(p)
-        if (!this.suitable(p, corridorWidth) || !this.validSegment(current.p, p, corridorWidth)) continue
+        if (!this.suitable(p, corridorWidth) || !this.validSegment(current.p, p, corridorWidth) || !this.gradeAllowed([current.p, p], searchMaximumGrade)) continue
         const cost = current.cost + distance(current.p, p) * this.field(p).cost + (this.railwayConstraints?.edgeCost(current.p, p, options.role) ?? 0) / roadConstructionFactor(options.role)
         if (cost >= (values.get(k) ?? Infinity)) continue
         values.set(k, cost); queue.push({ p, index: k, cost, previous: current }, cost + distance(p, searchGoal) * 1.25)
@@ -350,14 +386,12 @@ export class RoadPlanner {
       const a = controls[i - 1]!, b = controls[i]!, c = controls[i + 1]!, angle = Math.atan2(c.y - a.y, c.x - a.x), midpoint = lerp(a, c, .5)
       const candidates = [b, { x: b.x - Math.sin(angle) * step, y: b.y + Math.cos(angle) * step }, { x: b.x + Math.sin(angle) * step, y: b.y - Math.cos(angle) * step }, lerp(b, midpoint, .28)]
       let best = b, bestEnergy = energy(a, b, c)
-      for (const p of candidates.slice(1)) if (this.suitable(p, corridorWidth) && this.validSegment(a, p, corridorWidth) && this.validSegment(p, c, corridorWidth)) { const e = energy(a, p, c); if (e < bestEnergy) { best = p; bestEnergy = e } }
+      for (const p of candidates.slice(1)) if (this.suitable(p, corridorWidth) && this.validSegment(a, p, corridorWidth) && this.validSegment(p, c, corridorWidth) && this.gradeAllowed([a, p, c], searchMaximumGrade)) { const e = energy(a, p, c); if (e < bestEnergy) { best = p; bestEnergy = e } }
       controls[i] = best
     }
     for (let attempt = 0; attempt < 5; attempt++) {
       const curve = splineAlignment(controls, 5), diagnostics = alignmentDiagnostics(curve)
-      const maximumGrade = options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity
-      const gradeAllowed = !this.environment.terrain || curve.every((p, i) => !i || Math.abs(this.environment.terrain!.elevation(p) - this.environment.terrain!.elevation(curve[i - 1]!)) / (distance(p, curve[i - 1]!) || 1) <= maximumGrade)
-      if (diagnostics.minimumRadius >= minimumRadius && gradeAllowed && this.validate(curve, options.width)) return this.cost(curve, options.role)
+      if (diagnostics.minimumRadius >= minimumRadius && this.gradeAllowed(curve, maximumGrade) && this.validate(curve, options.width)) return this.cost(curve, options.role)
       // Broaden a geographic bend instead of drawing a decorative curve on top
       // of a sharp canonical polyline. End constraints remain exactly pinned.
       for (let i = 1; i < controls.length - 1; i++) if (!pinned(i)) controls[i] = lerp(controls[i]!, lerp(controls[i - 1]!, controls[i + 1]!, .5), .22)
@@ -366,9 +400,12 @@ export class RoadPlanner {
   }
   plan(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
     const route = this.planGeometry(start, goal, options)
+    if (route && options.maximumGrade !== undefined && this.environment.terrain && (!(options.maximumGrade > 0) || !surveyedRoadGradeAllowed(route, options.maximumGrade, p => this.environment.terrain!.elevation(p)))) return null
     return route && Number.isFinite(route.cost) ? route : null
   }
   private planGeometry(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
+    const maximumGrade = options.maximumGrade ?? (options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity)
+    const searchMaximumGrade = options.maximumGrade ?? Infinity
     if (distance(start, goal) < 16 || !this.suitable(start, options.width) || !this.suitable(goal, options.width)) return null
     if (options.through && distance(start, options.through) > 20 && distance(goal, options.through) > 20) {
       const corner = options.through
@@ -378,7 +415,7 @@ export class RoadPlanner {
         const trim = Math.min(40, distance(start, corner) * .32, distance(goal, corner) * .32)
         const entry = lerp(corner, start, trim / distance(start, corner)), exit = lerp(corner, goal, trim / distance(goal, corner))
         const points = splineAlignment([start, entry, corner, exit, goal], 5)
-        if (alignmentDiagnostics(points).minimumRadius > 12 && this.validate(points, options.width)) { const route = this.cost(points, options.role); if (Number.isFinite(route.cost)) return route }
+        if (alignmentDiagnostics(points).minimumRadius > 12 && this.validate(points, options.width) && this.gradeAllowed(points, searchMaximumGrade)) { const route = this.cost(points, options.role); if (Number.isFinite(route.cost)) return route }
       }
       const a = this.plan(start, options.through, { ...options, through: undefined, endHeading: undefined })
       if (!a) return null
@@ -400,7 +437,6 @@ export class RoadPlanner {
         .filter((site, i, all) => !all.slice(0, i).some(other => distance(site, other) < 5))
       const pairs = sites.flatMap(site => {
         const pair = this.banks(site)
-        const maximumGrade = options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity
         const gradeAllowed = pair && (!this.environment.terrain || Math.abs(this.environment.terrain.elevation(pair[1]) - this.environment.terrain.elevation(pair[0])) / distance(pair[0], pair[1]) <= maximumGrade)
         return pair && gradeAllowed && this.validate(pair, options.width, true) ? [{ a: pair[0], b: pair[1] }] : []
       })
@@ -411,7 +447,7 @@ export class RoadPlanner {
         lowerBound: (a, b) => distance(a, b) * roadConstructionFactor(options.role),
         cost: points => this.cost(points, options.role, true),
         dry: (a, b, startHeading, endHeading) => {
-          const key = `${pointKey(a)}>${pointKey(b)}:${options.role}:${options.width}:${startHeading?.toFixed(6)}:${endHeading?.toFixed(6)}:${options.alignment ?? 'natural'}`
+          const key = `${pointKey(a)}>${pointKey(b)}:${options.role}:${options.width}:${startHeading?.toFixed(6)}:${endHeading?.toFixed(6)}:${options.alignment ?? 'natural'}:${options.maximumGrade ?? 'default'}`
           if (this.dryRouteCache.has(key)) return this.dryRouteCache.get(key)!
           const route = this.plan(a, b, { ...options, through: undefined, allowBridge: false, startHeading, endHeading, maxNodes: options.maxNodes ?? 9000 })
           this.dryRouteCache.set(key, route)
@@ -423,7 +459,7 @@ export class RoadPlanner {
     const direct = this.cost([start, goal], options.role)
     const directHeading = Math.atan2(goal.y - start.y, goal.x - start.x)
     const headingCompatible = (options.startHeading === undefined || Math.abs(turn(directHeading - options.startHeading)) < .06) && (options.endHeading === undefined || Math.abs(turn(directHeading - options.endHeading)) < .06)
-    if (Number.isFinite(direct.cost) && (options.alignment === 'planned' || distance(start, goal) < 90) && this.validate([start, goal], options.width) && headingCompatible && (options.alignment === 'planned' || options.role === 'access' || direct.cost / direct.length < 1.55)) {
+    if (Number.isFinite(direct.cost) && (options.alignment === 'planned' || distance(start, goal) < 90) && this.validate([start, goal], options.width) && this.gradeAllowed([start, goal], searchMaximumGrade) && headingCompatible && (options.alignment === 'planned' || options.role === 'access' || direct.cost / direct.length < 1.55)) {
       const n = Math.ceil(direct.length / 12); direct.points = Array.from({ length: n + 1 }, (_, i) => lerp(start, goal, i / n)); direct.method = 'direct'; return direct
     }
     if (['highway', 'collector', 'expressway', 'ramp'].includes(options.role) || distance(start, goal) > 180) {
@@ -448,7 +484,7 @@ export class RoadPlanner {
       const item = queue.pop()!, state = item.value
       if (state.cost > (best.get(state.key) ?? Infinity) + .001) continue
       const d = distance(state.p, goal), direction = Math.atan2(goal.y - state.p.y, goal.x - state.p.x)
-      if (d < step * 1.8 && Math.abs(turn(direction - state.heading * bin)) < .54 && this.validSegment(state.p, goal, options.width)) {
+      if (d < step * 1.8 && Math.abs(turn(direction - state.heading * bin)) < .54 && this.validSegment(state.p, goal, options.width) && this.gradeAllowed([state.p, goal], searchMaximumGrade)) {
         finish = state; const n = Math.max(1, Math.ceil(d / 10)); finalArc = Array.from({ length: n }, (_, i) => lerp(state.p, goal, (i + 1) / n)); break
       }
       for (const delta of [-4, -2, -1, 0, 1, 2, 4]) {
@@ -461,7 +497,7 @@ export class RoadPlanner {
         if (p.x < minX || p.x > maxX || p.y < minY || p.y > maxY || !this.suitable(p, options.width)) continue
         let previous = state.p, allowed = true, routeCost = 0
         for (const q of arc) { if (!this.validSegment(previous, q, options.width)) { allowed = false; break } routeCost += distance(previous, q) * this.field(q).cost + (this.railwayConstraints?.edgeCost(previous, q, options.role) ?? 0) / roadConstructionFactor(options.role); previous = q }
-        if (!allowed) continue
+        if (!allowed || !this.gradeAllowed([state.p, ...arc], searchMaximumGrade)) continue
         const heading = (state.heading + delta + 32) % 32, k = stateKey(p, heading), cost = state.cost + routeCost + 3.5 * delta * delta
         if (cost >= (best.get(k) ?? Infinity)) continue
         best.set(k, cost); queue.push({ p, heading, cost, previous: state, arc, key: k }, cost + distance(p, goal))

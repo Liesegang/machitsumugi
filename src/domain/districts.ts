@@ -1,4 +1,5 @@
 import { union } from 'polygon-clipping'
+import { provisionalPlaceName } from './place-names'
 import type { Area, CityConfig, District, Facility, Parcel, Point, Road, Station } from './types'
 import type { Bounds, PolygonRegion } from './geometry'
 import { boundsOf, distance, intersectRegions, overlaps, pointInPolygon, pointInRegion, polygonArea, projectPoint, rectangle, regionArea, subtractRegions } from './geometry'
@@ -180,13 +181,18 @@ export function buildDistricts(input: DistrictInput): District[] {
     return points.find(point => regions.some(region => pointInRegion(point, region))) ?? center(regions[0]!.polygon)
   }
   const history = spatial(input.parcels.filter(p => p.developedYear).map(parcel => ({ parcel, point: center(parcel.polygon), bounds: boundsOf(parcel.polygon) })))
-  const towns: District[] = compactGroups.map((members, i) => {
+  const usedNames = new Set([input.config.name])
+  const towns: District[] = compactGroups.map(members => {
     const regions = merge(members.flatMap(index => nodes[index]!.regions)), point = anchor(members, regions)
     let foundedYear = Math.min(...members.map(index => nodes[index]!.year))
     for (const region of regions) for (const record of history(boundsOf(region.polygon))) if (record.parcel.createdYear < foundedYear && pointInRegion(record.point, region)) foundedYear = record.parcel.createdYear
     const station = input.stations?.find(station => distance(station.point, point) < 250)
     const facility = input.facilities?.find(facility => distance(facility.point, point) < 160)
-    return { id: `town-${hash(members.map(index => nodes[index]!.id).sort().join('|'))}`, name: `第${i + 1}町`, kind: 'town', regions, point, foundedYear, namingSource: 'provisional', nameOrigin: `${station ? `${station.name}に接続する` : facility ? `${facility.name}に近い` : '接道敷地と'}街区群。最古の敷地記録は${foundedYear}年。` }
+    const id = `town-${hash(members.map(index => nodes[index]!.id).sort().join('|'))}`
+    const direction = point.y < input.height * .35 ? '北' : point.y > input.height * .65 ? '南' : point.x < input.width * .35 ? '西' : point.x > input.width * .65 ? '東' : '中'
+    const name = provisionalPlaceName({ seed: input.config.seed, id, kind: 'town', direction }, usedNames)
+    usedNames.add(name)
+    return { id, name, kind: 'town', regions, point, foundedYear, namingSource: 'provisional', nameOrigin: `仮の町名。${station ? `${station.name}に接続する` : facility ? `${facility.name}に近い` : '接道敷地と'}街区群。最古の敷地記録は${foundedYear}年。` }
   })
   if (input.config.settlement !== 'metropolis' || towns.length < 8) return towns
   const townGraph = towns.map(() => new Set<number>())
@@ -201,7 +207,9 @@ export function buildDistricts(input: DistrictInput): District[] {
       pending.push(...[...townGraph[next]!].filter(index => wardOwner[index] === -1).sort((a, b) => distance(towns[a]!.point, towns[seed]!.point) - distance(towns[b]!.point, towns[seed]!.point)))
     }
     const regions = merge(members.flatMap(i => towns[i]!.regions!)), nodeMembers = members.flatMap(i => compactGroups[i]!)
-    wards.push({ id, name: `第${wards.length + 1}区`, kind: 'ward', regions, point: anchor(nodeMembers, regions), foundedYear: Math.min(...members.map(i => towns[i]!.foundedYear!)), namingSource: 'provisional', nameOrigin: '隣接する町の街路接続をまとめた大都市の上位地域区分。年は区域内で最古の敷地記録。' })
+    const name = provisionalPlaceName({ seed: input.config.seed, id, kind: 'ward' }, usedNames)
+    usedNames.add(name)
+    wards.push({ id, name, kind: 'ward', regions, point: anchor(nodeMembers, regions), foundedYear: Math.min(...members.map(i => towns[i]!.foundedYear!)), namingSource: 'provisional', nameOrigin: '仮の区名。隣接する町の街路接続をまとめた大都市の上位地域区分。年は区域内で最古の敷地記録。' })
   }
   return [...wards, ...towns]
 }

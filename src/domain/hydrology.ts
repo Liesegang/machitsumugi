@@ -1,6 +1,7 @@
 import { transportSediment } from './sediment-transport.ts'
 import { routeLeastTransverse } from './flow-directions.ts'
 import { transportHillslope } from './hillslope-transport.ts'
+import { wasmErodeTerrain, wasmRouteDrainage } from '../compute/wasm-terrain'
 /** DEM conditioning and single-flow drainage. Distances/elevations are metres; area is m². */
 export interface DrainageResult {
   hydroDEM: Float32Array
@@ -14,6 +15,11 @@ export interface DrainageResult {
 
 /** Priority-Flood fills accidental pits; equal-height flats drain using the flood ordering. */
 export function routeDrainage(raw: Float32Array, columns: number, rows: number, cellSize: number, method: 'd8' | 'd8-ltd' = 'd8-ltd'): DrainageResult {
+  return wasmRouteDrainage(raw, columns, rows, cellSize, method) ?? routeDrainageJs(raw, columns, rows, cellSize, method)
+}
+
+/** Unaccelerated reference, also used when WebAssembly cannot initialize. */
+export function routeDrainageJs(raw: Float32Array, columns: number, rows: number, cellSize: number, method: 'd8' | 'd8-ltd' = 'd8-ltd'): DrainageResult {
   const count = columns * rows, hydroDEM = new Float32Array(raw), visited = new Uint8Array(count)
   const heap = new Int32Array(count), rank = new Int32Array(count), floodParent = new Int32Array(count)
   floodParent.fill(-1)
@@ -117,10 +123,15 @@ export interface ErosionDiagnostics {
  * and marine waves, grain sorting and 2-D water momentum are not solved.
  */
 export function erodeTerrain(raw: Float32Array, columns: number, rows: number, cellSize: number, options: number | LandscapeOptions = 32) {
+  return wasmErodeTerrain(raw, columns, rows, cellSize, options) ?? erodeTerrainJs(raw, columns, rows, cellSize, options)
+}
+
+/** Exact JS reference kept available for differential validation and fallback. */
+export function erodeTerrainJs(raw: Float32Array, columns: number, rows: number, cellSize: number, options: number | LandscapeOptions = 32) {
   const settings = typeof options === 'number' ? { passes: options } : options
   const passes = settings.passes ?? 32, dt = settings.timeStepYears ?? 250
   const diffusion = Math.min(.2, (settings.diffusivity ?? .2) * dt / (cellSize * cellSize))
-  let terrain = new Float32Array(raw), drainage = routeDrainage(terrain, columns, rows, cellSize)
+  let terrain = new Float32Array(raw), drainage = routeDrainageJs(terrain, columns, rows, cellSize)
   const initial = new Float32Array(raw)
   const firstFlow = new Int32Array(drainage.flowTo), cumulativeIncision = new Float32Array(raw.length)
   let alluvium = new Float64Array(raw.length)
@@ -174,7 +185,7 @@ export function erodeTerrain(raw: Float32Array, columns: number, rows: number, c
     sediment.hillslopeTransferredVolume += creep.transferredVolume
     let squares = 0
     if (settings.sediment) {
-      const routed = routeDrainage(relaxed, columns, rows, cellSize)
+      const routed = routeDrainageJs(relaxed, columns, rows, cellSize)
       const transported = transportSediment({ elevation: relaxed, hydroElevation: routed.hydroDEM, flowTo: routed.flowTo, order: routed.order, sourceVolume: detached, columns, rows, cellSize, seaLevel })
       for (let i = 0; i < relaxed.length; i++) { relaxed[i] += transported.deposition[i]!; alluvium[i] += transported.deposition[i]! }
       sediment.depositedVolume += transported.depositedVolume
@@ -185,7 +196,7 @@ export function erodeTerrain(raw: Float32Array, columns: number, rows: number, c
     }
     for (let i = 0; i < raw.length; i++) squares += (relaxed[i]! - terrain[i]!) ** 2
     rmsHistory.push(Math.sqrt(squares / raw.length))
-    terrain = relaxed; drainage = routeDrainage(terrain, columns, rows, cellSize)
+    terrain = relaxed; drainage = routeDrainageJs(terrain, columns, rows, cellSize)
     if ((pass + 1) % 4 === 0 || pass + 1 === passes) settings.onStep?.({ elevation: terrain, iteration: pass + 1, iterations: passes, alluvium, seaLevel })
   }
   let squares = 0, absolute = 0, changedCells = 0, reorganized = 0, maxIncision = 0, maxCumulativeIncision = 0, maxRaising = 0
@@ -202,5 +213,7 @@ export function erodeTerrain(raw: Float32Array, columns: number, rows: number, c
   const erosion: ErosionDiagnostics = { iterations: passes, timeStepYears: dt, elapsedYears: passes * dt, erodedVolume, upliftVolume, maxIncision, maxCumulativeIncision, maxRaising, rmsElevationChange: Math.sqrt(squares / raw.length), meanAbsoluteChange: absolute / raw.length, changedCells, finalStepRms: rmsHistory.at(-1) ?? 0, flowReorganization: reorganized / raw.length, rmsHistory, initialTerrainVolume, finalTerrainVolume, diffusionNetVolume, terrainBalanceError }
   sediment.storedVolume = alluvium.reduce((sum, thickness) => sum + thickness * cellSize ** 2, 0)
   sediment.massBalanceError = sediment.erodedSourceVolume - sediment.storedVolume - sediment.exportedVolume
-  return { rawDEM: terrain, initialDEM: initial, alluvium: Float32Array.from(alluvium), sediment, erosion, ...drainage }
+  // Keep the exact mobile-sediment inventory for subsequent physical stages.
+  // The f32 field remains the compact sampling/rendering representation.
+  return { rawDEM: terrain, initialDEM: initial, alluvium: Float32Array.from(alluvium), alluvium64: alluvium, sediment, erosion, ...drainage }
 }

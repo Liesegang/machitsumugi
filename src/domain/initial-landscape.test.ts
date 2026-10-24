@@ -17,9 +17,22 @@ describe('geological relief scenarios', () => {
       expect(high.uplift[i]).toBeCloseTo(hills.uplift[i]! * 4, 8)
     }
   })
-  it('retains the legacy hills default and provides deep offshore accommodation', () => {
+  it('retains the hills default and an open receiving shelf and slope', () => {
     const baseline = initialLandscape(input)
     expect(baseline).toEqual(initialLandscape({ ...input, relief: 'hills' }))
-    for (let x = 0; x < input.columns; x++) expect(baseline.elevation[24 * 25 + x]).toBeLessThan(-1800)
+    for (let x = 0; x < input.columns; x++) expect(baseline.elevation[24 * 25 + x]).toBeLessThan(-200)
+  })
+  it('has a resolved shallow shelf before the outer slope, with narrower ria shelves', () => {
+    const flat = { ...input, columns: 241, resolution: 100, noise: () => .5 }
+    const bay = initialLandscape(flat), ria = initialLandscape({ ...flat, coastType: 'ria' }), delta = initialLandscape({ ...flat, coastType: 'delta' })
+    const z = (field: Float32Array, row: number) => field[row * 241 + 120]!
+    const grade = (field: Float32Array, a: number, b: number) => (z(field, a) - z(field, b)) / ((b - a) * 100)
+    expect(z(bay.elevation, 170)).toBeLessThan(-20)
+    expect(z(bay.elevation, 170)).toBeGreaterThan(-60)
+    expect(grade(bay.elevation, 180, 195)).toBeLessThan(grade(bay.elevation, 225, 235) / 3)
+    expect(z(ria.elevation, 220)).toBeLessThan(z(bay.elevation, 220))
+    expect(z(delta.elevation, 220)).toBeGreaterThan(z(bay.elevation, 220))
+    // Offshore rock does not keep rising at a mountain's continental rate.
+    expect(z(bay.uplift, 210)).toBe(0)
   })
 })

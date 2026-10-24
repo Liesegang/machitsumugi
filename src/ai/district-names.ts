@@ -1,28 +1,14 @@
 import type { CityMap, District } from '../domain/types'
 import { distance, distanceToSegment, pointInRegion } from '../domain/geometry'
+import { placeNameChoices } from '../domain/place-names'
 
 export interface NameProposal { id: string; name: string; reason: string; source?: 'llm' | 'edited' }
 /** Keep identity, spelling and geographical constraints outside the small model. */
 export function districtNameCandidates(map: CityMap, district: District, used: string[] = []): string[] {
   const context = districtNamingContext(map, district)
-  const suffix = district.kind === 'ward' ? '区' : '町'
-  const neutral = ['青葉', '若葉', '常盤', '千草', '小松', '高砂', '日和', '桜木', '松葉', '竹並', '楠木', '春日', '朝日', '明和', '睦', '弥生', '旭', '栄', '美和', '長和', '豊栄', '大和', '光', '早苗']
   const direction = district.point.y < map.height * .35 ? '北' : district.point.y > map.height * .65 ? '南' : district.point.x < map.width * .35 ? '西' : district.point.x > map.width * .65 ? '東' : '中'
-  const stems = [...neutral, ...neutral.map(stem => `${direction}${stem}`), ...neutral.map(stem => `${stem}台`)]
-  if (context.nearWater) stems.push('水辺', '水郷', '水際', '水明', '清水')
-  if (context.lodgings || context.facilities.includes('onsen')) stems.push('湯本', '湯ノ原', '湯端', '湯ノ里', '泉本', '泉中央')
   const unavailable = new Set([map.config.name, ...map.districts.map(d => d.name), ...used])
-  const hash = (value: string) => { let n = 2166136261; for (const c of value) n = Math.imul(n ^ c.charCodeAt(0), 16777619); return n >>> 0 }
-  const available = [...new Set(stems.map(stem => stem + suffix))].filter(name => !unavailable.has(name))
-  // Large regions can have hundreds of towns. Numbered chome are ordinary
-  // Japanese address names and keep the candidate supply from running out.
-  for (let number = 1; available.length < 16; number++) {
-    for (const stem of neutral) {
-      const name = district.kind === 'ward' ? `${stem}第${number}区` : `${stem}${number}丁目`
-      if (!unavailable.has(name)) available.push(name)
-    }
-  }
-  return available.sort((a, b) => hash(`${map.config.seed}:${district.id}:${a}`) - hash(`${map.config.seed}:${district.id}:${b}`)).slice(0, 16)
+  return placeNameChoices({ seed: map.config.seed, id: district.id, kind: district.kind, direction, nearWater: context.nearWater, onsen: !!context.lodgings || context.facilities.includes('onsen') }, unavailable).slice(0, 16)
 }
 export function parseNameSelection(text: string, district: Pick<District, 'id' | 'kind'>, candidates: string[], used: string[], reason: string): NameProposal {
   if (text.length > 2000) throw new Error('命名結果が長すぎます。')

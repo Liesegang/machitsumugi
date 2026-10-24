@@ -4,7 +4,8 @@ import { RoadPlanner } from './road-planner'
 import { RegionalRoadPlanner } from './regional-road-planner'
 import { alignmentDiagnostics } from './road-alignment'
 import { simulateUrbanGrowth } from './urban-growth'
-import { planValleyThroughRoad, valleyBoundaryPortals } from './valley-through-road'
+import { commitValleyThroughRoad, planValleyThroughRoad, valleyBoundaryPortals } from './valley-through-road'
+import { PlanarRoadGraph } from './road-graph'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 
 const width = 1800, height = 1400, origin = { x: 650, y: 650 }
@@ -22,7 +23,9 @@ function fixture(blockDownstream = false, headInside = false, elevatedBridge = f
   const channel = headInside ? [{ x: 900, y: 158 }, ...river.slice(1)] : river
   const area = headInside ? { ...riverArea, polygon: channel.map(p => ({ x: p.x - 22, y: p.y })).concat(channel.slice().reverse().map(p => ({ x: p.x + 22, y: p.y }))) } : riverArea
   const tributary: Area = { id: 'surveyed-tributary', kind: 'water', polygon: [{ x: -500, y: 780 }, { x: width + 500, y: 780 }, { x: width + 500, y: 820 }, { x: -500, y: 820 }] }
-  const waterAt = (p: Point) => inside(p, area.polygon) || (blockDownstream && p.y > height + 80 && p.y < height + 180) || (elevatedBridge && inside(p, tributary.polygon))
+  // The downstream region is isolated on every forward outside edge. A belt
+  // across only the bottom could legitimately be bypassed via a dry side pass.
+  const waterAt = (p: Point) => inside(p, area.polygon) || (blockDownstream && (p.y > height + 80 && p.y < height + 180 || p.y > origin.y && (p.x < -80 || p.x > width + 80))) || (elevatedBridge && inside(p, tributary.polygon))
   const terrain = { elevation: (p: Point) => elevatedBridge ? waterAt(p) ? 0 : 100 : 30, slope: () => 0, waterAt, bridgeSites: elevatedBridge ? [{ x: 650, y: 800 }] : [] as Point[], bridgeCandidates: elevatedBridge ? [{ point: { x: 650, y: 800 }, bankA: { x: 650, y: 700 }, bankB: { x: 650, y: 900 }, width: 40, cost: 40 }] : [], rivers: [{ id: 'river', points: channel }] }
   const model = { ...terrain, continuationTerrain: terrain }
   const areas = elevatedBridge ? [area, tributary] : [area]
@@ -96,5 +99,35 @@ describe('regional through-road in a small mountain settlement', () => {
     expect(surveyedRoadGradeAllowed(project!.route, .10, elevation)).toBe(true)
     expect(project!.sections.some(section => section.bridge)).toBe(true)
     for (const section of project!.sections) expect(regionalPlanner.validate(section.points, project!.width, section.bridge)).toBe(true)
+  })
+  it('rebuilds an inherited narrow bridge once and retains the old local junctions', () => {
+    const { planner, regionalPlanner } = fixture(false, false, true)
+    const project = planValleyThroughRoad({ width, height, origin, river, planner, regionalPlanner })!
+    const graph = new PlanarRoadGraph(), metadata = { builtYear: 1900, phase: 'railway', role: 'access' as const, reason: '駅への旧道', width: 4, kind: 'local' as const, constructionCost: 100 }
+    graph.add([{ x: 650, y: 650 }, { x: 650, y: 780 }], { ...metadata, id: 'north-access' }, false)
+    graph.add([{ x: 650, y: 780 }, { x: 650, y: 820 }], { ...metadata, id: 'old-bridge', role: 'bridge', bridge: true })
+    graph.add([{ x: 650, y: 820 }, { x: 650, y: 950 }], { ...metadata, id: 'south-access' })
+    let id = 0
+    const committed = commitValleyThroughRoad(graph, project, { year: 1955, reason: '近隣地域と市街を結ぶ国道', nextId: () => `highway-${id++}` })
+    expect(committed).not.toBeNull()
+    expect(committed).toHaveLength(project.sections.length)
+    expect(graph.roads.filter(road => road.bridge)).toHaveLength(1)
+    const bridge = graph.roads.find(road => road.id === 'old-bridge')!
+    expect(bridge.width).toBe(8.5)
+    expect(bridge.points).toContainEqual({ x: 650, y: 780 })
+    expect(bridge.points).toContainEqual({ x: 650, y: 820 })
+    expect(graph.roadHistory.filter(v => v.value.id === bridge.id).map(v => [v.from, v.to, v.value.width])).toEqual([[1900, 1955, 4], [1955, undefined, 8.5]])
+    expect(Number.isFinite(graph.travelTime(origin, project.route.points[0]!))).toBe(true)
+    expect(Number.isFinite(graph.travelTime(origin, project.route.points.at(-1)!))).toBe(true)
+  })
+  it('surveys a real dry watershed exit when the source is far inside the map rather than extending the river', () => {
+    const { planner, regionalPlanner } = fixture()
+    const interiorSource = [{ x: 900, y: 700 }, { x: 1050, y: 1000 }, { x: 1050, y: 2000 }], original = structuredClone(interiorSource)
+    expect(valleyBoundaryPortals({ width, height, origin, river: interiorSource, roadWidth: 8.5, planner })[0]).toEqual([])
+    const project = planValleyThroughRoad({ width, height, origin, river: interiorSource, planner, regionalPlanner })
+    expect(project).not.toBeNull()
+    expect(project!.headwaterPass).toBe(true)
+    expect(regionalPlanner.validate(project!.route.points, project!.width, project!.route.bridgeLength > 0)).toBe(true)
+    expect(interiorSource).toEqual(original)
   })
 })

@@ -1,5 +1,11 @@
 import { expect, it } from 'vitest'
 import { terrainContours } from './contours'
+
+it('can show saved seabed depth contours without changing land-only callers', () => {
+  const surface = { columns: 2, rows: 2, cellSize: 100, elevations: [0, -220, 0, -220] }
+  expect(terrainContours(surface)).toEqual([])
+  expect(terrainContours(surface, true).map(line => line.elevation)).toEqual([-200, -100, -50, -20, -10, -5])
+})
 it('interpolates an exact plane and joins the same elevation across cell boundaries', () => {
   const surface = { columns: 5, rows: 4, cellSize: 25, elevations: Array.from({ length: 20 }, (_, i) => i % 5 * 10 + Math.floor(i / 5) * 2) }
   const contours = terrainContours(surface)

@@ -16,6 +16,7 @@ describe('public transport investment', () => {
     const project = transportProjects(input)[0]!
     expect(project).toBeDefined()
     expect(project.width).toBeGreaterThan(5)
+    expect(project.role).toBe('collector')
     expect(project.minutesSaved).toBeGreaterThan(0)
     expect(planner.validate(project.route.points, project.width)).toBe(true)
     expect(project.benefit).toBeGreaterThan(project.route.cost)

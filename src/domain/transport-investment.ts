@@ -4,8 +4,9 @@ import { PlanarRoadGraph, projectOnRoadSegment, roadTravelSpeed } from './road-g
 import { RoadPlanner } from './road-planner'
 import type { PlannedRoute } from './road-planner'
 import type { RoadRole } from './road-graph'
+import { frontageCapacity } from './frontage-supply'
 
-interface MarketSite { point: Point; households: number; capacity: number; landValue: number; roadDistance: number; frontageDepth: number }
+interface MarketSite { point: Point; households: number; capacity: number; servicedCapacity?: number; area?: number; landValue: number; roadDistance: number; frontageDepth: number }
 export interface TransportProject { pair: string; route: PlannedRoute; role: RoadRole; width: number; served: MarketSite[]; benefit: number; trips: number; minutesSaved: number }
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y)
 
@@ -32,7 +33,10 @@ export function transportProjects(input: {
     if (trips < 80) continue
     const first = graph.nearest(a.point, 180), last = graph.nearest(b.point, 180)
     if (!first || !last) continue
-    const role: RoadRole = input.arterial && trips >= 900 ? 'highway' : 'collector', width = role === 'highway' ? 13 : 9.5
+    // This programme links internal markets/stations, so it is a collector
+    // even at high traffic volumes. National through-routes are surveyed by
+    // the separate boundary-to-boundary regional programme.
+    const role: RoadRole = 'collector', width = input.arterial && trips >= 900 ? 13 : 9.5
     let route: PlannedRoute | null = null
     // Start with the market itself, then adjacent existing street sites if its
     // junction has no free approach sector. This also avoids piling five arms
@@ -56,7 +60,11 @@ export function transportProjects(input: {
     const minutesSaved = Math.max(0, graph.travelTime(route.points[0]!, route.points.at(-1)!) - route.length / roadTravelSpeed({ role })) * impedance
     const minX = Math.min(...route.points.map(p => p.x)) - 42, maxX = Math.max(...route.points.map(p => p.x)) + 42, minY = Math.min(...route.points.map(p => p.y)) - 42, maxY = Math.max(...route.points.map(p => p.y)) + 42
     const served = cells.filter(cell => cell.households < cell.capacity && cell.landValue > .025 && cell.roadDistance > cell.frontageDepth && cell.point.x >= minX && cell.point.x <= maxX && cell.point.y >= minY && cell.point.y <= maxY && route!.points.slice(1).some((p, k) => distance(cell.point, projectOnRoadSegment(cell.point, route!.points[k]!, p).point) < cell.frontageDepth))
-    const capacity = served.reduce((sum, cell) => sum + cell.capacity - cell.households, 0)
+    const capacity = served.reduce((sum, cell) => {
+      let nearest = cell.roadDistance
+      for (let i = 1; i < route!.points.length; i++) nearest = Math.min(nearest, distance(cell.point, projectOnRoadSegment(cell.point, route!.points[i - 1]!, route!.points[i]!).point))
+      return sum + Math.max(0, frontageCapacity(cell, nearest) - Math.max(cell.households, cell.servicedCapacity ?? 0))
+    }, 0)
     // 250 trip-days/year, eight discounted years, .02 credit/person-hour.
     // These transparent scenario assumptions give time savings and construction
     // costs a common unit instead of arbitrarily rewarding a colored line.

@@ -18,7 +18,7 @@ export interface CityConfig {
   bypass?: boolean;
 }
 export interface Building { id: string; polygon: Point[]; kind: 'residential' | 'commercial' | 'public' | 'industrial'; height: number; parcelId?: string; builtYear?: number; occupancy?: 'occupied' | 'vacant' | 'underused'; occupiedHouseholds?: number; use?: 'lodging'; lodgingType?: 'ryokan' | 'hotel'; guestRooms?: number; name?: string }
-export interface Road { id: string; points: Point[]; kind: 'arterial' | 'local'; width: number; builtYear?: number; role?: 'highway' | 'collector' | 'lane' | 'access' | 'bridge' | 'farm' | 'expressway' | 'ramp'; reason?: string; bridge?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean }
+export interface Road { id: string; points: Point[]; kind: 'arterial' | 'local'; width: number; builtYear?: number; modifiedYear?: number; role?: 'highway' | 'collector' | 'lane' | 'access' | 'bridge' | 'farm' | 'expressway' | 'ramp'; reason?: string; bridge?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean }
 export interface Area { id: string; polygon: Point[]; holes?: Point[][]; kind: 'water' | 'forest' | 'park' | 'field'; name?: string; waterLevel?: number; landUse?: 'farmland' | 'paddy' | 'dry-field' | 'meadow' | 'wetland' | 'vacant' }
 export interface Railway { id: string; points: Point[]; name: string; elevations?: number[]; structures?: { kind: 'bridge' | 'cutting' | 'embankment'; from: Point; to: Point; maxHeight: number; length?: number }[]; junction?: { parentId: string; point: Point }; builtYear?: number }
 export interface Station { id: string; point: Point; name: string }
@@ -27,12 +27,24 @@ export interface District { id: string; point: Point; name: string; kind?: 'town
 export interface Parcel { id: string; polygon: Point[]; entrance: Point; access?: Point[]; roadId: string; createdYear: number; developedYear?: number; retiredYear?: number; use: 'residential' | 'commercial' | 'industrial' }
 export interface GrowthEvent { id: string; year: number; kind: 'road' | 'construction' | 'acquisition' | 'railway'; entityId: string; reason: string }
 export interface SimulationSnapshot { year: number; households: number; capacity: number; vacant: number; unmet: number; roads: number; buildings: number }
+/** Actual versions are valid on [from,to); geometry is stored only when it changes. */
+export interface TimelineVersion<T> { from: number; to?: number; value: T }
+export interface BuildingState { id: string; from: number; occupancy?: Building['occupancy']; occupiedHouseholds?: number }
+export interface CityTimeline {
+  version: 1; fromYear: number; throughYear: number
+  roads: TimelineVersion<Road>[]; buildings: TimelineVersion<Building>[]; areas: TimelineVersion<Area>[]
+  railways: TimelineVersion<Railway>[]; stations: TimelineVersion<Station>[]; facilities: TimelineVersion<Facility>[]
+  districts: TimelineVersion<District>[]; parcels: TimelineVersion<Parcel>[]
+  buildingStates: BuildingState[]; terrainSurfaces: TimelineVersion<TerrainSurface>[]
+  events?: GrowthEvent[]; snapshots?: SimulationSnapshot[]; growthLog?: CityMap['growthLog']
+}
 export interface CityMap {
   width: number; height: number; config: CityConfig; buildings: Building[]; roads: Road[]; areas: Area[];
   railways: Railway[]; stations: Station[]; facilities: Facility[]; districts: District[]; description: string;
-  growthLog?: { phase: string; roadsAdded: number; year?: number; reason?: string }[];
+  growthLog?: { phase: string; roadsAdded: number; year?: number; reason?: string; households?: number; unmetHouseholds?: number; constructionCost?: number }[];
   generatorVersion?: string;
   year?: number;
+  timeline?: CityTimeline;
   parcels?: Parcel[];
   events?: GrowthEvent[];
   snapshots?: SimulationSnapshot[];

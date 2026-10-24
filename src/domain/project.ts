@@ -1,4 +1,6 @@
-import type { CityConfig, CityMap, Point } from './types'
+import type { CityConfig, CityMap, Point, TerrainSurface, TimelineVersion } from './types'
+import { sliceCityAtYear } from './timeline'
+import { readableProvisionalNames } from './place-names'
 import type { Annotation, LayerSettings, MapStyle } from '../map/render'
 
 export interface Project {
@@ -129,12 +131,10 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     })
   }
   const year = (value: unknown, label: string) => number(value, label, -10_000, 10_000, true)
-  const map: CityMap = {
-    width, height, config: snapshotConfig,
-    description: string(input.description, '地図の説明', 5000, true),
-    roads: entities(input.roads, '道路', PROJECT_GEOMETRY_LIMITS.roads, (r, id) => ({
+  const readRoad = (r: Record<string, unknown>, id: string) => ({
       id, points: points(r.points, '道路の形', false), kind: choice(r.kind, ['arterial', 'local'] as const, '道路の種類'), width: number(r.width, '道路の幅', .1, 200),
       ...(r.builtYear === undefined ? {} : { builtYear: year(r.builtYear, '道路の建設年') }),
+      ...(r.modifiedYear === undefined ? {} : { modifiedYear: year(r.modifiedYear, '道路の改修年') }),
       ...(r.role === undefined ? {} : { role: choice(r.role, ['highway', 'collector', 'lane', 'access', 'bridge', 'farm', 'expressway', 'ramp'] as const, '道路の役割') }),
       ...(r.level === undefined ? {} : { level: number(r.level, '道路の階層', -10, 10, true) }),
       ...(r.controlledAccess === undefined ? {} : { controlledAccess: boolean(r.controlledAccess, '沿道からの進入制限') }),
@@ -143,8 +143,8 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       ...(r.bridge === undefined ? {} : { bridge: boolean(r.bridge, '橋の指定') }),
       ...(r.phase === undefined ? {} : { phase: string(r.phase, '道路の成立段階', 128) }),
       ...(r.constructionCost === undefined ? {} : { constructionCost: number(r.constructionCost, '道路の建設費', 0, 1e15) }),
-    })),
-    buildings: entities(input.buildings, '建物', PROJECT_GEOMETRY_LIMITS.buildings, (b, id) => ({
+    })
+  const readBuilding = (b: Record<string, unknown>, id: string) => ({
       id, polygon: points(b.polygon, '建物の形', true), kind: choice(b.kind, ['residential', 'commercial', 'public', 'industrial'] as const, '建物の種類'), height: number(b.height, '建物の階数', 1, 250, true),
       ...(b.parcelId === undefined ? {} : { parcelId: string(b.parcelId, '建物の敷地ID', 128) }),
       ...(b.builtYear === undefined ? {} : { builtYear: year(b.builtYear, '建物の建築年') }),
@@ -154,15 +154,15 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       ...(b.lodgingType === undefined ? {} : { lodgingType: choice(b.lodgingType, ['ryokan', 'hotel'] as const, '宿泊施設の種類') }),
       ...(b.guestRooms === undefined ? {} : { guestRooms: number(b.guestRooms, '客室数', 1, 10_000, true) }),
       ...(b.name === undefined ? {} : { name: string(b.name, '建物の名前', 200) }),
-    })),
-    areas: entities(input.areas, '土地', PROJECT_GEOMETRY_LIMITS.areas, (a, id) => ({
+    })
+  const readArea = (a: Record<string, unknown>, id: string) => ({
       id, polygon: points(a.polygon, '土地の形', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints), kind: choice(a.kind, ['water', 'forest', 'park', 'field'] as const, '土地の種類'),
       ...(a.name === undefined ? {} : { name: string(a.name, '土地の名前', 200, true) }),
       ...(a.waterLevel === undefined ? {} : { waterLevel: number(a.waterLevel, '水平水面の標高', -10_000, 10_000) }),
       ...(a.landUse === undefined ? {} : { landUse: choice(a.landUse, ['farmland', 'paddy', 'dry-field', 'meadow', 'wetland', 'vacant'] as const, '土地の用途') }),
       ...(a.holes === undefined ? {} : { holes: array(a.holes, '土地の内周', 10_000).map(hole => points(hole, '土地の内周の形', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints)) }),
-    })),
-    railways: entities(input.railways, '線路', 100, (r, id) => {
+    })
+  const readRailway = (r: Record<string, unknown>, id: string) => {
       const path = points(r.points, '線路の形', false)
       const elevations = r.elevations === undefined ? undefined : array(r.elevations, '線路の標高', 20_000).map(value => number(value, '線路の標高', -10_000, 10_000))
       if (elevations && elevations.length !== path.length) throw new Error('線路の形と標高の件数が一致しません。')
@@ -172,10 +172,10 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       })
       const junction = r.junction === undefined ? undefined : object(r.junction, '鉄道の分岐')
       return { id, points: path, name: string(r.name, '路線名', 200), ...(elevations ? { elevations } : {}), ...(structures ? { structures } : {}), ...(junction ? { junction: { parentId: string(junction.parentId, '分岐元の路線', 128), point: point(junction.point, '分岐点') } } : {}), ...(r.builtYear === undefined ? {} : { builtYear: year(r.builtYear, '鉄道開通年') }) }
-    }),
-    stations: entities(input.stations, '駅', 100, (s, id) => ({ id, point: point(s.point, '駅の位置'), name: string(s.name, '駅名', 200) })),
-    facilities: entities(input.facilities, '施設', 2000, (f, id) => ({ id, point: point(f.point, '施設の位置'), name: string(f.name, '施設名', 200), kind: choice(f.kind, FACILITIES, '施設の種類') })),
-    districts: entities(input.districts, '地区', 2000, (d, id) => ({
+    }
+  const readStation = (s: Record<string, unknown>, id: string) => ({ id, point: point(s.point, '駅の位置'), name: string(s.name, '駅名', 200) })
+  const readFacility = (f: Record<string, unknown>, id: string) => ({ id, point: point(f.point, '施設の位置'), name: string(f.name, '施設名', 200), kind: choice(f.kind, FACILITIES, '施設の種類') })
+  const readDistrict = (d: Record<string, unknown>, id: string) => ({
       id, point: point(d.point, '地区の位置'), name: string(d.name, '地区名', 200),
       ...(d.kind === undefined ? {} : { kind: choice(d.kind, ['town', 'ward'] as const, '区域の種類') }),
       ...(d.parentId === undefined ? {} : { parentId: string(d.parentId, '所属区域', 128) }),
@@ -186,7 +186,34 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
         const region = object(item, '地区の区域')
         return { polygon: points(region.polygon, '区域境界', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints), ...(region.holes === undefined ? {} : { holes: array(region.holes, '区域の穴', 1000).map(hole => points(hole, '区域の穴の境界', true, PROJECT_GEOMETRY_LIMITS.areaRingPoints)) }) }
       }) }),
-    })),
+    })
+
+  const readParcel = (p: Record<string, unknown>, id: string) => {
+    const createdYear = year(p.createdYear, '敷地の成立年'), developedYear = p.developedYear === undefined ? undefined : year(p.developedYear, '敷地の開発年'), retiredYear = p.retiredYear === undefined ? undefined : year(p.retiredYear, '敷地の廃止年')
+    if (developedYear !== undefined && developedYear < createdYear) throw new Error('敷地の開発年が成立年より前になっています。')
+    if (retiredYear !== undefined && retiredYear < createdYear) throw new Error('敷地の廃止年が成立年より前になっています。')
+    return { id, polygon: points(p.polygon, '敷地の形', true), entrance: point(p.entrance, '敷地の入口'), ...(p.access === undefined ? {} : { access: points(p.access, '敷地の通路', false) }), roadId: string(p.roadId, '接道先のID', 128), createdYear, ...(developedYear === undefined ? {} : { developedYear }), ...(retiredYear === undefined ? {} : { retiredYear }), use: choice(p.use, ['residential', 'commercial', 'industrial'] as const, '敷地の用途') }
+  }
+  const readEvent = (e: Record<string, unknown>, id: string) => ({ id, year: year(e.year, '履歴の年'), kind: choice(e.kind, ['road', 'construction', 'acquisition', 'railway'] as const, '履歴の種類'), entityId: string(e.entityId, '履歴の対象ID', 128), reason: string(e.reason, '履歴の理由', 2000, true) })
+  const readSurface = (value: unknown): TerrainSurface => {
+    const surface = object(value, '地形の標高')
+    const columns = number(surface.columns, '標高の列数', 2, 2001, true), rows = number(surface.rows, '標高の行数', 2, 2001, true)
+    if (columns * rows > 400_000) throw new Error('標高データが大きすぎます。')
+    const cellSize = number(surface.cellSize, '標高の間隔', 1, 1000)
+    const elevations = array(surface.elevations, '標高データ', 400_000).map(z => number(z, '地盤標高', -10_000, 10_000))
+    if (elevations.length !== columns * rows || Math.abs((columns - 1) * cellSize - width) > cellSize || Math.abs((rows - 1) * cellSize - height) > cellSize) throw new Error('標高データと地図の範囲が一致しません。')
+    return { columns, rows, cellSize, elevations }
+  }
+  const map: CityMap = {
+    width, height, config: snapshotConfig,
+    description: string(input.description, '地図の説明', 5000, true),
+    roads: entities(input.roads, '道路', PROJECT_GEOMETRY_LIMITS.roads, readRoad),
+    buildings: entities(input.buildings, '建物', PROJECT_GEOMETRY_LIMITS.buildings, readBuilding),
+    areas: entities(input.areas, '土地', PROJECT_GEOMETRY_LIMITS.areas, readArea),
+    railways: entities(input.railways, '線路', 100, readRailway),
+    stations: entities(input.stations, '駅', 100, readStation),
+    facilities: entities(input.facilities, '施設', 2000, readFacility),
+    districts: entities(input.districts, '地区', 2000, readDistrict),
   }
   if (input.generatorVersion !== undefined) map.generatorVersion = string(input.generatorVersion, '生成エンジンの版', 128)
   if (input.unplacedFacilities !== undefined) map.unplacedFacilities = array(input.unplacedFacilities, '未成立の施設', 20).map(item => { const value = object(item, '未成立の施設'); return { kind: choice(value.kind, FACILITIES, '未成立施設の種類'), reason: string(value.reason, '未成立の理由', 2000) } })
@@ -198,15 +225,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       localExcavationVolume: number(s.localExcavationVolume, '局所河床の掘削体積', 0, 1e18), localDepositionVolume: number(s.localDepositionVolume, '局所河床の堆積体積', 0, 1e18), localExportedVolume: number(s.localExportedVolume, '局所河床の土砂排出', 0, 1e18), localBalanceError: number(s.localBalanceError, '局所河床の収支誤差', -1e18, 1e18),
     }
   }
-  if (input.terrainSurface !== undefined) {
-    const surface = object(input.terrainSurface, '地形の標高')
-    const columns = number(surface.columns, '標高の列数', 2, 2001, true), rows = number(surface.rows, '標高の行数', 2, 2001, true)
-    if (columns * rows > 400_000) throw new Error('標高データが大きすぎます。')
-    const cellSize = number(surface.cellSize, '標高の間隔', 1, 1000)
-    const elevations = array(surface.elevations, '標高データ', 400_000).map(z => number(z, '地盤標高', -10_000, 10_000))
-    if (elevations.length !== columns * rows || Math.abs((columns - 1) * cellSize - width) > cellSize || Math.abs((rows - 1) * cellSize - height) > cellSize) throw new Error('標高データと地図の範囲が一致しません。')
-    map.terrainSurface = { columns, rows, cellSize, elevations }
-  }
+  if (input.terrainSurface !== undefined) map.terrainSurface = readSurface(input.terrainSurface)
   if (input.regionalContext !== undefined) {
     const context = object(input.regionalContext, '広域地形'), surface = object(context.surface, '広域の標高')
     const extent = number(context.extent, '広域地形の範囲', 1000, 500_000)
@@ -231,23 +250,74 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       ...(log.constructionCost === undefined ? {} : { constructionCost: number(log.constructionCost, '発展記録の建設費', 0, 1e15) }),
     }
   })
-  if (input.parcels !== undefined) map.parcels = entities(input.parcels, '敷地', PROJECT_GEOMETRY_LIMITS.parcels, (p, id) => {
-    const createdYear = year(p.createdYear, '敷地の成立年'), developedYear = p.developedYear === undefined ? undefined : year(p.developedYear, '敷地の開発年'), retiredYear = p.retiredYear === undefined ? undefined : year(p.retiredYear, '敷地の廃止年')
-    if (developedYear !== undefined && developedYear < createdYear) throw new Error('敷地の開発年が成立年より前になっています。')
-    if (retiredYear !== undefined && retiredYear < createdYear) throw new Error('敷地の廃止年が成立年より前になっています。')
-    return { id, polygon: points(p.polygon, '敷地の形', true), entrance: point(p.entrance, '敷地の入口'), ...(p.access === undefined ? {} : { access: points(p.access, '敷地の通路', false) }), roadId: string(p.roadId, '接道先のID', 128), createdYear, ...(developedYear === undefined ? {} : { developedYear }), ...(retiredYear === undefined ? {} : { retiredYear }), use: choice(p.use, ['residential', 'commercial', 'industrial'] as const, '敷地の用途') }
-  })
-  if (input.events !== undefined) map.events = entities(input.events, '都市の履歴', PROJECT_GEOMETRY_LIMITS.events, (e, id) => ({ id, year: year(e.year, '履歴の年'), kind: choice(e.kind, ['road', 'construction', 'acquisition', 'railway'] as const, '履歴の種類'), entityId: string(e.entityId, '履歴の対象ID', 128), reason: string(e.reason, '履歴の理由', 2000, true) }))
+  if (input.parcels !== undefined) map.parcels = entities(input.parcels, '敷地', PROJECT_GEOMETRY_LIMITS.parcels, readParcel)
+  if (input.events !== undefined) map.events = entities(input.events, '都市の履歴', PROJECT_GEOMETRY_LIMITS.events, readEvent)
   if (input.snapshots !== undefined) map.snapshots = array(input.snapshots, '人口と開発の記録', 1000).map(item => {
     const s = object(item, '人口と開発の記録'), count = (key: string) => number(s[key], `記録「${key}」`, 0, 100_000_000, true)
     return { year: year(s.year, '記録の年'), households: count('households'), capacity: count('capacity'), vacant: count('vacant'), unmet: count('unmet'), roads: count('roads'), buildings: count('buildings') }
   })
+  if (input.timeline !== undefined) {
+    const archive = object(input.timeline, '年代履歴')
+    if (archive.version !== 1) throw new Error('年代履歴の形式に対応していません。')
+    const fromYear = number(archive.fromYear, '履歴の開始年', 1650, 2025, true), throughYear = number(archive.throughYear, '履歴の最終年', fromYear, 2025, true)
+    function versions<T>(value: unknown, label: string, limit: number, read: (input: Record<string, unknown>, id: string) => T): TimelineVersion<T>[] {
+      const intervals = new Map<string, { from: number; to: number }[]>()
+      const records = array(value, label, limit).map(item => {
+        const version = object(item, label), from = number(version.from, '有効開始年', fromYear, throughYear, true)
+        const to = version.to === undefined ? undefined : number(version.to, '有効終了年', from + 1, throughYear + 1, true)
+        const entity = object(version.value, label), id = string(entity.id, '履歴の対象ID', 128)
+        for (const inception of ['builtYear', 'createdYear', 'foundedYear']) if (entity[inception] !== undefined && year(entity[inception], '成立年') > from) throw new Error(`${label}の有効開始年が成立年より前です。`)
+        const ranges = intervals.get(id) ?? []; ranges.push({ from, to: to ?? throughYear + 1 }); intervals.set(id, ranges)
+        return { from, ...(to === undefined ? {} : { to }), value: entities([entity], label, 1, read)[0]! }
+      })
+      for (const ranges of intervals.values()) {
+        ranges.sort((a, b) => a.from - b.from)
+        if (ranges.some((range, i) => i > 0 && ranges[i - 1]!.to > range.from)) throw new Error(`${label}の有効期間が重複しています。`)
+      }
+      return records
+    }
+    const roads = versions(archive.roads, '道路履歴', PROJECT_GEOMETRY_LIMITS.roads, readRoad)
+    const buildings = versions(archive.buildings, '建物履歴', PROJECT_GEOMETRY_LIMITS.buildings, readBuilding)
+    const parcels = versions(archive.parcels, '敷地履歴', PROJECT_GEOMETRY_LIMITS.parcels, readParcel)
+    const buildingIds = new Set(buildings.map(v => v.value.id)), roadIds = new Set(roads.map(v => v.value.id)), parcelIds = new Set(parcels.map(v => v.value.id))
+    if (parcels.some(v => !roadIds.has(v.value.roadId)) || buildings.some(v => v.value.parcelId !== undefined && !parcelIds.has(v.value.parcelId))) throw new Error('年代履歴の敷地・接道の参照先がありません。')
+    const buildingIntervals = new Map<string, TimelineVersion<(typeof buildings)[number]['value']>[]>()
+    for (const version of buildings) { const records = buildingIntervals.get(version.value.id) ?? []; records.push(version); buildingIntervals.set(version.value.id, records) }
+    const states = new Set<string>()
+    const buildingStates = array(archive.buildingStates, '利用状況履歴', PROJECT_GEOMETRY_LIMITS.events).map(item => {
+      if (++entityCount > PROJECT_GEOMETRY_LIMITS.entities) throw new Error('保存済み地図の要素数が上限を超えています。')
+      const state = object(item, '利用状況履歴'), id = string(state.id, '建物履歴ID', 128), from = number(state.from, '利用状況の年', fromYear, throughYear, true), key = `${id}:${from}`
+      if (!buildingIds.has(id) || !buildingIntervals.get(id)?.some(version => version.from <= from && (version.to === undefined || from < version.to)) || states.has(key)) throw new Error('利用状況履歴の参照先または年代が正しくありません。')
+      states.add(key)
+      return { id, from, ...(state.occupancy === undefined ? {} : { occupancy: choice(state.occupancy, ['occupied', 'vacant', 'underused'] as const, '建物の利用状況') }), ...(state.occupiedHouseholds === undefined ? {} : { occupiedHouseholds: number(state.occupiedHouseholds, '入居世帯数', 0, 100_000, true) }) }
+    })
+    let elevationCount = 0
+    const terrainSurfaces = array(archive.terrainSurfaces, '標高履歴', 4).map(item => {
+      const version = object(item, '標高履歴'), from = number(version.from, '標高の有効開始年', fromYear, throughYear, true), to = version.to === undefined ? undefined : number(version.to, '標高の有効終了年', from + 1, throughYear + 1, true)
+      const value = readSurface(version.value); elevationCount += value.elevations.length
+      if (elevationCount > 800_000) throw new Error('標高履歴が大きすぎます。')
+      return { from, ...(to === undefined ? {} : { to }), value }
+    }).sort((a, b) => a.from - b.from)
+    if (terrainSurfaces.some((v, i) => i > 0 && (terrainSurfaces[i - 1]!.to ?? throughYear + 1) > v.from)) throw new Error('標高履歴の有効期間が重複しています。')
+    const readSnapshot = (value: unknown) => { const s = object(value, '人口記録'), count = (key: string) => number(s[key], `記録${key}`, 0, 100_000_000, true); return { year: number(s.year, '記録の年', fromYear, throughYear, true), households: count('households'), capacity: count('capacity'), vacant: count('vacant'), unmet: count('unmet'), roads: count('roads'), buildings: count('buildings') } }
+    map.timeline = { version: 1, fromYear, throughYear, roads, buildings, parcels, buildingStates, terrainSurfaces,
+      areas: versions(archive.areas, '土地履歴', PROJECT_GEOMETRY_LIMITS.areas, readArea),
+      railways: versions(archive.railways, '線路履歴', 300, readRailway), stations: versions(archive.stations, '駅履歴', 300, readStation),
+      facilities: versions(archive.facilities, '施設履歴', 6000, readFacility), districts: versions(archive.districts, '地区履歴', 10_000, readDistrict),
+      events: archive.events === undefined ? [] : entities(archive.events, '都市履歴', PROJECT_GEOMETRY_LIMITS.events, readEvent),
+      snapshots: archive.snapshots === undefined ? [] : array(archive.snapshots, '人口履歴', 1000).map(readSnapshot),
+      growthLog: archive.growthLog === undefined ? [] : array(archive.growthLog, '発展履歴', 1000).map(item => { const log = object(item, '発展履歴'); return { phase: string(log.phase, '段階', 128), roadsAdded: number(log.roadsAdded, '道路数', 0, PROJECT_GEOMETRY_LIMITS.roads, true), ...(log.year === undefined ? {} : { year: number(log.year, '発展年', fromYear, throughYear, true) }), ...(log.reason === undefined ? {} : { reason: string(log.reason, '発展理由', 2000, true) }), ...(log.households === undefined ? {} : { households: number(log.households, '発展世帯数', 0, 100_000_000, true) }), ...(log.unmetHouseholds === undefined ? {} : { unmetHouseholds: number(log.unmetHouseholds, '未充足世帯数', 0, 100_000_000, true) }), ...(log.constructionCost === undefined ? {} : { constructionCost: number(log.constructionCost, '発展建設費', 0, 1e15) }) } }),
+    }
+    const selectedYear = map.year ?? config.targetYear ?? throughYear
+    if (selectedYear < fromYear || selectedYear > throughYear) throw new Error('表示年代が保存済み履歴の範囲外です。')
+    return readableProvisionalNames(sliceCityAtYear(map, selectedYear))
+  }
   if (map.parcels) {
     const roadIds = new Set(map.roads.map(r => r.id)), parcelIds = new Set(map.parcels.map(p => p.id))
     if (map.parcels.some(p => !roadIds.has(p.roadId))) throw new Error('敷地の接道先が保存済み地図にありません。')
     if (map.buildings.some(b => b.parcelId !== undefined && !parcelIds.has(b.parcelId))) throw new Error('建物の敷地が保存済み地図にありません。')
   }
-  return map
+  return readableProvisionalNames(map)
 }
 
 /** Reconstruct known fields, migrating v1 settings while retaining v2 geometry. */
@@ -287,13 +357,13 @@ export function loadProject(): Project | null {
 
 export function persistProject(project: Project): boolean {
   try {
-    return persistValidatedLocal(validateProject(project))
+    return persistValidatedLocal(validateProject(portableProject(project)))
   } catch { return false }
 }
 
 function persistValidatedLocal(project: Project): boolean {
   try {
-    const text = JSON.stringify(project)
+    const text = JSON.stringify(portableProject(project))
     // Keep a small-map/legacy fallback; large complete maps live in IndexedDB.
     if (text.length > MAX_LOCAL_STORAGE_LENGTH) return false
     globalThis.localStorage.setItem(STORAGE_KEY, text)
@@ -342,7 +412,7 @@ async function writeArchive(project: Project): Promise<boolean> {
     return await new Promise<boolean>(resolve => {
       try {
         const tx = db.transaction(ARCHIVE_STORE, 'readwrite')
-        tx.objectStore(ARCHIVE_STORE).put(project, 'current')
+        tx.objectStore(ARCHIVE_STORE).put(portableProject(project), 'current')
         // Only a committed transaction counts as saved. An abort retains the prior map.
         tx.oncomplete = () => { db.close(); resolve(true) }
         tx.onabort = tx.onerror = () => { db.close(); resolve(false) }
@@ -363,7 +433,7 @@ export async function loadProjectArchive(): Promise<Project | null> {
 /** Serialize archive transactions so an older async save cannot overtake a later map. */
 export async function persistProjectArchive(project: Project): Promise<boolean> {
   let validated: Project
-  try { validated = validateProject(project); if (!validated.snapshot) return false } catch { return false }
+  try { validated = validateProject(portableProject(project)); if (!validated.snapshot) return false } catch { return false }
   // IndexedDB already clones the value. Stringifying a large complete map merely
   // to discover that it cannot fit localStorage doubled autosave work and memory.
   // The legacy/small-map fallback is only needed if the primary archive fails.
@@ -373,8 +443,15 @@ export async function persistProjectArchive(project: Project): Promise<boolean> 
   return pending
 }
 
+/** The archive already owns every geometry version. Do not serialize a second
+ * copy of the selected frame (or a full map for each five-year date). */
+export function portableProject(project: Project): Project {
+  const snapshot = project.snapshot
+  return snapshot?.timeline ? { ...project, snapshot: { ...snapshot, roads: [], buildings: [], areas: [], railways: [], stations: [], facilities: [], districts: [], parcels: undefined, blocks: undefined, terrainSurface: undefined, events: undefined, snapshots: undefined, growthLog: undefined } } : project
+}
+
 export function downloadProject(project: Project): void {
-  const validated = validateProject(project), text = JSON.stringify(validated)
+  const validated = validateProject(portableProject(project)), text = JSON.stringify(portableProject(validated))
   if (text.length > MAX_PROJECT_JSON_LENGTH) throw new Error('保存できるプロジェクトの大きさを超えています。')
   const blob = new Blob([text], { type: 'application/json;charset=utf-8' })
   if (blob.size > MAX_PROJECT_FILE_BYTES) throw new Error('保存できるプロジェクトの大きさを超えています。')

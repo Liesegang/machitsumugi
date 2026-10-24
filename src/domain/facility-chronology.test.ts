@@ -12,12 +12,12 @@ vi.mock('./urban-growth', async importOriginal => {
   const original = await importOriginal<typeof import('./urban-growth')>()
   return { ...original, simulateUrbanGrowth: (input: UrbanGrowthInput) => {
     if (fixture.parks) for (const year of [1955, 1960]) if (year <= (input.untilYear ?? 2025)) input.onCivicPopulation?.(year, [500, 1150, 2300].map(y => ({ point: { x: 1100, y }, households: 500 })))
-    return {
-    roads: [
+    const roads = [
       { id: 'old-street', points: [{ x: 1100, y: 100 }, { x: 1100, y: 2900 }], kind: 'arterial' as const, width: 10, role: 'highway' as const, builtYear: 1650, reason: 'inherited street', phase: 'historic', constructionCost: 1 },
       ...((input.untilYear ?? 2025) >= 1900 ? [{ id: 'future-avenue', points: [{ x: 1600, y: 100 }, { x: 1600, y: 2900 }], kind: 'arterial' as const, width: 10, role: 'highway' as const, builtYear: 1900, reason: 'later street', phase: 'railway', constructionCost: 1 }] : []),
       ...((input.untilYear ?? 2025) >= 1955 && fixture.cut ? [{ id: 'school-acquisition-road', points: [{ x: 1100, y: fixture.cut.y - 180 }, { x: fixture.cut.x, y: fixture.cut.y - 80 }, { x: fixture.cut.x, y: fixture.cut.y + 80 }, { x: 1100, y: fixture.cut.y + 180 }], kind: 'local' as const, width: 8, role: 'collector' as const, builtYear: 1955, reason: 'later public street', phase: 'suburban', constructionCost: 1 }] : []),
-    ], centers: [{ point: { x: 1100, y: 1500 }, kind: 'historic' as const, weight: 1, activeYear: 1650, catchment: 500 }], developmentCells: [], demandSchedule: [], growthLog: [], blocks: [],
+    ]
+    return { roads, roadHistory: roads.map(road => ({ from: road.builtYear, value: { ...road, points: road.points.map(point => ({ ...point })) } })), centers: [{ point: { x: 1100, y: 1500 }, kind: 'historic' as const, weight: 1, activeYear: 1650, catchment: 500 }], developmentCells: [], demandSchedule: [], growthLog: [], blocks: [],
     }
   } }
 })
@@ -29,7 +29,7 @@ function flatSurvey(): TerrainModel {
     cropOrigin: { x: 0, y: 0 }, frame: { worldAnchor: { x: 0, y: 0 }, localAnchor: { x: 0, y: 0 }, angle: 0, mirrored: false },
     localResolution: 2000, localColumns: 4, localRows: 4, localDEM: raw, channelEvolution: [], oxbows: [], depressionLakes: [] }
   return { areas: [], elevation: () => 5, slope: () => 0, waterAt: () => false, cityOrigin: { x: 1800, y: 1500 }, landform: () => 'terrace', wetness: () => .2,
-    terrainCost: () => 1, cultivable: () => true, bankDistance: () => Infinity, channelAt: () => null, rivers: [], bridgeSites: [], bridgeCandidates: [], hydrology }
+    terrainCost: () => 1, cultivable: () => false, bankDistance: () => Infinity, channelAt: () => null, rivers: [], bridgeSites: [], bridgeCandidates: [], hydrology }
 }
 
 describe('facility construction uses its own historical street survey', () => {

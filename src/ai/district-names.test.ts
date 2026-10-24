@@ -44,7 +44,7 @@ it('keeps supplying distinct valid names after the ordinary vocabulary is exhaus
     used.push(proposal.name)
   }
   expect(new Set(used).size).toBe(300)
-  expect(used.some(name => name.endsWith('丁目'))).toBe(true)
+  expect(used.every(name => name.endsWith('町') && !/[0-9０-９第]|丁$/.test(name))).toBe(true)
   const largeBatch = used.map((name, index) => ({ id: `town-${index}`, name, reason: '観測値'.repeat(80) }))
   const text = JSON.stringify({ names: largeBatch })
   expect(text.length).toBeGreaterThan(30_000)

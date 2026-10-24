@@ -3,6 +3,7 @@ import { RoadPlanner } from './road-planner'
 import type { Area, Point } from './types'
 import { alignmentDiagnostics } from './road-alignment'
 import { PlanarRoadGraph } from './road-graph'
+import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 
 const water: Area = { id: 'river', kind: 'water', polygon: [{ x: 480, y: 0 }, { x: 520, y: 0 }, { x: 520, y: 800 }, { x: 480, y: 800 }] }
 const river = (p: Point) => p.x >= 480 && p.x <= 520
@@ -134,5 +135,27 @@ describe('terrain route planning', () => {
     expect(road).not.toBeNull()
     expect(planner.validate(road!.points, 6)).toBe(true)
     expect(planner.validate([{ x: 500, y: 400 }, { x: 850, y: 400 }], 6, true)).toBe(false)
+  })
+
+  it('does not reuse a failed strict-grade bridge approach for a feasible gentler policy', () => {
+    const terrain = { elevation: (p: Point) => river(p) ? 0 : p.y * .08, slope: () => .08, waterAt: river, bridgeSites: [{ x: 500, y: 400 }], bridgeCandidates: [{ point: { x: 500, y: 400 }, bankA: { x: 455, y: 400 }, bankB: { x: 545, y: 400 }, width: 40, cost: 100 }] }
+    const planner = new RoadPlanner({ width: 1000, height: 800, areas: [water], core: null, terrain })
+    const start = { x: 100, y: 100 }, goal = { x: 900, y: 700 }
+    expect(planner.plan(start, goal, { role: 'collector', width: 9, allowBridge: true, maximumGrade: .01 })).toBeNull()
+    const route = planner.plan(start, goal, { role: 'collector', width: 9, allowBridge: true, maximumGrade: .10 })
+    expect(route).not.toBeNull()
+    expect(route!.surveyedBridgeSpans).toHaveLength(1)
+    expect(surveyedRoadGradeAllowed(route!, .10, terrain.elevation)).toBe(true)
+    // A second strict request must still reject the gentler policy's route.
+    expect(planner.plan(start, goal, { role: 'collector', width: 9, allowBridge: true, maximumGrade: .01 })).toBeNull()
+  })
+
+  it('measures an explicit grade limit on a surveyed bridge deck rather than the river bed', () => {
+    const terrain = { elevation: (p: Point) => river(p) ? -40 : 100, slope: () => 0, waterAt: river, bridgeSites: [{ x: 500, y: 400 }], bridgeCandidates: [{ point: { x: 500, y: 400 }, bankA: { x: 455, y: 400 }, bankB: { x: 545, y: 400 }, width: 40, cost: 100 }] }
+    const planner = new RoadPlanner({ width: 1000, height: 800, areas: [water], core: null, terrain })
+    const route = planner.plan({ x: 100, y: 400 }, { x: 900, y: 400 }, { role: 'highway', width: 8.5, allowBridge: true, maximumGrade: .10 })
+    expect(route).not.toBeNull()
+    expect(surveyedRoadGradeAllowed(route!, .10, terrain.elevation)).toBe(true)
+    expect(route!.surveyedBridgeSpans).toHaveLength(1)
   })
 })

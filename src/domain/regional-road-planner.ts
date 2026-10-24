@@ -3,6 +3,15 @@ import { RoadPlanner } from './road-planner'
 import type { PlannedRoute, PlanningEnvironment, PlanningOptions } from './road-planner'
 import type { RailwayCorridor } from './railway-road-constraints'
 
+export interface BoundaryPortalOptions {
+  width: number
+  /** Restrict the search to the same boundary as this original edge survey. */
+  preferred?: Point
+  /** Search forward into a neighbouring valley/pass, independently of river outlets. */
+  direction?: Point
+  maxCandidates?: number
+}
+
 /** Plans into real surrounding terrain. The full canonical route is retained;
  * the map canvas clips it at the crop edge, rather than drawing a false end cap. */
 export class RegionalRoadPlanner {
@@ -38,6 +47,11 @@ export class RegionalRoadPlanner {
     })
   }
   private move(p: Point): Point { return { x: p.x + this.padding, y: p.y + this.padding } }
+  private boundarySide(point: Point): number {
+    const { width, height } = this.environment
+    const distances = [Math.abs(point.x), Math.abs(point.y), Math.abs(width - point.x), Math.abs(height - point.y)]
+    return distances.indexOf(Math.min(...distances))
+  }
   waterAt(p: Point) { return this.planner.waterAt(this.move(p)) }
   validate(points: Point[], width: number, bridge = false) { return this.planner.validate(points.map(p => this.move(p)), width, bridge) }
   plan(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
@@ -48,8 +62,50 @@ export class RegionalRoadPlanner {
   /** A real surveyed endpoint beyond the displayed edge, shared by regional programmes. */
   beyondBoundary(edgeSite: Point, offset = 0): Point {
     const { width, height } = this.environment, inset = this.padding * .72
-    const distances = [Math.abs(edgeSite.x), Math.abs(edgeSite.y), Math.abs(width - edgeSite.x), Math.abs(height - edgeSite.y)], side = distances.indexOf(Math.min(...distances))
+    const side = this.boundarySide(edgeSite)
     return side === 0 ? { x: -inset, y: edgeSite.y + offset } : side === 1 ? { x: edgeSite.x + offset, y: -inset } : side === 2 ? { x: width + inset, y: edgeSite.y + offset } : { x: edgeSite.x + offset, y: height + inset }
+  }
+  /** Cheap, bounded surveys of actual surrounding terrain. These are candidate
+   * endpoints, not accepted roads: callers must plan and validate the full route.
+   * A river source inside the crop does not preclude an independent land pass. */
+  boundaryPortals(start: Point, options: BoundaryPortalOptions): Point[] {
+    const { width, height } = this.environment, inset = this.padding * .72
+    const preferredSide = options.preferred ? this.boundarySide(options.preferred) : undefined
+    const magnitude = options.direction ? Math.hypot(options.direction.x, options.direction.y) : 0
+    const candidates: { point: Point; score: number }[] = []
+    for (let side = 0; side < 4; side++) {
+      if (preferredSide !== undefined && side !== preferredSide) continue
+      const span = side % 2 === 0 ? height : width, clearance = Math.max(24, options.width + 2)
+      const samples = Math.min(64, Math.max(2, Math.ceil(span / 180)))
+      for (let i = 0; i <= samples; i++) {
+        const along = clearance + (span - 2 * clearance) * i / samples
+        const boundary = side === 0 ? { x: 0, y: along } : side === 1 ? { x: along, y: 0 } : side === 2 ? { x: width, y: along } : { x: along, y: height }
+        const point = side === 0 ? { x: -inset, y: along } : side === 1 ? { x: along, y: -inset } : side === 2 ? { x: width + inset, y: along } : { x: along, y: height + inset }
+        const dx = point.x - start.x, dy = point.y - start.y, distance = Math.hypot(dx, dy)
+        const alignment = magnitude ? (dx * options.direction!.x + dy * options.direction!.y) / (distance * magnitude || 1) : 1
+        if (magnitude && alignment < .15) continue
+        let terrainPenalty = 0, dry = true
+        // A few field probes reject obviously wet/steep portals before any A*.
+        // They do not stand in for the full-width continuous route validation.
+        for (const t of [0, .25, .5, .75, 1]) {
+          const localProbe = { x: boundary.x + (point.x - boundary.x) * t, y: boundary.y + (point.y - boundary.y) * t }
+          if (!this.planner.suitable(this.move(localProbe), options.width)) { dry = false; break }
+          const grade = this.environment.terrain!.continuationTerrain!.slope(localProbe)
+          terrainPenalty += grade * grade * 95 / 5
+        }
+        if (!dry) continue
+        const preferredDistance = options.preferred ? Math.hypot(boundary.x - options.preferred.x, boundary.y - options.preferred.y) : 0
+        candidates.push({ point, score: distance * (1 + terrainPenalty * .15 + (1 - alignment) * .7) + preferredDistance * .35 })
+      }
+    }
+    candidates.sort((a, b) => a.score - b.score || a.point.x - b.point.x || a.point.y - b.point.y)
+    const selected: Point[] = [], limit = Math.min(12, Math.max(1, Math.floor(options.maxCandidates ?? 8)))
+    for (const candidate of candidates) {
+      if (selected.some(point => Math.hypot(point.x - candidate.point.x, point.y - candidate.point.y) < 240)) continue
+      selected.push(candidate.point)
+      if (selected.length === limit) break
+    }
+    return selected
   }
   toBoundary(start: Point, edgeSite: Point, options: PlanningOptions): PlannedRoute | null {
     let best: PlannedRoute | null = null
@@ -58,6 +114,14 @@ export class RegionalRoadPlanner {
       const route = this.plan(start, goal, options)
       if (route && (!best || route.cost < best.cost)) best = route
     }
-    return best ? { ...best, boundaryContinuation: true } : null
+    if (best) return { ...best, boundaryContinuation: true }
+    // The original five surveys can all fall on a cliff or inlet while another
+    // dry corridor exists farther along the same real boundary. Bound expensive
+    // route searches after the coarse portal survey instead of scanning every site.
+    for (const goal of this.boundaryPortals(start, { width: options.width, preferred: edgeSite, maxCandidates: 6 })) {
+      const route = this.plan(start, goal, options)
+      if (route) return { ...route, boundaryContinuation: true }
+    }
+    return null
   }
 }

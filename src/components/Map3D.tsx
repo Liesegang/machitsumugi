@@ -7,6 +7,7 @@ import { clipSegmentToMap, partitionTerrainWater, roadDeckOffsets, roadSurfaceCl
 import type { TerrainWaterFragment } from '../map/scene-geometry'
 import type { PolygonRegion } from '../domain/geometry'
 import { waterGeometry, waterSurfaceElevation } from '../map/water-surfaces'
+import { seaDepthRgb } from '../map/bathymetry'
 import './Map3D.css'
 
 interface TerrainSurface { columns: number; rows: number; cellSize: number; elevations: number[] }
@@ -22,8 +23,8 @@ function cleanRing(ring: Point[]) { return ring.filter((p, i) => !i || distance(
 class TriangleBatch {
   positions: number[] = []
   colors: number[] = []
-  triangle(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, color: THREE.Color) {
-    for (const point of [a, b, c]) { this.positions.push(point.x, point.y, point.z); this.colors.push(color.r, color.g, color.b) }
+  triangle(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, color: THREE.Color, vertexColors?: THREE.Color[]) {
+    for (const [i, point] of [a, b, c].entries()) { const value = vertexColors?.[i] ?? color; this.positions.push(point.x, point.y, point.z); this.colors.push(value.r, value.g, value.b) }
   }
   geometry() {
     const geometry = new THREE.BufferGeometry()
@@ -43,6 +44,7 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
     for (let x = minX; x <= maxX; x++) for (let y = minY; y <= maxY; y++) { const key = `${x}:${y}`, found = regions.get(key) ?? []; found.push(area); regions.set(key, found) }
   }
   const waterAt = (point: Point) => (regions.get(`${Math.floor(point.x / 160)}:${Math.floor(point.y / 160)}`) ?? []).some(area => area.kind === 'water' && inside(point, area.polygon) && !area.holes?.some(hole => inside(point, hole)))
+  const seaAt = (point: Point) => (regions.get(`${Math.floor(point.x / 160)}:${Math.floor(point.y / 160)}`) ?? []).some(area => (area.id === 'sea' || area.id.startsWith('sea-')) && inside(point, area.polygon) && !area.holes?.some(hole => inside(point, hole)))
   const textureCanvas = document.createElement('canvas'), textureWidth = Math.min(4096, Math.max(1024, Math.round(map.width)))
   textureCanvas.width = textureWidth; textureCanvas.height = Math.max(1, Math.round(textureWidth * map.height / map.width))
   const textureContext = textureCanvas.getContext('2d')
@@ -71,9 +73,9 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
     if (outer.length < 3) return { points: [], faces: [] }
     return { points: [...outer, ...holes.flat()], faces: THREE.ShapeUtils.triangulateShape(outer.map(p => new THREE.Vector2(p.x, p.y)), holes.map(ring => ring.map(p => new THREE.Vector2(p.x, p.y)))) }
   }
-  const emitRegion = (batch: TriangleBatch, region: PolygonRegion, color: THREE.Color, level: (p: Point) => number) => {
+  const emitRegion = (batch: TriangleBatch, region: PolygonRegion, color: THREE.Color, level: (p: Point) => number, colorAt?: (p: Point) => THREE.Color) => {
     const { points, faces } = triangulate(region)
-    for (const face of faces) batch.triangle(...face.map(i => world(points[i]!, level(points[i]!))) as [THREE.Vector3, THREE.Vector3, THREE.Vector3], color)
+    for (const face of faces) batch.triangle(...face.map(i => world(points[i]!, level(points[i]!))) as [THREE.Vector3, THREE.Vector3, THREE.Vector3], color, colorAt ? face.map(i => colorAt(points[i]!)) : undefined)
   }
   // Split water at the very same triangles as the ground. Union within each
   // triangle removes duplicate confluence faces; standing levels take priority.
@@ -103,7 +105,11 @@ function makeCityScene(map: CityMap, surface: TerrainSurface | undefined) {
     const key = grid.key(x, y, upper), fragments = waterCells.get(key)
     if (!fragments) { const a = y * columns + x, b = a + 1, c = a + columns, d = c + 1; indices.push(...upper ? [b, c, d] : [a, c, b]); continue }
     const partition = partitionTerrainWater(grid.triangle(x, y, upper), fragments)
-    for (const visible of partition.surfaces) emitRegion(water, visible, new THREE.Color('#9cc8d2'), p => waterSurfaceElevation({ id: 'surface', kind: 'water', polygon: visible.polygon, waterLevel: visible.level }, p, height))
+    for (const visible of partition.surfaces) {
+      const centre = visible.polygon.reduce((sum, p) => ({ x: sum.x + p.x / visible.polygon.length, y: sum.y + p.y / visible.polygon.length }), { x: 0, y: 0 })
+      const colour = seaAt(centre) ? (p: Point) => { const rgb = seaDepthRgb(-height(p)); return new THREE.Color().setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, THREE.SRGBColorSpace) } : undefined
+      emitRegion(water, visible, new THREE.Color('#9cc8d2'), p => waterSurfaceElevation({ id: 'surface', kind: 'water', polygon: visible.polygon, waterLevel: visible.level }, p, height), colour)
+    }
     // There is no second ground face behind/above the water. Island holes stay
     // in the dry remainder, rather than relying on depth bias to hide a conflict.
     for (const dry of partition.dry) appendGround(dry)

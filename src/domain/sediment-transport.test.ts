@@ -90,4 +90,22 @@ describe('conservative erosion, transport and deposition', () => {
     }
     expect(cases[1]!.deposition[center]).toBe(cases[0]!.deposition[center])
   })
+
+  it('carries fine marine suspension across deep water while preserving lake trapping and actual boundary export', () => {
+    const n = 21, source = new Float64Array(n * n); source[3 * n + 10] = 100_000
+    const marine = [1, 100].map(depth => run(Float32Array.from({ length: n * n }, (_, i) => -depth - Math.floor(i / n) * .01), n, n, source))
+    expect(marine[1]!.exportedVolume).toBeGreaterThan(marine[0]!.exportedVolume)
+    expect(marine[1]!.marineDepositedVolume).toBeLessThan(marine[0]!.marineDepositedVolume)
+    for (const result of marine) {
+      expect(result.marineDepositedVolume).toBeGreaterThan(0)
+      expect(result.exportedVolume + result.depositedVolume).toBeCloseTo(100_000, 7)
+      expect(Math.abs(result.massBalanceError)).toBeLessThan(1e-7)
+    }
+    const lake = new Float32Array(n * n).fill(10)
+    for (let y = 1; y < n - 1; y++) for (let x = 1; x < n - 1; x++) lake[y * n + x] = -100
+    const trapped = run(lake, n, n, source)
+    expect(trapped.marineDepositedVolume).toBe(0)
+    expect(trapped.lakeDepositedVolume).toBeGreaterThan(marine[1]!.marineDepositedVolume * 10)
+    expect(trapped.exportedVolume + trapped.depositedVolume).toBeCloseTo(100_000, 7)
+  })
 })

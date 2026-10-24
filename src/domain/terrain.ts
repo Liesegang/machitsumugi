@@ -450,7 +450,16 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     fullWaterRegions.push(region)
     for (const [i, part] of clipWaterRegion(region, w, h).entries()) if (part.polygon.length > 3 && Math.abs(area(part.polygon)) > 4) areas.push({ id: i ? `${lake.id}-part-${i}` : lake.id, kind: 'water', waterLevel: lake.level, ...part, name: '旧河道湖' })
   }
-  if (input.terrain === 'coast') {
+  // The preset chooses the survey window, not the physical presence of sea.
+  // A wide river/mountain crop can extend offshore too. Omitting its ocean
+  // polygons exposed negative seabed as dry terrain and allowed construction
+  // there. Closed negative basins are excluded by the regional ocean mask.
+  const oceanInSurvey = world.ocean.some((wet, i) => {
+    if (!wet) return false
+    const p = local(worldPoint(i)), margin = 1000 + world.resolution
+    return p.x >= -margin && p.y >= -margin && p.x <= w + margin && p.y <= h + margin
+  })
+  if (oceanInSurvey) {
     const nx = Math.ceil(w / 12), ny = Math.ceil(h / 12), sx = w / nx, sy = h / ny, mx = Math.ceil(1000 / sx), my = Math.ceil(1000 / sy)
     const seas = contourConnectedSea({ width: (nx + mx * 2) * sx, height: (ny + my * 2) * sy, columns: nx + mx * 2, rows: ny + my * 2, origin: { x: -mx * sx, y: -my * sy }, elevation: p => coastalSurface(regional(p)), regionalOcean: p => world.ocean[indexAt(regional(p))] === 1 })
     fullWaterRegions.push(...seas)

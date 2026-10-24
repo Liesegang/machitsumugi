@@ -4,6 +4,8 @@ import type { RenderOptions } from './render'
 import { terrainContours } from './contours'
 import { waterGeometry } from './water-surfaces'
 import { areaLabelPoint } from './area-labels'
+import { seaDepthRaster } from './bathymetry'
+import { landPaintGroups } from './land-paint'
 
 function filename(map: CityMap, extension: string) {
   return `${map.config.name.replace(/[\\/:*?"<>|]/g, '_') || 'machitsumugi'}-${map.config.seed.replace(/[^\w\u3000-\u9fff-]/g, '_').slice(0, 48)}.${extension}`
@@ -87,19 +89,28 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
   const text = (name: string, p: Point, color: string, size = 12, weight = 500) => `<text x="${p.x.toFixed(2)}" y="${p.y.toFixed(2)}" text-anchor="middle" dominant-baseline="central" font-size="${size * px}" font-weight="${weight}" fill="${color}" stroke="${c.halo}" stroke-width="${3 * px}" paint-order="stroke" stroke-linejoin="round">${escapeXml(name)}</text>`
   parts.push(`<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="4096" height="${Math.round(4096 * map.height / map.width)}" viewBox="0 0 ${map.width} ${map.height}" font-family="Noto Sans JP,Yu Gothic,Hiragino Kaku Gothic ProN,sans-serif"><title>${escapeXml(map.config.name)} — 架空日本地図ジェネレーター</title><desc>架空都市地図。seed: ${escapeXml(map.config.seed)}</desc><defs><clipPath id="bounds"><rect width="${map.width}" height="${map.height}"/></clipPath></defs><rect width="${map.width}" height="${map.height}" fill="${c.ground}"/><g clip-path="url(#bounds)" stroke-linejoin="round" stroke-linecap="round">`)
   if (layers.terrain) {
-    for (const area of map.areas) {
-      if (area.kind === 'water') continue
+    for (const group of landPaintGroups(map.areas)) {
       if (options.contours && map.terrainSurface) continue
-      const d = [area.polygon, ...area.holes ?? []].map(ring => path(ring, true)).join(' ')
+      const area = group[0]!
+      const d = group.flatMap(part => [part.polygon, ...part.holes ?? []]).map(ring => path(ring, true)).join(' ')
       parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
       // The portable full-city view uses the same continuous woodland fill as
       // the canvas overview; individual tree texture belongs to close zooms.
     }
     const water = waterGeometry(map.areas)
-    for (const area of water.surfaces) parts.push(`<path d="${[area.polygon, ...(area.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
+    let seaSerial = 0
+    for (const area of water.surfaces) {
+      const d = [area.polygon, ...(area.holes ?? [])].map(ring => path(ring, true)).join(' ')
+      parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
+      if (map.terrainSurface && (area.id === 'sea' || area.id.startsWith('sea-'))) {
+        const surface = map.terrainSurface, id = `sea-depth-${seaSerial++}`
+        const raster = seaDepthRaster(surface, options.style).toDataURL('image/png')
+        parts.push(`<defs><clipPath id="${id}"><path d="${d}" clip-rule="evenodd"/></clipPath></defs><image href="${raster}" x="${-surface.cellSize / 2}" y="${-surface.cellSize / 2}" width="${surface.columns * surface.cellSize}" height="${surface.rows * surface.cellSize}" preserveAspectRatio="none" clip-path="url(#${id})"/>`)
+      }
+    }
     for (const shoreline of water.shorelines) parts.push(`<path d="${[shoreline.polygon, ...(shoreline.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="none" stroke="${c.waterEdge}" stroke-width="1.5"/>`)
   }
-  if (options.contours && map.terrainSurface) for (const line of terrainContours(map.terrainSurface)) {
+  if (options.contours && map.terrainSurface) for (const line of terrainContours(map.terrainSurface, map.areas.some(area => area.id === 'sea' || area.id.startsWith('sea-')))) {
     parts.push(`<path data-elevation="${line.elevation}" d="${path(line.points)}" fill="none" stroke="${options.style === 'mono' ? '#777777' : '#9b8060'}" stroke-width="${(line.index ? 1.15 : .6) * px}" opacity="${line.index ? .85 : .48}"/>`)
     if (line.index && line.points.length > 8) parts.push(text(`${line.elevation}m`, line.points[Math.floor(line.points.length * .43)]!, '#816849', 10))
   }
