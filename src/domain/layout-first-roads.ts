@@ -1,6 +1,6 @@
 import type { Point, Railway, Road } from './types'
 import type { PolygonRegion } from './geometry'
-import { corridorPolygon, distance, pointInRegion, polygonOverlapsRegion } from './geometry'
+import { corridorPolygon, distance, pointInRegion, polygonArea, polygonOverlapsRegion, rectangle } from './geometry'
 import type { LayoutFirstZone } from './layout-first-types'
 import { PlanarRoadGraph, extractStreetBlocks, projectOnRoadSegment, roadLength } from './road-graph'
 import type { RoadProjection, RoadRole, SimulatedRoad } from './road-graph'
@@ -16,6 +16,7 @@ import { surveyLayoutMainCorridors } from './layout-first-main-corridors'
 import { layoutFrontageLoop } from './layout-first-frontage-loops'
 import { layoutNeighborhoodHasStreetFace, proposeLayoutNeighborhoodLinks } from './layout-first-neighborhood-links'
 import type { LayoutNeighborhoodSite } from './layout-first-neighborhood-links'
+import { createLayoutCoverageMask, measureLayoutCoverageGain, measureLayoutStreetCoverage, proposeLayoutCoverageBlocks } from './layout-first-coverage-blocks'
 
 export interface LayoutAccessTarget { id: string; point: Point; builtYear: number }
 export interface LayoutRoadDiagnostics {
@@ -24,6 +25,7 @@ export interface LayoutRoadDiagnostics {
   selectedCenter?: Point
   boundaryAttempts?: { start: Point; portal: Point; route: boolean; finiteCost: boolean; reservations: boolean; railWidth: boolean; cost?: number; length?: number; milliseconds?: number; phase?: 'mesh-exit' }[]
   accessAttempts?: { id: string; start: Point; target: Point; route: boolean; reservations: boolean; railWidth: boolean }[]
+  coverage?: { builtYear: number; before: number; after: number; enclosedGain: number; coveredGain: number; streetLength: number; attempted: number; accepted: number; routeFailures: number; guardFailures: number; unchangedFaces: number }[]
 }
 export interface LayoutRoadInput {
   environment: PlanningEnvironment; seed: string; center: Point
@@ -431,13 +433,82 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
   }
   connectNeighbourhoodStreets()
 
+  // A dry demand field identifies missing town blocks; it is never emitted as
+  // a street lattice. The complete pavement still receives its ordinary width,
+  // water, grade, acquisition and railway survey before any face can count.
+  const urban = zones.filter(zone => zone.kind !== 'rural')
+  const fieldSize = Math.max(75, Math.sqrt(width * height / 12000)), suitableRegions: PolygonRegion[] = []
+  const suitableCell = (x: number, y: number, cellWidth: number, cellHeight: number) => {
+    const middle = { x: x + cellWidth / 2, y: y + cellHeight / 2 }
+    if (!urban.some(zone => pointInRegion(middle, zone))) return false
+    for (const dx of [0, .5, 1]) for (const dy of [0, .5, 1]) {
+      const point = { x: x + dx * cellWidth, y: y + dy * cellHeight }
+      if (!landAvailable(point) || planner.waterAt(point) || (environment.terrain?.slope(point) ?? 0) > .13) return false
+    }
+    return true
+  }
+  for (let y = 12; y < height - 12; y += fieldSize) {
+    const cellHeight = Math.min(fieldSize, height - 12 - y)
+    let runStart: number | undefined, runEnd = 0
+    for (let x = 12; x < width - 12; x += fieldSize) {
+      const cellWidth = Math.min(fieldSize, width - 12 - x)
+      if (suitableCell(x, y, cellWidth, cellHeight)) { runStart ??= x; runEnd = x + cellWidth }
+      else if (runStart !== undefined) { suitableRegions.push({ polygon: rectangle(runStart, y, runEnd - runStart, cellHeight) }); runStart = undefined }
+    }
+    if (runStart !== undefined) suitableRegions.push({ polygon: rectangle(runStart, y, runEnd - runStart, cellHeight) })
+  }
+  // Actual surface track footprints split the proposal demand into its real
+  // sides. A collector can close its own side instead of repeatedly asking for
+  // a new nearby crossing; normal railway guards still own final acceptance.
+  const railRegions = railways.filter(railway => railway.mode !== 'subway').flatMap(railway => railway.points.slice(1).map((point, i) => ({ polygon: corridorPolygon(railway.points[i]!, point, 3) })))
+  const protectedLandRegions = [...(input.reservedRegions ?? []), ...environment.areas.filter(area => area.kind === 'water')]
+  const excludedRegions = [...protectedLandRegions, ...railRegions]
+  diagnostics.coverage = []
+  for (const year of [...new Set(urban.map(zone => zone.builtYear))].sort((a, b) => a - b)) {
+    check()
+    const mask = createLayoutCoverageMask({ demandRegions: urban.filter(zone => zone.builtYear <= year), suitableRegions, excludedRegions })
+    if (mask.area < 10000) continue
+    let faces = extractStreetBlocks(graph.roads.filter(road => road.builtYear <= year))
+    const before = measureLayoutStreetCoverage({ faces, mask }).coveredArea
+    const record = { builtYear: year, before, after: before, enclosedGain: 0, coveredGain: 0, streetLength: 0, attempted: 0, accepted: 0, routeFailures: 0, guardFailures: 0, unchangedFaces: 0 }
+    diagnostics.coverage.push(record)
+    const candidates = proposeLayoutCoverageBlocks({ roads: graph.roads.filter(road => road.builtYear <= year), faces, mask, builtYear: year, canAnchor: point => landAvailable(point) && planner.suitable(point, 8), cellSize: fieldSize, maximumProposals: 8 })
+    for (const proposal of candidates.proposals) {
+      check(); record.attempted++; diagnostics.attempted++
+      const from = openStreet(proposal.from.point, 1e-6, year), to = openStreet(proposal.to.point, 1e-6, year)
+      if (!from || !to) continue
+      const startHeading = graph.junctionHeading(from.point, proposal.through), endHeading = graph.junctionHeading(to.point, proposal.through)
+      const route = planner.plan(from.point, to.point, { role: 'collector', width: proposal.width, through: proposal.through, allowBridge: false, maximumGrade: .13, maxNodes: 1800, ...(startHeading !== null ? { startHeading } : {}), ...(endHeading !== null ? { endHeading: endHeading + Math.PI } : {}) })
+      if (!route) { diagnostics.rejected++; record.routeFailures++; continue }
+      const points = canonicalSurvey(route, false)
+      if (!points || alignmentDiagnostics(points).minimumRadius < 50 - 1e-6 || !avoidsReservations(points, proposal.width) || !planner.railwayWidthAllows(points, .01, proposal.width, 'collector') || environment.terrain && !surveyedRoadGradeAllowed({ ...route, points }, .13, environment.terrain.elevation)) { diagnostics.rejected++; record.guardFailures++; continue }
+      // A normalized graph fork measures actual closed pavement before commit.
+      // A merely accepted link or an unchanged oversized face earns no coverage.
+      const staged = graph.fork(), builtYear = Math.max(year, proposal.builtYear, from.road.builtYear, to.road.builtYear)
+      if (!staged.add(points, { id: 'coverage-trial', kind: 'local', role: 'collector', width: proposal.width, builtYear, phase: 'spatial-layout', reason: 'coverage trial', constructionCost: route.cost })) { record.unchangedFaces++; continue }
+      const proposedFaces = extractStreetBlocks(staged.roads.filter(road => road.builtYear <= year)), gain = measureLayoutCoverageGain({ beforeFaces: faces, afterFaces: proposedFaces, mask, streetLength: roadLength(points) })
+      if (gain.coveredGain <= 100) { record.unchangedFaces++; continue }
+      const added = accept({ ...route, points }, 'collector', proposal.width, builtYear, '未被覆の都市需要地を通り実公道へ戻る大街区の集散道路')
+      if (!added) continue
+      const afterFaces = extractStreetBlocks(graph.roads.filter(road => road.builtYear <= year)), actualGain = measureLayoutCoverageGain({ beforeFaces: faces, afterFaces, mask, streetLength: roadLength(added.points) })
+      record.accepted++; record.streetLength += roadLength(added.points); record.enclosedGain += actualGain.enclosedGain; record.coveredGain += actualGain.coveredGain
+      record.after = measureLayoutStreetCoverage({ faces: afterFaces, mask }).coveredArea; faces = afterFaces
+    }
+  }
+
   // A single old street may genuinely leave an isolated neighbourhood with
   // no face at its opening date. Only that case receives an outer reach;
   // existing connected faces are never replaced by completed capsule stamps.
   const faceCache = new Map<number, Point[][]>()
   const facesAt = (year: number) => {
     let faces = faceCache.get(year)
-    if (!faces) { faces = extractStreetBlocks(graph.roads.filter(road => road.builtYear <= year)); faceCache.set(year, faces) }
+    if (!faces) {
+      // A large enclosure around a castle/campus is real, but cannot stand in
+      // for the surrounding neighbourhood's usable street blocks. Its failed
+      // first cut must not suppress the last isolated-frontage fallback.
+      faces = extractStreetBlocks(graph.roads.filter(road => road.builtYear <= year)).filter(polygon => polygonArea(polygon) <= 600000 && !protectedLandRegions.some(region => polygonOverlapsRegion(polygon, region)))
+      faceCache.set(year, faces)
+    }
     return faces
   }
   for (const { zone, hub } of active.slice().sort((a, b) => a.zone.builtYear - b.zone.builtYear || a.zone.id.localeCompare(b.zone.id))) {

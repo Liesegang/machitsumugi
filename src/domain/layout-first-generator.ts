@@ -21,11 +21,12 @@ import { planSubway } from './subway'
 import { extractStreetBlocks, materializeRoadJunctions } from './road-graph'
 import { certifyLayoutAccess } from './layout-first-access'
 import { LAYOUT_GENERATOR_VERSION } from './layout-first-types'
+import type { LayoutFirstZone } from './layout-first-types'
 import { layoutThroughRoadHistory } from './layout-first-road-designations'
 import { regionQuery } from './region-query'
 
 export { LAYOUT_GENERATOR_VERSION } from './layout-first-types'
-const reports = new WeakMap<CityMap, { composition: { input: 'configuration-and-terrain-only'; inheritedRoads: 0; inheritedParcels: 0; inheritedBuildings: 0; center: Point; stationDoors: Point[]; streetBlocks: number }; zones: number; transport: ReturnType<typeof buildLayoutFirstRoads>['diagnostics']; rail: ReturnType<typeof surveyLayoutFirstRail>['diagnostics']; land: ReturnType<typeof developLayoutFirstLand>['metrics']; regional: ReturnType<typeof augmentLayoutFirstRegional>['diagnostics'] }>()
+const reports = new WeakMap<CityMap, { composition: { input: 'configuration-and-terrain-only'; inheritedRoads: 0; inheritedParcels: 0; inheritedBuildings: 0; center: Point; stationDoors: Point[]; streetBlocks: number }; zones: number; planningZones: readonly LayoutFirstZone[]; transport: ReturnType<typeof buildLayoutFirstRoads>['diagnostics']; rail: ReturnType<typeof surveyLayoutFirstRail>['diagnostics']; land: ReturnType<typeof developLayoutFirstLand>['metrics']; regional: ReturnType<typeof augmentLayoutFirstRegional>['diagnostics'] }>()
 export const layoutGenerationReport = (map: CityMap) => reports.get(map)
 const facilityOpening: Record<FacilityKind, number> = { castle: 1650, shrine: 1650, onsen: 1650, port: 1920, shop: 1700, school: 1875, police: 1880, hospital: 1920, park: 1955, university: 1965 }
 const areaOpening = (area: Area) => area.id.startsWith('station-') ? 1900 : area.id.startsWith('facility-') ? facilityOpening[(Object.keys(facilityOpening) as FacilityKind[]).find(kind => area.id.includes(kind)) ?? 'park'] : 1650
@@ -221,6 +222,6 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
     areas: [...coverHistory, ...civicGrounds.map(value => ({ from: areaOpening(value), value })), ...rail.stationGrounds.map(value => ({ from: 1900, value }))] })
   onPreview?.(frame(map, 'development'))
   const result = sliceCityAtYear(map, requestedYear)
-  reports.set(result, { composition: { input: 'configuration-and-terrain-only', inheritedRoads: 0, inheritedParcels: 0, inheritedBuildings: 0, center: transport.center, stationDoors: rail.stations.map(station => station.entrance ?? station.point), streetBlocks: blocks.length }, zones: zones.length, transport: transport.diagnostics, rail: rail.diagnostics, land: land.metrics, regional: regional.diagnostics })
+  reports.set(result, { composition: { input: 'configuration-and-terrain-only', inheritedRoads: 0, inheritedParcels: 0, inheritedBuildings: 0, center: transport.center, stationDoors: rail.stations.map(station => station.entrance ?? station.point), streetBlocks: blocks.length }, zones: zones.length, planningZones: zones, transport: transport.diagnostics, rail: rail.diagnostics, land: land.metrics, regional: regional.diagnostics })
   return result
 }

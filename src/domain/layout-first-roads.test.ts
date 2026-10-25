@@ -219,10 +219,16 @@ describe('layout-first public street design', () => {
     for (const road of links) for (const endpoint of [road.points[0]!, road.points.at(-1)!]) {
       expect(result.roads.some(other => other !== road && other.points.slice(1).some((b, i) => distanceToSegment(endpoint, other.points[i]!, b) < 1e-6))).toBe(true)
     }
-    // Only the isolated old reach needs two fallback sides. Its neighbour
-    // already has usable actual faces and must not receive a second capsule.
-    expect(result.roads.filter(road => road.reason === '孤立した住区で旧道上の二つの接道点を結ぶ補完街路')).toHaveLength(2)
-    expect(result.blocks.some(block => pointInPolygon({ x: 900, y: 820 }, block))).toBe(true)
+    // Actual coverage projects may also remove the need for an old fallback.
+    // Neither neighbourhood may substitute an isolated modern capsule for
+    // continuous real closed frontage across their shared built-up reach.
+    const fallbacks = result.roads.filter(road => road.reason === '孤立した住区で旧道上の二つの接道点を結ぶ補完街路')
+    expect(fallbacks.every(road => road.builtYear === 1650)).toBe(true)
+    for (const x of [600, 700, 800, 900]) {
+      const point = { x, y: 820 }
+      expect(result.blocks.some(block => pointInPolygon(point, block)) || !!result.graph.nearest(point, 10)).toBe(true)
+    }
+    expect(certifyLayoutAccess({ width: 2000, height: 1400, roads: result.roads, targets: [{ id: old.id, point: old.center, builtYear: 1650 }, { id: modern.id, point: modern.center, builtYear: 1975 }] })).toEqual({ unserved: [], certified: 2 })
     expect(result.roads.every(road => Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points.at(-1)!)))).toBe(true)
   })
 
