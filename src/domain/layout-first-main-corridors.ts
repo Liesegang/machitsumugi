@@ -4,6 +4,8 @@ import type { PlannedRoute, PlanningEnvironment, PlanningOptions } from './road-
 import { RegionalRoadPlanner } from './regional-road-planner'
 import { alignmentDiagnostics, resampleAlignment } from './road-alignment'
 import { distance, distanceToSegment, projectPoint } from './geometry'
+import { layoutMainCivilGuides, surveyLayoutMainCivilCrossings } from './layout-first-main-civil-bridges'
+import type { LayoutMainCivilSurveyInput } from './layout-first-main-civil-bridges'
 
 export interface LayoutMainCorridor {
   id: string
@@ -18,6 +20,7 @@ export interface LayoutMainCorridorInput {
   zones: readonly LayoutFirstZone[]
   railways: Railway[]
   signal?: AbortSignal
+  civilSurvey?: Pick<LayoutMainCivilSurveyInput, 'rowAllows' | 'railwayAllows' | 'bridgeAllows'>
 }
 type MainAlignmentPlanner = Pick<RegionalRoadPlanner, 'plan' | 'validate'>
 
@@ -124,10 +127,16 @@ export function surveyLayoutMainCorridors(input: LayoutMainCorridorInput, adopt:
     const to = planner.boundaryPortals(center, { width: roadWidth, preferred: last, maxCandidates: 2 })
     const pairs = from.flatMap(start => to.map(goal => ({ start, goal, distance: distance(start, center) + distance(center, goal) }))).sort((a, b) => a.distance - b.distance).slice(0, 2)
     for (const { start, goal } of pairs) {
+        const civil = input.civilSurvey ? surveyLayoutMainCivilCrossings({ guides: layoutMainCivilGuides(start, goal), width: roadWidth, waterRegions: environment.areas.filter(area => area.kind === 'water'), terrain: environment.terrain!, ...input.civilSurvey }) : []
+        // Civil and native normal-bank alternatives remain independent. New
+        // road bearings must not be lost to the old point/radius deduplication.
+        const allCrossings = [...civil, ...crossings], routeTerrain = { ...terrain, bridgeSites: allCrossings.map(crossing => crossing.point), bridgeCandidates: allCrossings }
+        const designPlanner = civil.length ? new RegionalRoadPlanner({ ...environment, terrain: routeTerrain, bridgeSites: routeTerrain.bridgeSites }) : planner
+        designPlanner.setRailwayCorridors(input.railways)
         // The regional line is designed as a regional line. A local centre is
         // demand, not a mandatory highway control point or compulsory detour.
-        const direct = planner.plan(start, goal, { role: 'highway', width: roadWidth, alignment: 'planned', allowBridge: true, maximumGrade: .09, maxNodes: 16000, maxNodesPerKm: 1800, avoidRepeatedRiverCrossings: true })
-        if (direct && direct.length <= distance(start, goal) * 1.8 && alignmentDiagnostics(direct.points).minimumRadius >= 85 && planner.validate(direct.points, roadWidth, direct.bridgeLength > 0)) {
+        const direct = designPlanner.plan(start, goal, { role: 'highway', width: roadWidth, alignment: 'planned', allowBridge: true, maximumGrade: .09, maxNodes: 16000, maxNodesPerKm: 1800, avoidRepeatedRiverCrossings: true })
+        if (direct && direct.length <= distance(start, goal) * 1.8 && alignmentDiagnostics(direct.points).minimumRadius >= 85 && designPlanner.validate(direct.points, roadWidth, direct.bridgeLength > 0)) {
           const joins = direct.points.slice(1).map((point, i) => {
             const a = direct.points[i]!, join = projectPoint(center, a, point), direction = Math.atan2(join.y - center.y, join.x - center.x), tangent = Math.atan2(point.y - a.y, point.x - a.x)
             const normal = tangent + (Math.abs(angleDifference(direction - tangent - Math.PI / 2)) < Math.PI / 2 ? Math.PI / 2 : -Math.PI / 2)
@@ -138,14 +147,14 @@ export function surveyLayoutMainCorridors(input: LayoutMainCorridorInput, adopt:
             if (attempted.some(point => distance(point, contact.join) < 100)) continue
             attempted.push(contact.join)
             if (attempted.length > 3) break
-            const townConnection = contact.distance < 1e-7 ? undefined : contact.distance < 20 && planner.validate([center, contact.join], 9) ? planner.cost([center, contact.join], 'collector') : planner.plan(center, contact.join, { role: 'collector', width: 9, endHeading: contact.normal, maximumGrade: .13, maxNodes: 2400 })
+            const townConnection = contact.distance < 1e-7 ? undefined : contact.distance < 20 && designPlanner.validate([center, contact.join], 9) ? designPlanner.cost([center, contact.join], 'collector') : designPlanner.plan(center, contact.join, { role: 'collector', width: 9, endHeading: contact.normal, maximumGrade: .13, maxNodes: 2400 })
             if (contact.distance >= 1e-7 && !townConnection) continue
             const proposal = { id: `layout-main-corridor-${index + 1}`, route: direct, width: roadWidth, builtYear: 1650, ...(townConnection ? { townConnection } : {}) }
             if (adopt(proposal)) { result.push(proposal); break }
           }
           if (result.some(proposal => proposal.id === `layout-main-corridor-${index + 1}`)) break
         }
-        const route = planLayoutMainCorridorAlignment(planner, start, center, goal, roadWidth)
+        const route = planLayoutMainCorridorAlignment(designPlanner, start, center, goal, roadWidth)
         if (!route) continue
         const proposal = { id: `layout-main-corridor-${index + 1}`, route, width: roadWidth, builtYear: 1650 }
         if (!adopt(proposal)) continue

@@ -6,7 +6,7 @@ import { MinHeap } from './road-graph'
 export interface BridgeRoutingInput {
   start: Point
   goal: Point
-  pairs: { a: Point; b: Point; riverId?: string }[]
+  pairs: { a: Point; b: Point; riverId?: string; candidateId?: string }[]
   role: RoadRole
   width: number
   startHeading?: number
@@ -32,7 +32,7 @@ const angleDifference = (a: number, b: number) => Math.abs(Math.atan2(Math.sin(a
 export function routeAcrossBridges(input: BridgeRoutingInput): PlannedRoute | null {
   if (!(input.width > 0) || !input.pairs.length) return null
   const crossings = input.pairs.flatMap((pair, index) => distance(pair.a, pair.b) > 1e-6
-    ? [{ entry: pair.a, exit: pair.b, riverId: pair.riverId, waterKey: pair.riverId ?? `unidentified-bridge-${index}` }, { entry: pair.b, exit: pair.a, riverId: pair.riverId, waterKey: pair.riverId ?? `unidentified-bridge-${index}` }]
+    ? [{ entry: pair.a, exit: pair.b, riverId: pair.riverId, candidateId: pair.candidateId, waterKey: pair.riverId ?? `unidentified-bridge-${index}` }, { entry: pair.b, exit: pair.a, riverId: pair.riverId, candidateId: pair.candidateId, waterKey: pair.riverId ?? `unidentified-bridge-${index}` }]
     : []).map(pair => ({ ...pair, heading: Math.atan2(pair.exit.y - pair.entry.y, pair.exit.x - pair.entry.x), bridge: input.cost([pair.entry, pair.exit]) }))
   if (!crossings.length) return null
   const join = (a: Point[], b: Point[]) => a.concat(b.filter((p, i) => i !== 0 || !a.length || distance(a.at(-1)!, p) > 1e-6))
@@ -133,7 +133,7 @@ export function routeAcrossBridges(input: BridgeRoutingInput): PlannedRoute | nu
       const from = chain[i - 1]!, to = chain[i]!, leg = known.get(edgeKey(from, to))!
       points = join(points, leg!.points); cost += leg!.cost
       surveyedBridgeSpans.push(...(leg.surveyedBridgeSpans ?? []))
-      if (to < count) { const crossing = crossings[to]!; points = join(points, [crossing.entry, crossing.exit]); cost += crossing.bridge.cost; bridges++; surveyedBridgeSpans.push({ bankA: crossing.entry, bankB: crossing.exit, ...(crossing.riverId ? { riverId: crossing.riverId } : {}) }) }
+      if (to < count) { const crossing = crossings[to]!; points = join(points, [crossing.entry, crossing.exit]); cost += crossing.bridge.cost; bridges++; surveyedBridgeSpans.push({ bankA: crossing.entry, bankB: crossing.exit, ...(crossing.riverId ? { riverId: crossing.riverId } : {}), ...(crossing.candidateId ? { candidateId: crossing.candidateId } : {}) }) }
     }
     return { ...input.cost(points), cost, method: bridges ? 'bridge-project' : known.get(edgeKey(start, goal))!.method, ...(surveyedBridgeSpans.length ? { surveyedBridgeSpans } : {}) }
   }

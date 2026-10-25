@@ -16,7 +16,7 @@ export interface PlanningTerrain {
   /** Real regional samples outside the displayed crop, never edge-clamped land. */
   continuationTerrain?: { elevation(point: Point): number; slope(point: Point): number; waterAt(point: Point): boolean; seaAt?: (point: Point) => boolean; contains?: (point: Point) => boolean; bounds?: { minX: number; minY: number; maxX: number; maxY: number } }
   bridgeSites: Point[]
-  bridgeCandidates?: { point: Point; bankA: Point; bankB: Point; width: number; cost: number; riverId?: string }[]
+  bridgeCandidates?: { point: Point; bankA: Point; bankB: Point; width: number; cost: number; riverId?: string; id?: string; design?: 'main-civil'; bearing?: number; carriagewayWidth?: number; wetLength?: number }[]
   rivers?: { id: string; points: Point[] }[]
   wetness?: (point: Point) => number
   terrainCost?: (point: Point) => number
@@ -24,7 +24,7 @@ export interface PlanningTerrain {
   channelAt?: (point: Point) => { point: Point; tangent: Point; bankDistance: number; width: number; surfaceElevation: number; riverId: string } | null
 }
 export interface PlanningEnvironment { width: number; height: number; areas: Area[]; core: Point[] | null; terrain?: PlanningTerrain; bridgeSites?: Point[]; landCost?: (point: Point) => number; exactLandCost?: boolean; waterGeometryBounds?: { minX: number; minY: number; maxX: number; maxY: number } }
-export interface SurveyedBridgeSpan { bankA: Point; bankB: Point; riverId?: string }
+export interface SurveyedBridgeSpan { bankA: Point; bankB: Point; riverId?: string; candidateId?: string }
 export interface PlannedRoute { points: Point[]; length: number; cost: number; bridgeLength: number; method: 'direct' | 'heading-search' | 'bridge-project'; boundaryContinuation?: boolean; surveyedBridgeSpans?: SurveyedBridgeSpan[] }
 export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; /** Optional distance budget for long independently planned corridors; physical guards are unchanged. */ maxNodesPerKm?: number; /** Independently surveyed main roads can forbid crossing the same identified water body again. */ avoidRepeatedRiverCrossings?: boolean; crossedRiverIds?: readonly string[]; alignment?: 'natural' | 'planned'; maximumGrade?: number }
 type PlanningField = { water: boolean; sea: boolean; grade: number; cost: number; coreDistance: number }
@@ -564,12 +564,24 @@ export class RoadPlanner {
       // acquisition and approach-curvature constraints as an ordinary road.
       const sites = [...(this.environment.bridgeSites ?? this.environment.terrain?.bridgeSites ?? []), ...(this.environment.terrain?.bridgeCandidates?.map(candidate => candidate.point) ?? [])]
         .filter((site, i, all) => !all.slice(0, i).some(other => distance(site, other) < 5))
-      const pairs = sites.flatMap(site => {
+      const oldPairs = (values = sites) => values.flatMap(site => {
         const pair = this.banks(site)
         const gradeAllowed = pair && (!this.environment.terrain || Math.abs(this.environment.terrain.elevation(pair[1]) - this.environment.terrain.elevation(pair[0])) / distance(pair[0], pair[1]) <= maximumGrade)
         const riverId = this.environment.terrain?.bridgeCandidates?.find(candidate => distance(candidate.point, site) < 5)?.riverId
         return pair && gradeAllowed && this.validate(pair, options.width, true) ? [{ a: pair[0], b: pair[1], ...(riverId ? { riverId } : {}) }] : []
       })
+      // A planned highway may cross obliquely at the same location as an old
+      // river-normal survey. Preserve each actual bank-pair identity; resolving
+      // every site through banks(point) would silently substitute the first
+      // different bearing within5m and recreate the unnecessary road bend.
+      const candidates = this.environment.terrain?.bridgeCandidates ?? []
+      const plannedCandidates = options.role === 'highway' && options.alignment === 'planned' && candidates.length > 0
+      const candidatePairs = plannedCandidates ? candidates.flatMap(candidate => {
+        const pair: [Point, Point] = [candidate.bankA, candidate.bankB]
+        const gradeAllowed = !this.environment.terrain || Math.abs(this.environment.terrain.elevation(pair[1]) - this.environment.terrain.elevation(pair[0])) / distance(pair[0], pair[1]) <= maximumGrade
+        return pair.every(point => this.suitable(point, options.width)) && gradeAllowed && this.validate(pair, options.width, true) ? [{ a: pair[0], b: pair[1], ...(candidate.riverId ? { riverId: candidate.riverId } : {}), ...(candidate.id ? { candidateId: candidate.id } : {}) }] : []
+      }) : []
+      const pairs = plannedCandidates ? [...candidatePairs, ...oldPairs(sites.filter(site => !candidates.some(candidate => distance(candidate.point, site) < 5)))].filter((pair, i, all) => !all.slice(0, i).some(other => pair.riverId === other.riverId && (distance(pair.a, other.a) < 1e-6 && distance(pair.b, other.b) < 1e-6 || distance(pair.a, other.b) < 1e-6 && distance(pair.b, other.a) < 1e-6))) : oldPairs()
       const pointKey = (p: Point) => `${p.x.toFixed(4)},${p.y.toFixed(4)}`
       const bridgeRoute = routeAcrossBridges({
         start, goal, pairs, role: options.role, width: options.width,

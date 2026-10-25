@@ -1,7 +1,7 @@
 import type { Point, Road, TimelineVersion } from './types'
 import { controlledRoad, MinHeap } from './road-graph'
 
-const key = (point: Point) => `${Math.round(point.x * 20)}:${Math.round(point.y * 20)}`
+const key = (point: Point) => `${Math.round(point.x * 1000000)}:${Math.round(point.y * 1000000)}`
 const edgeKey = (a: Point, b: Point) => { const x = key(a), y = key(b); return x < y ? `${x}|${y}` : `${y}|${x}` }
 const routeEdgeKey = (road: Road, a: Point, b: Point) => `${road.throughRouteId ?? ''}:${edgeKey(a, b)}`
 const classify = (road: Road, through: boolean): Road => through ? { ...road, kind: 'arterial' } : { ...road, kind: 'local', ...(road.role === 'highway' ? { role: 'collector', reason: road.boundaryContinuation ? '地区から周辺地域へ続く道路' : '地区内を結ぶ広幅員道路' } : {}) }

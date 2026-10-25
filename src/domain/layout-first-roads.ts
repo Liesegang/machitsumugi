@@ -5,7 +5,7 @@ import type { LayoutFirstZone } from './layout-first-types'
 import { PlanarRoadGraph, extractStreetBlocks, projectOnRoadSegment, roadLength } from './road-graph'
 import type { RoadProjection, RoadRole, SimulatedRoad } from './road-graph'
 import { RoadPlanner } from './road-planner'
-import type { PlannedRoute, PlanningEnvironment } from './road-planner'
+import type { PlannedRoute, PlanningEnvironment, SurveyedBridgeSpan } from './road-planner'
 import { RegionalRoadPlanner } from './regional-road-planner'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { RailwayRoadConstraints } from './railway-road-constraints'
@@ -27,6 +27,7 @@ export interface LayoutRoadDiagnostics {
   attempted: number; accepted: number; rejected: number; boundaryConnections: number
   bridges: number; streetLength: number; unservedZoneIds: string[]; unservedAccessIds: string[]
   selectedCenter?: Point
+  surveyedBridges?: (SurveyedBridgeSpan & { roadId: string })[]
   boundaryAttempts?: { start: Point; portal: Point; route: boolean; finiteCost: boolean; reservations: boolean; railWidth: boolean; cost?: number; length?: number; milliseconds?: number; phase?: 'mesh-exit' }[]
   accessAttempts?: { id: string; start: Point; target: Point; route: boolean; reservations: boolean; railWidth: boolean }[]
   coverage?: { builtYear: number; phase?: 'before-fallback' | 'after-fallback'; before: number; after: number; enclosedGain: number; coveredGain: number; streetLength: number; attempted: number; accepted: number; routeFailures: number; guardFailures: number; unchangedFaces: number; proposalRounds?: number; surveyAttempts?: { from: Point; to: Point; through: Point; attempts: LayoutCoverageSurveyAttempt[]; rejectedInput?: string }[] }[]
@@ -40,7 +41,7 @@ export interface LayoutRoadInput {
 export interface LayoutRoadResult {
   roads: SimulatedRoad[]; graph: PlanarRoadGraph; blocks: Point[][]
   center: Point; zones: LayoutFirstZone[]; diagnostics: LayoutRoadDiagnostics
-  bridgeSpans: { roadId: string; bankA: Point; bankB: Point }[]
+  bridgeSpans: (SurveyedBridgeSpan & { roadId: string })[]
 }
 
 const lerp = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
@@ -76,6 +77,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
   const reserved = (input.reservedRegions ?? []).map(region => ({ region, bounds: regionBounds(region) }))
   const diagnostics: LayoutRoadDiagnostics = { attempted: 0, accepted: 0, rejected: 0, boundaryConnections: 0, bridges: 0, streetLength: 0, unservedZoneIds: [], unservedAccessIds: [] }
   const bridgeSpans: LayoutRoadResult['bridgeSpans'] = []
+  diagnostics.surveyedBridges = bridgeSpans
   type DatedSegment = { a: Point; b: Point; road: SimulatedRoad }
   const datedSegments: DatedSegment[] = [], datedBins = new Map<string, DatedSegment[]>()
   let indexedRoads = 0
@@ -202,7 +204,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     const added = graph.add(route.points, { id: `layout-road-${++serial}`, kind: throughRouteId && input.arterial !== false ? 'arterial' : 'local', width: roadWidth, role, builtYear: year, phase: throughRouteId ? 'surveyed-main-corridor' : boundary ? 'regional-connections' : 'spatial-layout', reason, constructionCost: route.cost, ...(throughRouteId ? { throughRouteId } : {}), ...(role === 'access' ? { preserveEndpoint: true } : {}), ...(route.bridgeLength > 0 ? { bridge: true } : {}), ...(boundary ? { boundaryContinuation: true } : {}) }, graph.roads.length > 0 && !internalContact)
     if (!added) { diagnostics.rejected++; return null }
     diagnostics.accepted++; diagnostics.streetLength += roadLength(added.points)
-    for (const span of route.surveyedBridgeSpans ?? []) bridgeSpans.push({ roadId: added.id, bankA: span.bankA, bankB: span.bankB })
+    for (const span of route.surveyedBridgeSpans ?? []) bridgeSpans.push({ roadId: added.id, ...span })
     if (route.bridgeLength > 0) diagnostics.bridges++
     if (boundary) diagnostics.boundaryConnections++
     // Only a new gate changes the crossing inventory. Rebuilding/translating
@@ -245,7 +247,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
 
   // Regional roads acquire their own continuous physical alignment before
   // local streets exist. A later path over household streets is not a trunk.
-  if (regional && input.arterial !== false) surveyLayoutMainCorridors({ environment, center, zones, railways, signal }, proposal => {
+  if (regional && input.arterial !== false) surveyLayoutMainCorridors({ environment, center, zones, railways, signal, civilSurvey: { rowAllows: avoidsReservations, railwayAllows: (points, roadWidth) => planner.railwayWidthAllows(points, .01, roadWidth, 'highway'), bridgeAllows: (points, roadWidth) => regional.validate(points, roadWidth, true) } }, proposal => {
     if (!proposal.townConnection) return !!accept(proposal.route, 'highway', proposal.width, proposal.builtYear, '周辺地域から町を通過する連続した幹線の測量', true, proposal.id)
     const mainPoints = canonicalSurvey(proposal.route, false), connectionPoints = canonicalSurvey(proposal.townConnection, true)
     if (!mainPoints || !connectionPoints) return false
@@ -261,7 +263,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     const built = graph.addBatch(projects)
     if (!built) return false
     serial += 2; diagnostics.accepted += built.length; diagnostics.streetLength += built.reduce((sum, road) => sum + roadLength(road.points), 0); diagnostics.boundaryConnections++
-    for (const span of proposal.route.surveyedBridgeSpans ?? []) bridgeSpans.push({ roadId: mainMetadata.id, bankA: span.bankA, bankB: span.bankB })
+    for (const span of proposal.route.surveyedBridgeSpans ?? []) bridgeSpans.push({ roadId: mainMetadata.id, ...span })
     if (proposal.route.bridgeLength > 0) diagnostics.bridges++
     if (crossingSurvey && built.some(road => crossingSurvey.crossings(road.points).length)) { planner.setRailwayRoadNetwork(graph.roads); regional.setRailwayRoadNetwork(graph.roads) }
     return true
@@ -344,7 +346,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
         ])
         if (!built) { diagnostics.rejected++; continue }
         diagnostics.accepted += built.length; diagnostics.bridges++; diagnostics.streetLength += built.reduce((sum, road) => sum + roadLength(road.points), 0)
-        bridgeSpans.push({ roadId: deckId, bankA: entry, bankB: exit }); adoptedPairs.add(pair); adopted = true
+        bridgeSpans.push({ roadId: deckId, bankA: entry, bankB: exit, ...(pair.riverId ? { riverId: pair.riverId } : {}) }); adoptedPairs.add(pair); adopted = true
         if (crossingSurvey && built.some(road => crossingSurvey.crossings(road.points).length)) { planner.setRailwayRoadNetwork(graph.roads); regional?.setRailwayRoadNetwork(graph.roads) }
         break
       }

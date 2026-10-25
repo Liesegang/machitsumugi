@@ -2,6 +2,21 @@ import { expect, it } from 'vitest'
 import { designateLayoutThroughRoads, layoutThroughRoadHistory } from './layout-first-road-designations'
 import type { Road } from './types'
 const programme = (roads: Road[]): Road[] => roads.map(road => road.width >= 6.8 ? { ...road, throughRouteId: 'surveyed-test-corridor' } : road)
+it('keeps real millimetre and centimetre main samples in the same arterial route', () => {
+  const roads: Road[] = programme([{ id: 'micro-main', kind: 'arterial', role: 'highway', width: 12, builtYear: 1650, boundaryContinuation: true, points: [{ x: -20, y: 70 }, { x: 100, y: 70 }, { x: 100.003, y: 70 }, { x: 100.043, y: 70 }, { x: 220, y: 70 }] }])
+  const result = designateLayoutThroughRoads(roads, 200, 150)
+  expect(result).toHaveLength(1)
+  expect(result[0]).toMatchObject({ id: 'micro-main', kind: 'arterial', points: roads[0]!.points })
+  expect(layoutThroughRoadHistory(roads, 200, 150)).toHaveLength(1)
+})
+
+it('does not invent a connection between physically separate banks only millimetres apart', () => {
+  const roads: Road[] = programme([
+    { id: 'west-bank', kind: 'arterial', role: 'highway', width: 12, boundaryContinuation: true, points: [{ x: -20, y: 70 }, { x: 100, y: 70 }] },
+    { id: 'east-bank', kind: 'arterial', role: 'highway', width: 12, boundaryContinuation: true, points: [{ x: 100.003, y: 70 }, { x: 220, y: 70 }] },
+  ])
+  expect(designateLayoutThroughRoads(roads, 200, 150).every(road => road.kind === 'local')).toBe(true)
+})
 it('continues the designation over a real bridge and splits an unused side tail', () => {
   const roads: Road[] = programme([
     { id: 'west', kind: 'arterial', width: 12, boundaryContinuation: true, points: [{ x: -30, y: 50 }, { x: 50, y: 50 }] },
