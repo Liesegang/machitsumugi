@@ -50,6 +50,8 @@ describe('layout-first regional railway', () => {
       expect(pointInPolygon(station.entrance!, result.stationGrounds[index]!.polygon)).toBe(true)
       expect(pointInPolygon(result.accessTargets[index]!.point, result.stationGrounds[index]!.polygon)).toBe(false)
       expect(result.stationPaths[index]!.points).toEqual([result.accessTargets[index]!.point, station.entrance!])
+      expect(result.accessTargets[index]!.builtYear).toBe(station.builtYear)
+      expect(result.accessTargets[index]!.endHeading).toBeCloseTo(Math.atan2(station.entrance!.y - result.accessTargets[index]!.point.y, station.entrance!.x - result.accessTargets[index]!.point.x), 12)
       expect(station.buildingPolygon!.every(p => pointInPolygon(p, result.stationGrounds[index]!.polygon))).toBe(true)
       expect(result.stationGrounds[index]!.polygon.every(p => !input.terrain.waterAt(p) && input.terrain.slope(p) <= .12)).toBe(true)
     }

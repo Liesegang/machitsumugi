@@ -23,7 +23,7 @@ export interface LayoutFirstRailResult {
   /** Reserve these complete forecourts before assigning residential parcels. */
   stationGrounds: Area[]
   /** Public roads stop outside reserved grounds; these paths reach the doors. */
-  accessTargets: { id: string; point: Point; builtYear: number }[]
+  accessTargets: { id: string; point: Point; builtYear: number; endHeading?: number }[]
   stationPaths: Road[]
   diagnostics: {
     requestedStations: number
@@ -163,7 +163,7 @@ export function surveyLayoutFirstRail(input: LayoutFirstRailInput): LayoutFirstR
   })
   return { railways: [{ id: 'railway-main', name: `${base}線`, points: plan.points, elevations: plan.elevations, structures: plan.structures, builtYear: 1900 }], stations,
     stationGrounds: selected.map((site, i) => ({ id: `station-forecourt-${i}`, kind: 'field', landUse: 'vacant', polygon: site.forecourt, name: `${stations[i]!.name}前広場` })),
-    accessTargets: selected.map((site, i) => ({ id: `station-access-${i}`, point: site.gate, builtYear: 1900 })),
+    accessTargets: selected.map((site, i) => ({ id: `station-access-${i}`, point: site.gate, builtYear: 1900, endHeading: Math.atan2(site.entrance.y - site.gate.y, site.entrance.x - site.gate.x) })),
     stationPaths: selected.map((site, i) => ({ id: `station-access-${i}`, points: [site.gate, site.entrance], width: 3, role: 'access', kind: 'local', builtYear: 1900, reason: '駅前の公道から駅舎の入口に至る歩行者動線' })),
     diagnostics: { requestedStations: requested, placedStations: stations.length, alignment: plan.diagnostics, ...(stations.length < requested ? { reason: '駅間隔と駅舎・駅前広場の地盤条件を満たす地点に駅を絞りました。' } : {}) } }
 }

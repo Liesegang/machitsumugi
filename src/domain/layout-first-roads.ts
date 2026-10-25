@@ -24,14 +24,14 @@ import { surveyLayoutCoverageAlignment } from './layout-first-coverage-survey'
 import type { LayoutCoverageSurveyAttempt } from './layout-first-coverage-survey'
 import { layoutCoverageHasPhysicalGain, runLayoutCoveragePass } from './layout-first-coverage-pass'
 
-export interface LayoutAccessTarget { id: string; point: Point; builtYear: number }
+export interface LayoutAccessTarget { id: string; point: Point; builtYear: number; endHeading?: number }
 export interface LayoutRoadDiagnostics {
   attempted: number; accepted: number; rejected: number; boundaryConnections: number
   bridges: number; streetLength: number; unservedZoneIds: string[]; unservedAccessIds: string[]
   selectedCenter?: Point
   surveyedBridges?: (SurveyedBridgeSpan & { roadId: string })[]
   boundaryAttempts?: { start: Point; portal: Point; route: boolean; finiteCost: boolean; reservations: boolean; railWidth: boolean; cost?: number; length?: number; milliseconds?: number; phase?: 'mesh-exit' }[]
-  accessAttempts?: { id: string; start: Point; target: Point; route: boolean; reservations: boolean; railWidth: boolean }[]
+  accessAttempts?: { id: string; start: Point; target: Point; route: boolean; reservations: boolean; railWidth: boolean; endHeading?: number }[]
   coverage?: { builtYear: number; phase?: 'before-fallback' | 'after-fallback'; before: number; after: number; enclosedGain: number; coveredGain: number; streetLength: number; attempted: number; accepted: number; routeFailures: number; guardFailures: number; unchangedFaces: number; proposalRounds?: number; prioritySites?: number; priorityGaps?: number; surveyAttempts?: { from: Point; to: Point; through: Point; attempts: LayoutCoverageSurveyAttempt[]; rejectedInput?: string }[] }[]
   railServiceCuts?: { attempted: number; accepted: number; streetLength: number; trials: { center: Point; area: number; builtYear: number; adopted: boolean; postSurvey?: string; attempts: { railwayId: string; side: -1 | 1; offset: number; reason: string }[] }[] }
 }
@@ -216,18 +216,19 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     return added
   }
   let lastSurvey: { route: boolean; reservations: boolean; railWidth: boolean } | undefined
-  const survey = (from: Point, to: Point, role: RoadRole, roadWidth: number, year: number, reason: string, allowBridge = false, maxNodes = 900) => {
+  const survey = (from: Point, to: Point, role: RoadRole, roadWidth: number, year: number, reason: string, allowBridge = false, maxNodes = 900, endHeading?: number) => {
     check(); diagnostics.attempted++
     // Search the same entire right of way that the final ownership check
     // certifies. A five-metre carriageway plus its two 0.75m shoulders must not
     // repeatedly choose a path that just clips a protected campus corner.
     const surveyWidth = roadWidth + (role === 'access' ? 1.5 : 0)
-    const shortAccess = role === 'access' && distance(from, to) < 20 && distance(from, to) > 1e-7 && planner.validate([from, to], surveyWidth) && (!environment.terrain || surveyedRoadGradeAllowed({ points: [from, to] }, .13, environment.terrain.elevation))
+    const endCompatible = endHeading === undefined || Math.abs(Math.atan2(Math.sin(heading(from, to) - endHeading), Math.cos(heading(from, to) - endHeading))) <= .1
+    const shortAccess = role === 'access' && endCompatible && distance(from, to) < 20 && distance(from, to) > 1e-7 && planner.validate([from, to], surveyWidth) && (!environment.terrain || surveyedRoadGradeAllowed({ points: [from, to] }, .13, environment.terrain.elevation))
     const localFrame = role === 'lane' || role === 'collector' && !allowBridge && distance(from, to) <= 200
     const straightFrame = localFrame && planner.validate([from, to], roadWidth) && (!environment.terrain || surveyedRoadGradeAllowed({ points: [from, to] }, .13, environment.terrain.elevation))
     // A failed local block edge is omitted, not rerouted around a mountain or
     // through an entire neighbouring district. Collectors/gates retain search.
-    const route = shortAccess || straightFrame ? planner.cost([from, to], role) : role === 'lane' ? null : planner.plan(from, to, { role, width: surveyWidth, allowBridge, alignment: role === 'access' ? 'planned' : 'natural', maximumGrade: role === 'highway' ? .09 : .13, maxNodes: localFrame ? Math.min(maxNodes, 64) : maxNodes })
+    const route = shortAccess || straightFrame ? planner.cost([from, to], role) : role === 'lane' ? null : planner.plan(from, to, { role, width: surveyWidth, allowBridge, alignment: role === 'access' ? 'planned' : 'natural', maximumGrade: role === 'highway' ? .09 : .13, maxNodes: localFrame ? Math.min(maxNodes, 64) : maxNodes, ...(endHeading !== undefined ? { endHeading } : {}) })
     if (role === 'access') lastSurvey = { route: !!route, reservations: !!route && avoidsReservations(route.points, roadWidth), railWidth: !!route && planner.railwayWidthAllows(route.points, .01, roadWidth, role) }
     // A later anchor cannot lend its physical connection to an earlier map.
     const anchorYear = openStreet(from, .15, year)?.road.builtYear ?? graph.nearest(from, .15)?.road.builtYear ?? year
@@ -408,6 +409,22 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
         if (++attempts >= (finalPass ? 8 : 3)) break
       }
       if (served) break
+    }
+    if (!served && target.endHeading !== undefined && Number.isFinite(target.endHeading)) {
+      // A surveyed station gate has an actual open mouth outside its reserved
+      // forecourt. Retry that arrival only after ordinary access failed; the
+      // same old public anchors, search budget and physical guards still apply.
+      const sectors = new Set<number>()
+      let attempts = 0
+      for (const start of openProjections(target.point, Math.max(1200, Math.min(width, height) * .85), target.builtYear, 64)) {
+        const sector = Math.floor((heading(target.point, start.point) + Math.PI) / (Math.PI / 4))
+        if (sectors.has(sector)) continue
+        sectors.add(sector)
+        const road = survey(start.point, target.point, 'access', 5, target.builtYear, '測量済みの駅前入口の向きに沿う公道接続', true, 1600, target.endHeading)
+        diagnostics.accessAttempts?.push({ id: target.id, start: start.point, target: target.point, endHeading: target.endHeading, ...(lastSurvey ?? { route: false, reservations: false, railWidth: false }) })
+        if (road) { served = true; break }
+        if (++attempts >= 2) break
+      }
     }
     return served
   }

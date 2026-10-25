@@ -1,6 +1,6 @@
 import type { Point } from './types'
 import type { PolygonRegion } from './geometry'
-export const LAYOUT_GENERATOR_VERSION = '2.6.0-layout.13'
+export const LAYOUT_GENERATOR_VERSION = '2.6.0-layout.14'
 
 /** A whole-city land brief. Actual station catchments are measured on the final
  * public street network; this shape does not grant a building form or a title. */
