@@ -54,6 +54,14 @@ describe('supported coast survey framing', () => {
     }
     expect(wrappingRows + wrappingColumns).toBeGreaterThan(0)
   })
+  it('prefers an existing reentrant bay to an equally feasible featureless open shore', () => {
+    const seaAt = (p: Point) => p.y > 12000 || ((p.x - 12000) / 900) ** 2 + ((p.y - 11800) / 1500) ** 2 < 1
+    const frame = coastalWindow({ width: 4000, height: 3000, extent: 24000, margin: 500, mirrored: false, landform: 'ria',
+      candidates: [{ index: 0, point: { x: 5000, y: 11950 }, score: -10 }, { index: 1, point: { x: 11200, y: 11050 }, score: -10 }], seaAt, usableAt: p => !seaAt(p) })!
+    expect(frame.index).toBe(1)
+    expect(frame.seaFraction).toBeGreaterThan(.2)
+    expect(frame.usableFraction).toBeGreaterThan(.4)
+  })
 
   it('retains real sea and land while supporting the full road continuation margin', () => {
     const shoreline = (x: number) => 20000 + 900 * Math.exp(-(((x - 12000) / 1800) ** 2))

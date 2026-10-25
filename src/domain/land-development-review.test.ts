@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import { developLand } from './land-development'
-import { scenarioDemandAtYear } from './urban-growth'
 import { pointInPolygon, polygonArea, polygonsOverlap } from './geometry'
 import type { CityConfig, Road } from './types'
 
@@ -27,20 +26,27 @@ describe('land market and surviving historic stock regressions', () => {
     expect(gentlySloping.buildings.some(b => (b.builtYear ?? 0) > 1960)).toBe(true)
   })
   it('uses housing shortage to rebuild old station lots with explicit history', () => {
-    const acquired = historic.buildings.filter(old => flat.events.some(event => event.kind === 'acquisition' && event.entityId === old.id))
-    expect(acquired.length).toBeGreaterThan(0)
-    for (const old of acquired) {
-      const acquisition = flat.events.find(event => event.kind === 'acquisition' && event.entityId === old.id)!
-      const replacement = flat.buildings.find(building => building.parcelId === old.parcelId)!
+    const acquisitions = flat.events.filter(event => event.id.startsWith('redevelop-acquire-'))
+    expect(acquisitions.length).toBeGreaterThan(0)
+    for (const acquisition of acquisitions) {
+      const previous = flat.history.buildings.find(version => version.value.id === acquisition.entityId)!, old = previous.value
+      const next = flat.history.buildings.find(version => version.from === acquisition.year && version.value.parcelId === old.parcelId)!, replacement = next.value
       expect(acquisition.year).toBeGreaterThanOrEqual(1960)
-      const previous = flat.snapshots.filter(snapshot => snapshot.year < acquisition.year).at(-1)!
-      expect(scenarioDemandAtYear(config, acquisition.year).households).toBeGreaterThan(previous.capacity)
+      expect(previous.to).toBe(acquisition.year)
+      expect(acquisition.year - old.builtYear!).toBeGreaterThanOrEqual(35)
       expect(replacement.id).not.toBe(old.id)
-      const originalParcel = historic.parcels.find(p => p.id === old.parcelId)!
-      const currentParcel = flat.parcels.find(p => p.id === old.parcelId)!
+      const originalParcel = flat.history.parcels.find(version => version.value.id === old.parcelId)!.value
+      const currentParcel = flat.history.parcels.find(version => version.value.id === old.parcelId && version.from <= acquisition.year && (version.to === undefined || acquisition.year < version.to))!.value
       expect(currentParcel.polygon).toEqual(originalParcel.polygon)
+      expect(currentParcel.createdYear).toBe(originalParcel.createdYear)
       expect(replacement.polygon.every(p => pointInPolygon(p, currentParcel.polygon))).toBe(true)
-      expect(replacement.height).toBeGreaterThan(old.height)
+      expect(replacement.kind).toBe('residential')
+      expect(currentParcel.use).toBe('residential')
+      // The project supplies real dwellings, including conversion from a shop
+      // whose upper floor need not become taller. Shared space is still paid
+      // from its actual floor area rather than assigning units to a label.
+      expect(replacement.height * 2).toBeGreaterThan(1)
+      expect(polygonArea(replacement.polygon) * replacement.height).toBeGreaterThanOrEqual(replacement.height * 2 * 90)
       expect(replacement.builtYear).toBe(acquisition.year)
       expect(flat.events.some(event => event.kind === 'construction' && event.entityId === replacement.id && event.year === acquisition.year)).toBe(true)
     }

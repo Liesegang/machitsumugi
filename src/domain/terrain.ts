@@ -5,6 +5,7 @@ import { contourConnectedSea } from './sea-contour.ts'
 import { evolveChannel } from './river-evolution.ts'
 import { channelHasCrossings } from './channel-topology'
 import { surveyChannelWidths } from './channel-hydraulic-geometry.ts'
+import { estuarineWidthPriors } from './estuary-hydraulics.ts'
 import { channelFootprint } from './channel-footprint.ts'
 import { reworkChannelBed } from './channel-sediment.ts'
 import type { ChannelBedSection, ChannelSedimentBudget } from './channel-sediment.ts'
@@ -223,7 +224,7 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   // rotating already clipped polygons (which would leave unsupported corners).
   const frameSeed = seedNumber(`${input.seed}:map-frame-v1`)
   const style = noise(frameSeed, 0, 8), mirrored = frameSeed % 2 === 1, mirror = mirrored ? -1 : 1
-  const coastFrame = input.terrain === 'coast' ? coastalWindow({ width: w, height: h, extent: world.extent, margin: 500, mirrored, preferredBearing: style * Math.PI * 2, ...(input.coastType === 'peninsula' ? { landform: 'peninsula' as const } : {}), candidates: coastalCandidates, seaAt: p => p.x >= 0 && p.y >= 0 && p.x <= world.extent && p.y <= world.extent && !!world.ocean[indexAt(p)], usableAt: p => !!habitable[indexAt(p)] }) : null
+  const coastFrame = input.terrain === 'coast' ? coastalWindow({ width: w, height: h, extent: world.extent, margin: 500, mirrored, preferredBearing: style * Math.PI * 2, ...(input.coastType === 'delta' ? {} : { landform: input.coastType ?? 'bay' }), candidates: coastalCandidates, seaAt: p => p.x >= 0 && p.y >= 0 && p.x <= world.extent && p.y <= world.extent && !!world.ocean[indexAt(p)], usableAt: p => !!habitable[indexAt(p)] }) : null
   if (coastFrame) pivot = coastFrame.index
   const angle = coastFrame?.angle ?? (style - .5) * .9, cosine = Math.cos(angle), sine = Math.sin(angle)
   const oppositeBank = style > .5
@@ -323,6 +324,7 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
   const initialSections: ChannelBedSection[] = [], abandoned: (AbandonedChannel & { id: string; sourceRiverId: string; level: number })[] = []
   const mobileSediment = (world as RegionalTerrain & { alluvium?: Float32Array }).alluvium
   const channelGround = (p: Point) => { const q = regional(p); return sampleRegionalCubic(world, world.rawDEM, q.x, q.y) }
+  const tidalPrior = (points: Point[], referenceWidths: number[], surfaceElevation: number[]) => estuarineWidthPriors({ points, referenceWidths, surfaceElevation, coastType: input.coastType, oceanAt: p => world.ocean[indexAt(regional(p))] === 1 })
   const channelAlluvium = mobileSediment ? (p: Point) => { if (lakeAt(p)) return 0; const q = regional(p); return sampleRegional(world, mobileSediment, q.x, q.y) } : undefined
   for (const [pathIndex, selectedPath] of cellPaths.entries()) {
     const fullPath = extendHeadwaterPath({ cells: selectedPath, flowTo: world.flowTo, accumulatedArea: world.accumulatedArea, ocean: world.ocean, columns: world.columns, rows: world.rows, sourceArea: sourceModel.sourceArea })
@@ -335,7 +337,8 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     // move its confluences away from the tributary endpoints and break the water.
     const knots = [0, ...cells.flatMap((cell, i) => i > 0 && i < cells.length - 1 && upstream(cell).length > 1 ? [i] : []), cells.length - 1]
     const referenceWidths = cells.map((cell, i) => sourceModel.width(pathIndex > 0 && i === cells.length - 1 ? Math.min(world.accumulatedArea[cell]!, world.accumulatedArea[cells[i - 1]!]! * 1.02) : world.accumulatedArea[cell]!))
-    const originalWidths = surveyChannelWidths({ points: original, referenceWidths, surfaceElevation: cells.map(cell => world.ocean[cell] ? 0 : world.hydroDEM[cell]!), groundElevation: channelGround, alluvium: channelAlluvium })
+    const originalLevels = cells.map(cell => world.ocean[cell] ? 0 : world.hydroDEM[cell]!)
+    const originalWidths = surveyChannelWidths({ points: original, referenceWidths: tidalPrior(original, referenceWidths, originalLevels), surfaceElevation: originalLevels, groundElevation: channelGround, alluvium: channelAlluvium })
     const evolved = evolveChannel({ points: original, widths: originalWidths, pinned: knots, allowCutoff, valleyElevation: channelGround, alluvium: channelAlluvium })
     const sourceRiverId = pathIndex === 0 ? 'river' : `river-branch-${pathIndex}`
     channelEvolution.push({ id: sourceRiverId, steps: evolved.steps, maxMigration: evolved.maxMigration, cutoffs: evolved.abandoned.length })
@@ -372,7 +375,7 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
         referenceWidths.push(sourceModel.width(accumulated))
         drainageArea.push(accumulated); surfaceElevation.push(z); lastArea = accumulated; lastElevation = z
       }
-      return { widths: surveyChannelWidths({ points: line, referenceWidths, surfaceElevation, groundElevation: channelGround, alluvium: channelAlluvium }), drainageArea, surfaceElevation }
+      return { widths: surveyChannelWidths({ points: line, referenceWidths: tidalPrior(line, referenceWidths, surfaceElevation), surfaceElevation, groundElevation: channelGround, alluvium: channelAlluvium }), drainageArea, surfaceElevation }
     }
     // Initial and evolved beds use the exact same reconstruction and width
     // rule. Mapping simplification itself must not be counted as bank erosion.

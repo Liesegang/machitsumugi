@@ -14,7 +14,7 @@ export function renewExistingRoad(input: { graph: PlanarRoadGraph; planner: Pick
   const traffic = input.traffic ?? assignRoadTraffic({ roads: input.graph.roads, cells: input.cells, destinations: input.destinations, year: input.year })
   const candidates = input.graph.roads.flatMap(road => {
     const load = traffic.loads.get(road.id)
-    if (!load || load.peakVehicles < 80 || road.width >= (input.actualStock ? 13 : 9.5) || road.bridge || controlledRoad(road) || road.role === 'farm' || input.year - (road.modifiedYear ?? road.builtYear) < 25) return []
+    if (!load || load.peakVehicles < 80 || road.width >= (input.actualStock ? 13 : 9.5) || road.bridge || controlledRoad(road) || input.year - (road.modifiedYear ?? road.builtYear) < 25) return []
     const length = roadLength(road.points)
     if (length < 45 || length > 2400) return []
     const role = road.role === 'highway' ? 'highway' as const : 'collector' as const

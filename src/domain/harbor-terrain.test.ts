@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyHarborTerrain } from './harbor-terrain'
+import { applyHarborTerrain, harborAreaHistory } from './harbor-terrain'
 import { pointInRegion, rectangle, regionArea } from './geometry'
 import type { TerrainModel } from './terrain'
 import type { Area, Point } from './types'
@@ -19,7 +19,8 @@ describe('explicit harbor reclamation', () => {
     const { terrain, harbor } = applyHarborTerrain(base, input)
     expect(harbor).not.toBeNull()
     expect(harbor!.reclaimedArea).toBeGreaterThan(14000)
-    expect(harbor!.reclaimedArea).toBeLessThan(22000)
+    expect(harbor!.stages.length).toBeGreaterThan(1)
+    expect(harbor!.constructionCost).toBeLessThanOrEqual(harbor!.capitalBudget)
     const originalSea = base.areas.filter(a => a.kind === 'water').reduce((sum, a) => sum + regionArea(a), 0)
     const sea = terrain.areas.filter(a => a.kind === 'water')
     expect(originalSea - sea.reduce((sum, a) => sum + regionArea(a), 0)).toBeCloseTo(harbor!.reclaimedArea, 1)
@@ -35,9 +36,34 @@ describe('explicit harbor reclamation', () => {
     for (let y = 20; y < input.height; y += 43) for (let x = 20; x < input.width; x += 41) {
       const p = { x, y }
       expect(terrain.waterAt(p)).toBe(sea.some(a => pointInRegion(p, a)))
-      if (!pointInRegion(p, { polygon: harbor!.platform })) expect(terrain.waterAt(p)).toBe(base.waterAt(p))
+      if (!harbor!.stages.some(stage => pointInRegion(p, { polygon: stage.platform }))) expect(terrain.waterAt(p)).toBe(base.waterAt(p))
     }
     expect(applyHarborTerrain(base, input).harbor).toEqual(harbor)
+  })
+  it('keeps real open water between separate dated pier works and books imported solid and exact area loss', () => {
+    const base = coast(), result = applyHarborTerrain(base, input), harbor = result.harbor!
+    expect(harbor.stages.map(stage => stage.constructionYear)).toEqual([1920, 1955, 1975])
+    const beforeArea = base.areas.filter(a => a.id.startsWith('sea')).reduce((s, r) => s + regionArea(r), 0)
+    let previous = beforeArea
+    for (const stage of harbor.stages) {
+      const terrain = result.terrainAt(stage.constructionYear), after = terrain.areas.filter(a => a.id.startsWith('sea')).reduce((s, r) => s + regionArea(r), 0)
+      expect(previous - after).toBeCloseTo(stage.reclaimedArea, 2)
+      expect(stage.solidBalanceError).toBeCloseTo(0, 8)
+      expect(stage.importedFillVolume).toBeGreaterThan(0)
+      expect(stage.earthworkVolume).toBeGreaterThan(0)
+      expect(stage.constructionCost).toBeGreaterThan(0)
+      for (const p of stage.internalPath) expect(terrain.waterAt(p)).toBe(false)
+      expect(result.terrainAt(stage.constructionYear - 1).waterAt(stage.quay[0])).toBe(true)
+      previous = after
+    }
+    expect(result.terrainAt(1900)).toBe(base)
+    // A concave pier phase has dry arms with an actual retained sea basin.
+    const middle = harbor.stages[1]!, basin = { x: (middle.platform[4]!.x + middle.platform[5]!.x) / 2 + middle.outward.x * 25, y: (middle.platform[4]!.y + middle.platform[5]!.y) / 2 + middle.outward.y * 25 }
+    expect(base.waterAt(basin)).toBe(true)
+    expect(result.terrain.waterAt(basin)).toBe(true)
+    const histories = harborAreaHistory(base.areas, harbor.stages)
+    for (const year of [1900, 1920, 1955, 1975]) expect(histories.filter(v => v.from <= year && (v.to ?? Infinity) > year).reduce((s, v) => s + regionArea(v.value), 0)).toBeCloseTo(result.terrainAt(year).areas.reduce((s, r) => s + regionArea(r), 0), 3)
+    expect(applyHarborTerrain(base, { ...input, capitalBudget: 1 }).harbor).toBeNull()
   })
   it('does not dam a river mouth or build across inaccessible high coastal cliffs', () => {
     const mouth: Area = { id: 'river-mouth', kind: 'water', polygon: rectangle(2170, 0, 160, 3000) }

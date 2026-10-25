@@ -10,6 +10,20 @@ function graph() {
 }
 const cost = (points: { x: number; y: number }[]) => ({ points, length: 600, cost: 600, bridgeLength: 0, method: 'direct' as const })
 describe('funded road renewal', () => {
+  it('can acquire and widen a former farm route when actual urban traffic funds a collector, preserving its original history', () => {
+    const makeFarm = () => {
+      const roads = new PlanarRoadGraph()
+      roads.add([{ x: 0, y: 100 }, { x: 600, y: 100 }], { id: 'inherited-farm', builtYear: 1650, width: 3.2, role: 'farm', kind: 'local', phase: 'regional', reason: '耕地への道', constructionCost: 300 }, false)
+      return roads
+    }
+    const input = { planner: { validate: () => true, railwayWidthAllows: () => true, cost }, cells: [{ point: { x: 590, y: 100 }, households: 1400 }], destinations: [{ point: { x: 0, y: 100 }, weight: 1 }], year: 1955, funds: 8000 }
+    const roads = makeFarm(), renewed = renewExistingRoad({ ...input, graph: roads })
+    expect(renewed).not.toBeNull()
+    expect(renewed!.road.role).toBe('collector')
+    expect(renewed!.cost).toBeGreaterThan(0)
+    expect(roads.roadHistory.map(version => [version.from, version.to, version.value.role, version.value.width])).toEqual([[1650, 1955, 'farm', 3.2], [1955, undefined, 'collector', 9.5]])
+    for (const override of [{ cells: [] }, { funds: 1 }, { planner: { ...input.planner, validate: () => false } }]) expect(renewExistingRoad({ ...input, ...override, graph: makeFarm() })).toBeNull()
+  })
   it('upgrades inhabited old streets within capital funds and preserves their old width and junctions', () => {
     const roads = graph(), cells = [{ point: { x: 590, y: 100 }, households: 1400 }]
     const result = renewExistingRoad({ graph: roads, planner: { validate: () => true, railwayWidthAllows: () => true, cost }, cells, destinations: [{ point: { x: 0, y: 100 }, weight: 1 }], year: 1955, funds: 5000 })

@@ -27,20 +27,27 @@ describe('settlement scale and demographic history', () => {
     expect(scenarioDemandAtYear(decline, 1930)).toEqual(scenarioDemandAtYear({ ...decline, populationTrend: 'growing' }, 1930))
   })
 
-  it('retains inherited physical stock while declining demand becomes vacancy', () => {
+  it('retains acquired land and dated stock while declining demand creates vacancy and eventual old-building clearance', () => {
     const config = { name: '山里', seed: 'vacancy-17', type: 'post', terrain: 'plain', density: 65, forest: 0, railway: false, stations: 1, arterial: false, facilities: [], era: 'present', settlement: 'village', populationTrend: 'declining' } as CityConfig
     const roads: Road[] = [{ id: 'old-valley', points: [{ x: 200, y: 500 }, { x: 1600, y: 500 }], kind: 'local', role: 'lane', width: 4.5, builtYear: 1650 }]
     const result = developLand({ config, roads, center: { x: 900, y: 500 }, stations: [], canPlace: () => true, slope: () => 0 })
     const final = result.snapshots.at(-1)!, peak = result.snapshots.reduce((a, b) => a.households > b.households ? a : b)
     expect(final.households).toBeLessThan(peak.households)
-    expect(final.buildings).toBeGreaterThanOrEqual(peak.buildings)
+    expect(final.buildings).toBeGreaterThan(0)
+    const clearedAfterPeak = result.history.buildings.filter(version => version.to !== undefined && version.to > peak.year)
+    expect(clearedAfterPeak.length).toBeGreaterThan(0)
+    for (const version of clearedAfterPeak) {
+      expect(version.value.builtYear).toBeLessThan(version.to!)
+      expect(result.events.some(event => event.kind === 'acquisition' && event.entityId === version.value.id && event.year === version.to)).toBe(true)
+      expect(result.parcels.some(parcel => parcel.id === version.value.parcelId)).toBe(true)
+    }
     expect(final.vacant).toBeGreaterThan(0)
     expect(result.buildings.some(building => (building as unknown as { occupancy: string }).occupancy === 'vacant')).toBe(true)
     // Potential frontages are no longer pre-owned titles. Initial residential
     // purchases are now recorded; declining demand must still retain that
     // physical stock rather than buying/clearing additional land after the
     // scenario's demographic peak (occupied stock can plateau earlier).
-    const acquisitions = result.events.filter(event => event.kind === 'acquisition')
+    const acquisitions = result.events.filter(event => event.id.startsWith('title-acquisition-'))
     expect(acquisitions.length).toBeGreaterThan(0)
     const demandPeak = simulationYears(2025).reduce((a, b) => scenarioDemandAtYear(config, a).households > scenarioDemandAtYear(config, b).households ? a : b)
     expect(acquisitions.every(event => event.year <= demandPeak)).toBe(true)

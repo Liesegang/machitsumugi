@@ -3,7 +3,7 @@ import type { Point } from './types'
 interface CoastalWindowInput {
   width: number; height: number; extent: number; margin: number; mirrored: boolean
   preferredBearing?: number
-  landform?: 'peninsula'
+  landform?: 'peninsula' | 'bay' | 'ria'
   candidates: { index: number; point: Point; score: number }[]
   seaAt(p: Point): boolean
   usableAt(p: Point): boolean
@@ -53,7 +53,7 @@ export function coastalWindow(input: CoastalWindowInput): CoastalWindow | null {
         const wet = input.seaAt(q)
         if (wet) sea++
         else if (input.usableAt(q)) usable++
-        if (input.landform === 'peninsula') {
+        if (input.landform) {
           if (!x) rowTransitions = 0
           else if (wet !== rowPrevious) rowTransitions++
           if (y && Number(wet) !== columnPrevious[x]) columnTransitions[x]++
@@ -65,8 +65,8 @@ export function coastalWindow(input: CoastalWindowInput): CoastalWindow | null {
       const seaFraction = sea / 192, usableFraction = usable / 192
       // Balanced framing is a map-selection preference, not a target supplied
       // to the erosion or sea-level calculation. Keep useful land and real sea.
-      const targetSea = input.landform === 'peninsula' ? .45 : .3
-      const wrapping = input.landform === 'peninsula' ? Math.max(wrappingRows / 12, wrappingColumns / 16) * .45 : 0
+      const targetSea = input.landform === 'peninsula' ? .45 : input.landform === 'ria' ? .4 : input.landform === 'bay' ? .36 : .3
+      const wrapping = input.landform ? Math.max(wrappingRows / 12, wrappingColumns / 16) * (input.landform === 'peninsula' ? .45 : .75) : 0
       const bearingCost = input.preferredBearing === undefined ? 0 : (1 - Math.cos(angle - input.preferredBearing)) * .08
       const cost = site.score * .1 + Math.abs(seaFraction - targetSea) * 3 + Math.max(0, .12 - seaFraction) * 35 + Math.max(0, seaFraction - .65) * 20 - usableFraction - wrapping + bearingCost + Math.hypot(worldAnchor.x - site.point.x, worldAnchor.y - site.point.y) / 800
       if (cost < bestCost) { bestCost = cost; best = { index: site.index, worldAnchor, localAnchor, angle, seaFraction, usableFraction } }

@@ -9,7 +9,7 @@ const modes = ['bay', 'ria', 'delta', 'peninsula'] as const
 const extent = 24_000
 
 describe('relative coastal base-level history', () => {
-  it.each([['ria', -40], ['peninsula', -80]] as const)('%s drowns the evolved margin during the final sixteen geological updates', (kind, lowstand) => {
+  it.each([['ria', -40], ['peninsula', -80], ['bay', -24]] as const)('%s drowns the evolved margin during the final sixteen geological updates', (kind, lowstand) => {
     const levels = Array.from({ length: 257 }, (_, i) => coastalSeaLevel(kind, i, 256))
     expect(levels.slice(0, 241).every(level => level === lowstand)).toBe(true)
     expect(levels[248]).toBe(lowstand / 2)
@@ -20,7 +20,7 @@ describe('relative coastal base-level history', () => {
       expect(levels[i]!).toBeLessThanOrEqual(0)
     }
   })
-  it.each(['bay', 'delta', undefined] as const)('%s retains its existing constant reference level', kind => {
+  it.each(['delta'] as const)('%s retains its existing constant reference level', kind => {
     for (let i = 0; i <= 256; i++) expect(coastalSeaLevel(kind, i, 256)).toBe(0)
   })
 })

@@ -11,6 +11,8 @@ import type { DevelopmentSiteSurvey } from './development-terrain'
 import { surveyResidentialEstate } from './residential-estate'
 import { rearPrivateAccess } from './rear-private-access'
 import { isConstructionYear, simulationEndYear, simulationYears } from './simulation-calendar'
+import { advanceBuildingLife, buildingReplacementInvoice, fundBuildingReplacement, newBuildingLifeAccount } from './building-lifecycle'
+import type { BuildingLifeAccount } from './building-lifecycle'
 
 export const GENERATOR_VERSION = '2.5.0'
 export { EPOCH_YEAR } from './simulation-calendar'
@@ -140,6 +142,15 @@ export function developLand(input: DevelopmentInput) {
   const industry = input.centers?.find(c => c.kind === 'industrial')
   const end = simulationEndYear(config), candidates: Candidate[] = [], events: GrowthEvent[] = [], snapshots: SimulationSnapshot[] = []
   const history = { buildings: [] as TimelineVersion<Building>[], parcels: [] as TimelineVersion<Parcel>[], buildingStates: [] as BuildingState[] }
+  const lifeAccounts = new Map<Candidate, BuildingLifeAccount>()
+  const lifecycle: { year: number; receipts: number; maintenance: number; construction: number; clearance: number; initialBonds: number; releasedCapital: number; cashBalance: number; bondBalance: number; renewed: number; retired: number }[] = []
+  const physicalIds = new Set<string>()
+  const physicalBuildingId = (base: string, year: number) => {
+    let id = base, serial = 0
+    while (physicalIds.has(id)) id = `${base}-${year}-${++serial}`
+    physicalIds.add(id)
+    return id
+  }
   const liveBuildings = new Map<string, TimelineVersion<Building>>(), liveParcels = new Map<string, TimelineVersion<Parcel>>()
   const occupancyStates = new Map<string, BuildingState>()
   const inheritedGardens = new Map<Candidate, Candidate[]>()
@@ -331,6 +342,7 @@ export function developLand(input: DevelopmentInput) {
   const versionedIds = new Set(input.roadHistory?.map(version => version.value.id))
   for (const year of simulationYears(end)) {
     const constructionYear = isConstructionYear(year)
+    const lifeRound = { year, receipts: 0, maintenance: 0, construction: 0, clearance: 0, initialBonds: 0, releasedCapital: 0, cashBalance: 0, bondBalance: 0, renewed: 0, retired: 0 }
     const activeRoads = input.roadHistory ? [...input.roadHistory.filter(version => version.from <= year && (version.to === undefined || year < version.to)).map(version => version.value), ...roads.filter(road => !versionedIds.has(road.id) && (road.builtYear ?? 1700) <= year)] : roads.filter(r => (r.builtYear ?? 1700) <= year)
     const activeStations = year >= 1900 ? stations : []
     const destinations = input.centers?.filter(c => c.activeYear <= year).map(c => c.point) ?? [center]
@@ -357,7 +369,7 @@ export function developLand(input: DevelopmentInput) {
         lodgingSerial++
         acquireTitle(c, year)
         c.parcel.use = 'commercial'; c.parcel.developedYear = year; c.capacity = 0
-        c.building = { id: `lodging-${c.parcel.id}-${year}`, parcelId: c.parcel.id, polygon: footprint, kind: 'commercial', use: 'lodging', lodgingType: kind, guestRooms, name: kind === 'hotel' ? `ホテル${stem}${suffix}` : `${stem}${suffix}旅館`, height, builtYear: year, occupiedHouseholds: 0, occupancy: 'occupied' }
+        c.building = { id: physicalBuildingId(`lodging-${c.parcel.id}-${year}`, year), parcelId: c.parcel.id, polygon: footprint, kind: 'commercial', use: 'lodging', lodgingType: kind, guestRooms, name: kind === 'hotel' ? `ホテル${stem}${suffix}` : `${stem}${suffix}旅館`, height, builtYear: year, occupiedHouseholds: 0, occupancy: 'occupied' }
         c.footprint = footprint; c.formation = formation; built.push(c); rooms += guestRooms
         events.push({ id: `lodging-construction-${year}-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: kind === 'hotel' ? '連続する沿道敷地を取得した温泉ホテルの開業' : '湯の徒歩圏に立地する小旅館の開業' })
       }
@@ -477,10 +489,53 @@ export function developLand(input: DevelopmentInput) {
         // Gross floor space includes shared access/circulation: a scenario
         // allowance of90m² per household, rather than two units for any pad size.
         c.capacity = c.parcel.use === 'industrial' ? 0 : apartment ? height * Math.max(2, Math.floor(polygonArea(c.footprint) / 90)) : commercial ? 1 : 1
-        c.building = { id: `building-${c.parcel.id}`, parcelId: c.parcel.id, builtYear: year, polygon: c.footprint, kind: c.parcel.use, height }
+        c.building = { id: physicalBuildingId(`building-${c.parcel.id}`, year), parcelId: c.parcel.id, builtYear: year, polygon: c.footprint, kind: c.parcel.use, height }
         built.push(c); capacity += c.capacity; added += c.capacity
         if (c.parcel.use === 'industrial') industrialJobs += Math.round(c.area / 35)
         events.push({ id: `construction-${year}-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: c.parcel.use === 'industrial' ? '物流に接続した事業用地の供給' : '既存空室を使い切った後の住宅・商業需要' })
+      }
+    }
+    // Ordinary houses, shops, inns and workshops all age, independently of a
+    // station/housing-shortage project. Keeping a business or a title does not
+    // keep its original physical building. The pad/title/access do not enlarge.
+    if (constructionYear) {
+      const lodgingRooms = built.reduce((sum, c) => sum + (c.building?.guestRooms ?? 0), 0)
+      const businessJobs = built.reduce((sum, c) => sum + (c.building!.kind === 'commercial' && c.building!.use !== 'lodging' ? polygonArea(c.building!.polygon) * c.building!.height / 45 : 0), 0)
+      for (let i = built.length - 1; i >= 0; i--) {
+        const c = built[i]!, old = c.building!, previous = lifeAccounts.get(c)
+        if (!previous || previous.buildingId !== old.id || !canPlace(old.polygon, year)) continue
+        const localUse = Math.exp(-travel(c) / 30)
+        const utilization = old.use === 'lodging' ? Math.min(1, lodgingDemand(config, year) / Math.max(1, lodgingRooms)) * localUse
+          : old.kind === 'industrial' ? Math.min(1, jobs * .45 / Math.max(1, industrialJobs)) * localUse
+          : old.kind === 'commercial' ? Math.min(1, jobs / Math.max(1, industrialJobs + businessJobs)) * localUse
+          : Math.min((old.occupiedHouseholds ?? c.capacity) / Math.max(1, c.capacity), households / Math.max(1, capacity))
+        const step = advanceBuildingLife(previous, year, utilization), account = step.account
+        lifeRound.receipts += step.receipts; lifeRound.maintenance += step.maintenancePaid
+        lifeAccounts.set(c, account)
+        if (step.renewalDue && (!c.parcel.access || canPlace(c.parcel.polygon, year))) {
+          const formation = survey(old.polygon), invoice = buildingReplacementInvoice(account, formation.formationCost)
+          if (formation.viable && formation.maximumFloors >= old.height && account.cash + 1e-7 >= invoice.cashRequired) {
+            const replacement: Building = { ...old, id: physicalBuildingId(`building-${c.parcel.id}-renewal-${year}`, year), builtYear: year, polygon: old.polygon.map(p => ({ ...p })) }
+            const funded = fundBuildingReplacement(config.seed, account, replacement, polygonArea(replacement.polygon), formation.formationCost)
+            if (funded) {
+              events.push({ id: `lifecycle-retire-${year}-${old.id}`, year, kind: 'acquisition', entityId: old.id, reason: `築${step.age}年の老朽建物を更新勘定で除却し、同じ敷地・接道で建替え（除却費${Math.round(invoice.demolition)}）` })
+              c.building = replacement; c.footprint = replacement.polygon; c.formation = formation
+              lifeAccounts.set(c, funded); lifeRound.renewed++; lifeRound.construction += invoice.construction + invoice.foundation; lifeRound.clearance += invoice.demolition
+              events.push({ id: `lifecycle-build-${year}-${replacement.id}`, year, kind: 'construction', entityId: replacement.id, reason: `既存の事業・住居と所有地を継承した新しい建物（建築・基礎更新費${Math.round(invoice.construction + invoice.foundation)}、別途除却積立${Math.round(invoice.newBond)}）` })
+              continue
+            }
+          }
+        }
+        if (step.retirementDue) {
+          events.push({ id: `lifecycle-clearance-${year}-${old.id}`, year, kind: 'acquisition', entityId: old.id, reason: `築${step.age}年・空室${account.vacantYears}年の老朽建物を除却積立で撤去（費用${Math.round(account.demolitionBond)}）、土地の所有は継続` })
+          lifeRound.retired++; lifeRound.clearance += account.demolitionBond
+          lifeRound.releasedCapital += account.cash
+          capacity -= c.capacity
+          if (old.kind === 'industrial') industrialJobs -= Math.round(c.area / 35)
+          c.capacity = old.kind === 'industrial' || old.use === 'lodging' ? 0 : 1
+          c.building = undefined; c.parcel.developedYear = undefined; c.availableYear = year + 10
+          lifeAccounts.delete(c); built.splice(i, 1)
+        }
       }
     }
     // Station access can pay for rebuilding ageing stock after vacant capacity has
@@ -503,7 +558,8 @@ export function developLand(input: DevelopmentInput) {
         const floors = Math.min(zoning(c.frontage, year).maximumFloors, formation.maximumFloors, settlement === 'metropolis' ? station < 550 ? 10 : 6 : station < 220 ? 5 : 3), newCapacity = floors * 2
         if ((newCapacity - c.capacity) * pressure < 4 + c.reluctance * 20 + formation.formationCostPerHousehold / 6) continue
         events.push({ id: `redevelop-acquire-${year}-${c.parcel.id}`, year, kind: 'acquisition', entityId: old.id, reason: '駅周辺の住宅需要による老朽建物の建替え' })
-        c.building = { ...old, id: `building-${c.parcel.id}-${year}`, builtYear: year, height: floors, polygon: renewed }
+        c.parcel = { ...c.parcel, use: 'residential' }
+        c.building = { ...old, id: physicalBuildingId(`building-${c.parcel.id}-${year}`, year), builtYear: year, height: floors, polygon: renewed, kind: 'residential' }
         capacity += newCapacity - c.capacity; c.capacity = newCapacity; c.formation = formation
         events.push({ id: `redevelop-build-${year}-${c.parcel.id}`, year, kind: 'construction', entityId: c.building.id, reason: '既存敷地を継承した共同住宅への建替え' })
       }
@@ -519,16 +575,31 @@ export function developLand(input: DevelopmentInput) {
       }
     }
     // Falling population vacates properties; it does not erase their parcel,
-    // footprint or history. Accessible homes retain use longest in this model.
+    // ownership or history. Unmaintained empty structures can eventually clear.
+    // Accessible homes retain use longest in this model.
+    for (const [c, account] of lifeAccounts) if (!c.building || c.building.id !== account.buildingId) {
+      lifeRound.releasedCapital += account.cash + account.demolitionBond
+      lifeAccounts.delete(c)
+    }
+    const visitorUse = Math.min(1, lodgingDemand(config, year) / Math.max(1, built.reduce((sum, c) => sum + (c.building!.guestRooms ?? 0), 0)))
+    const industrialUse = Math.min(1, jobs * .45 / Math.max(1, industrialJobs))
+    const retailUse = Math.min(1, jobs / Math.max(1, industrialJobs + built.reduce((sum, c) => sum + (c.building!.kind === 'commercial' && c.building!.use !== 'lodging' ? polygonArea(c.building!.polygon) * c.building!.height / 45 : 0), 0)))
     let residents = households
     const occupied = built.map(c => ({ c, value: travel(c) + distance(c.frontage, center) / 500 })).sort((a, b) => a.value - b.value || a.c.parcel.id.localeCompare(b.c.parcel.id))
     for (const { c } of occupied) {
       const used = Math.min(c.capacity, residents)
       residents -= used
-      Object.assign(c.building!, { occupiedHouseholds: used, occupancy: c.building!.use === 'lodging' ? 'occupied' : c.capacity === 0 ? jobs < industrialJobs * .6 ? 'underused' : 'occupied' : used === 0 ? 'vacant' : used < c.capacity ? 'underused' : 'occupied' })
+      const businessUse = c.building!.use === 'lodging' ? visitorUse : c.building!.kind === 'industrial' ? industrialUse : c.building!.kind === 'commercial' ? retailUse : undefined
+      Object.assign(c.building!, { occupiedHouseholds: used, occupancy: businessUse !== undefined ? businessUse < .1 ? 'vacant' : businessUse < .9 ? 'underused' : 'occupied' : used === 0 ? 'vacant' : used < c.capacity ? 'underused' : 'occupied' })
+      if (lifeAccounts.get(c)?.buildingId !== c.building!.id) {
+        const account = newBuildingLifeAccount(config.seed, c.building!, polygonArea(c.building!.polygon))
+        lifeAccounts.set(c, account); lifeRound.initialBonds += account.demolitionBond
+      }
     }
+    for (const account of lifeAccounts.values()) { lifeRound.cashBalance += account.cash; lifeRound.bondBalance += account.demolitionBond }
+    lifecycle.push(lifeRound)
     recordStock(year, built)
     if (year % 25 === 0 || year === end || year === 1930) snapshots.push({ year, households, capacity, vacant: Math.max(0, capacity - households), unmet: Math.max(0, households - capacity), roads: activeRoads.length, buildings: built.length })
   }
-  return { buildings: built.map(c => c.building!), parcels: candidates.filter(c => c.acquiredYear !== undefined).map(c => c.parcel), events, snapshots, history }
+  return { buildings: built.map(c => c.building!), parcels: candidates.filter(c => c.acquiredYear !== undefined).map(c => c.parcel), events, snapshots, history, lifecycle }
 }

@@ -112,11 +112,22 @@ describe('frontage land development', () => {
       }
     }
   })
-  it('gives each rebuild a unique event ID when the same parcel is developed again', () => {
+  it('gives each rebuilt physical structure a new identity while keeping the same parcel and unique events', () => {
     const result = developLand({ config, roads, center: { x: 600, y: 500 }, stations: [], canPlace: (_polygon, year) => year !== 1955, slope: () => 0 })
     expect(new Set(result.events.map(event => event.id)).size).toBe(result.events.length)
     const constructed = result.events.filter(event => event.kind === 'construction')
-    expect(constructed.some(event => constructed.some(other => other !== event && other.entityId === event.entityId && other.year !== event.year))).toBe(true)
+    expect(new Set(constructed.map(event => event.entityId)).size).toBe(constructed.length)
+    const cleared = result.history.buildings.filter(version => version.to === 1955)
+    expect(cleared.length).toBeGreaterThan(0)
+    for (const old of cleared) {
+      const replacement = result.history.buildings.find(version => version.from >= 1960 && version.value.parcelId === old.value.parcelId)
+      if (!replacement) continue
+      expect(replacement.value.id).not.toBe(old.value.id)
+      expect(replacement.value.builtYear).toBe(replacement.from)
+      expect(old.value.builtYear).toBeLessThan(1955)
+      expect(result.parcels.find(parcel => parcel.id === old.value.parcelId)!.createdYear).toBeLessThan(1955)
+    }
+    expect(cleared.some(old => result.history.buildings.some(next => next.value.parcelId === old.value.parcelId && next.from >= 1960))).toBe(true)
     expect(result.events.some(event => event.kind === 'acquisition' && event.year === 1955)).toBe(true)
   })
 })

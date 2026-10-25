@@ -14,7 +14,7 @@ const blendMin = (a: number, b: number, radius: number) => -blendMax(-a, -b, rad
  * creates accommodation in the evolved valleys and bays through the actual
  * erosion/deposition sequence; it never restores a water mask afterwards. */
 export function coastalSeaLevel(kind: CityConfig['coastType'], iteration: number, iterations: number) {
-  const lowstand = kind === 'ria' ? -40 : kind === 'peninsula' ? -80 : 0
+  const lowstand = kind === 'ria' ? -40 : kind === 'peninsula' ? -80 : kind === 'delta' ? 0 : -24
   return lowstand * (1 - clamp((iteration - iterations + 16) / 16))
 }
 
@@ -93,12 +93,22 @@ export function coastalLandform(input: { extent: number; seed: number; noise: No
     { a: { x: e * (-.08 + random(231) * .08), y: -.25 * e }, b: { x: e * (-.04 + random(232) * .12), y: e * (kind === 'delta' ? .02 + random(233) * .045 : .06 + random(233) * .10) }, ra: e * (.055 + random(234) * .025), rb: e * (kind === 'ria' ? .02 + random(235) * .02 : .03 + random(235) * .035) },
     { a: { x: e * (.33 + random(236) * .13), y: -.25 * e }, b: { x: e * (.25 + random(237) * .16), y: e * (.02 + random(238) * .07) }, ra: e * (.045 + random(239) * .03), rb: e * (.025 + random(240) * .03) },
   ]
+  // Inherited branching coastal depressions, not a finished water mask. Their
+  // actual bed/shore evolves through uplift, river sediment and marine work.
+  // A single ellipse per bay produced smooth bowls without neighbouring arms
+  // at town scale; asymmetric drowned tributary valleys retain real headlands.
+  const inletArms = kind === 'peninsula' || kind === 'delta' ? [] : bays.flatMap((bay, i) => [-1, 1].map((side, j) => ({
+    a: { x: bay.point.x + side * bay.rx * .48, y: bay.point.y - bay.ry * .10 },
+    b: { x: bay.point.x + side * bay.rx * (.55 + random(260 + i * 8 + j) * .32), y: bay.point.y - bay.ry * (.72 + random(264 + i * 8 + j) * .26) },
+    ra: bay.rx * .29, rb: bay.rx * (.075 + random(268 + i * 8 + j) * .065),
+  })))
   const distance = (p: Point) => {
     // Gentle 2D warp preserves kilometre-scale width meaning. It is shared by
     // the land, shore, shelf and uplift field, never a separate coast wiggle.
     const w = warp(p), q = toLocal({ x: p.x + w.x, y: p.y + w.y })
     let d = ellipseDistance(q, { x: 0, y: -.58 * e }, 1.1 * e, .58 * e)
     for (const bay of bays) d = blendMin(d, -ellipseDistance(q, bay.point, bay.rx, bay.ry, bay.angle), 250)
+    for (const arm of inletArms) d = blendMin(d, -ridgeDistance(q, arm.a, arm.b, arm.ra, arm.rb), 180)
     for (const headland of headlands) d = blendMax(d, ridgeDistance(q, headland.a, headland.b, headland.ra, headland.rb), 300)
     for (let i = 1; i < spine.length; i++) d = blendMax(d, ridgeDistance(q, spine[i - 1]!.point, spine[i]!.point, spine[i - 1]!.radius, spine[i]!.radius), 300)
     return d

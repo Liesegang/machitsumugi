@@ -5,6 +5,7 @@ import * as terrainModule from './terrain'
 import type { TerrainModel } from './terrain'
 import { erodeTerrain } from './hydrology'
 import type { CityConfig, CityMap } from './types'
+import { sliceCityAtYear } from './timeline'
 
 const config: CityConfig = { ...DEFAULT_CONFIG, type: 'port', terrain: 'coast', density: 0, era: 'railway', facilities: ['port'] }
 
@@ -74,6 +75,28 @@ describe('dated harbor earthworks and their actual urban integration', { timeout
     expect(historic.roads.some(r => r.id.startsWith('harbor-'))).toBe(false)
     expect(historic.buildings.some(b => b.id.startsWith('harbor-warehouse'))).toBe(false)
     expect(historic.events!.every(e => e.year <= 1800)).toBe(true)
+  })
+  it('adopts later piers only with dated real roads, paid earthworks and matching sea/terrain histories', () => {
+    const map = generateCity({ ...config, era: 'present', targetYear: 2025, railway: false })
+    const events = map.events!.filter(e => e.id.startsWith('event-harbor-reclamation')).sort((a, b) => a.year - b.year)
+    expect(events.length).toBeGreaterThan(1)
+    for (const event of events) {
+      expect(event.reason).toContain('盛土搬入')
+      expect(event.reason).toContain('港湾公費枠')
+      const yard = map.areas.find(a => a.id === event.entityId)!
+      const phaseRoads = map.roads.filter(r => r.id.startsWith('harbor-') && r.builtYear === event.year)
+      expect(phaseRoads).toHaveLength(3)
+      expect(map.timeline!.terrainSurfaces.some(v => v.from === event.year)).toBe(true)
+      const before = sliceCityAtYear(map, event.year - 1), after = sliceCityAtYear(map, event.year)
+      expect(before.areas.some(a => a.id === yard.id)).toBe(false)
+      expect(after.areas.some(a => a.id === yard.id)).toBe(true)
+      for (const road of phaseRoads) for (const p of road.points) expect(after.areas.some(a => a.kind === 'water' && pointInRegion(p, a))).toBe(false)
+      const warehouse = after.buildings.filter(b => b.id.startsWith('harbor-warehouse') && b.builtYear === event.year)
+      for (const b of warehouse) {
+        expect(before.buildings.some(old => old.id === b.id)).toBe(false)
+        expect(b.polygon.every(p => pointInRegion(p, yard))).toBe(true)
+      }
+    }
   })
   it('keeps unsuitable high shores natural and reports an omitted port if no landing can be accessed', () => {
     terrainSpy.mockImplementation(() => surveyedCoast(24))
