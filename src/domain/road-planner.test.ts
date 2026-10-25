@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { RoadPlanner } from './road-planner'
 import type { Area, Point } from './types'
 import { alignmentDiagnostics } from './road-alignment'
@@ -157,5 +157,20 @@ describe('terrain route planning', () => {
     expect(route).not.toBeNull()
     expect(surveyedRoadGradeAllowed(route!, .10, terrain.elevation)).toBe(true)
     expect(route!.surveyedBridgeSpans).toHaveLength(1)
+  })
+
+  it('retries an exhausted bridge approach when the same planner receives a larger search budget', () => {
+    const terrain = { elevation: () => 0, slope: () => 0, waterAt: river, bridgeSites: [{ x: 500, y: 400 }], bridgeCandidates: [{ point: { x: 500, y: 400 }, bankA: { x: 455, y: 400 }, bankB: { x: 545, y: 400 }, width: 40, cost: 100 }] }
+    const planner = new RoadPlanner({ width: 1000, height: 800, areas: [water], core: null, terrain })
+    // Exercise the finite search instead of the cheap analytic connector.
+    const connector = vi.spyOn(planner as unknown as { endpointConnector: () => null }, 'endpointConnector').mockReturnValue(null)
+    try {
+      const start = { x: 100, y: 250 }, goal = { x: 900, y: 520 }, options = { role: 'collector' as const, width: 9, allowBridge: true }
+      expect(planner.plan(start, goal, { ...options, maxNodes: 1 })).toBeNull()
+      const route = planner.plan(start, goal, { ...options, maxNodes: 16000 })
+      expect(route).not.toBeNull()
+      expect(route!.surveyedBridgeSpans).toHaveLength(1)
+      expect(planner.validate(route!.points, 9, true)).toBe(true)
+    } finally { connector.mockRestore() }
   })
 })
