@@ -56,4 +56,11 @@ describe('roads continuing beyond the displayed map', () => {
     expect(route!.points.every(p => p.x >= 513)).toBe(true)
     expect(planner.validate(route!.points, 3)).toBe(true)
   })
+  it('retains surveyed water identity when translating bridge decks back to the city frame', () => {
+    const waterAt = (point: Point) => point.x >= 480 && point.x <= 520, bridge = { point: { x: 500, y: 400 }, bankA: { x: 455, y: 400 }, bankB: { x: 545, y: 400 }, width: 40, cost: 100, riverId: 'trunk' }
+    const planner = new RegionalRoadPlanner({ width: 1000, height: 800, core: null, areas: [], terrain: { ...flat, waterAt, bridgeSites: [bridge.point], bridgeCandidates: [bridge], continuationTerrain: { ...flat, waterAt } } })
+    const result = planner.plan({ x: 100, y: 400 }, { x: 900, y: 400 }, { role: 'highway', width: 12, allowBridge: true, avoidRepeatedRiverCrossings: true })!
+    expect(result.surveyedBridgeSpans).toEqual([{ bankA: bridge.bankA, bankB: bridge.bankB, riverId: 'trunk' }])
+    expect(planner.plan({ x: 100, y: 400 }, { x: 900, y: 400 }, { role: 'highway', width: 12, allowBridge: true, avoidRepeatedRiverCrossings: true, crossedRiverIds: ['trunk'] })).toBeNull()
+  })
 })

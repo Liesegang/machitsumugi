@@ -16,7 +16,7 @@ export interface PlanningTerrain {
   /** Real regional samples outside the displayed crop, never edge-clamped land. */
   continuationTerrain?: { elevation(point: Point): number; slope(point: Point): number; waterAt(point: Point): boolean; seaAt?: (point: Point) => boolean; contains?: (point: Point) => boolean; bounds?: { minX: number; minY: number; maxX: number; maxY: number } }
   bridgeSites: Point[]
-  bridgeCandidates?: { point: Point; bankA: Point; bankB: Point; width: number; cost: number }[]
+  bridgeCandidates?: { point: Point; bankA: Point; bankB: Point; width: number; cost: number; riverId?: string }[]
   rivers?: { id: string; points: Point[] }[]
   wetness?: (point: Point) => number
   terrainCost?: (point: Point) => number
@@ -24,9 +24,9 @@ export interface PlanningTerrain {
   channelAt?: (point: Point) => { point: Point; tangent: Point; bankDistance: number; width: number; surfaceElevation: number; riverId: string } | null
 }
 export interface PlanningEnvironment { width: number; height: number; areas: Area[]; core: Point[] | null; terrain?: PlanningTerrain; bridgeSites?: Point[]; landCost?: (point: Point) => number; exactLandCost?: boolean; waterGeometryBounds?: { minX: number; minY: number; maxX: number; maxY: number } }
-export interface SurveyedBridgeSpan { bankA: Point; bankB: Point }
+export interface SurveyedBridgeSpan { bankA: Point; bankB: Point; riverId?: string }
 export interface PlannedRoute { points: Point[]; length: number; cost: number; bridgeLength: number; method: 'direct' | 'heading-search' | 'bridge-project'; boundaryContinuation?: boolean; surveyedBridgeSpans?: SurveyedBridgeSpan[] }
-export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; /** Optional distance budget for long independently planned corridors; physical guards are unchanged. */ maxNodesPerKm?: number; alignment?: 'natural' | 'planned'; maximumGrade?: number }
+export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; /** Optional distance budget for long independently planned corridors; physical guards are unchanged. */ maxNodesPerKm?: number; /** Independently surveyed main roads can forbid crossing the same identified water body again. */ avoidRepeatedRiverCrossings?: boolean; crossedRiverIds?: readonly string[]; alignment?: 'natural' | 'planned'; maximumGrade?: number }
 type PlanningField = { water: boolean; sea: boolean; grade: number; cost: number; coreDistance: number }
 type EarthField = { grade: number; cost: number }
 type WidthRailSegment = { a: Point; b: Point; id: string; along: number; length: number; levels?: [number, number]; bridges: [number, number][] }
@@ -396,20 +396,22 @@ export class RoadPlanner {
     return true
   }
   private endpointConnector(start: Point, goal: Point, options: PlanningOptions) {
-    if (options.startHeading === undefined || options.endHeading === undefined || distance(start, goal) > 850) return null
+    const plannedHighway = options.role === 'highway' && options.alignment === 'planned'
+    if ((!plannedHighway && (options.startHeading === undefined || options.endHeading === undefined)) || distance(start, goal) > (plannedHighway ? 8000 : 850)) return null
     const radius = options.role === 'expressway' ? 240 : options.role === 'ramp' ? 60 : options.role === 'highway' ? 85 : options.role === 'collector' ? 50 : 15, direct = distance(start, goal)
     const maximumGrade = options.maximumGrade ?? (options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity)
-    const straightCost = this.cost([start, goal], options.role).cost, handles = [.38, .55, .75, 1, .22]
+    const straightCost = this.cost([start, goal], options.role).cost, handles = plannedHighway ? [.22, .38, .55] : [.38, .55, .75, 1, .22]
     const proposals = [...handles.map(a => [a, a] as const), ...handles.flatMap(a => handles.filter(b => b !== a).map(b => [a, b] as const))]
     let best: PlannedRoute | null = null
     for (const [a, b] of proposals) {
-      const points = tangentAlignment(start, goal, options.startHeading, options.endHeading, direct * a, direct * b)
+      const bearing = Math.atan2(goal.y - start.y, goal.x - start.x)
+      const points = tangentAlignment(start, goal, options.startHeading ?? bearing, options.endHeading ?? bearing, direct * a, direct * b)
       const diagnostics = alignmentDiagnostics(points)
       if (diagnostics.minimumRadius < radius || diagnostics.length > direct * 2.1 || !this.validate(points, options.width)) continue
       if (!this.gradeAllowed(points, maximumGrade)) continue
       const route = this.cost(points, options.role)
-      if (route.cost < straightCost * 1.08) return route
-      if (!best || route.cost < best.cost) best = route
+      if (!plannedHighway && route.cost < straightCost * 1.08) return route
+      if (!best || (plannedHighway ? route.length < best.length : route.cost < best.cost)) best = route
     }
     return best
   }
@@ -417,6 +419,7 @@ export class RoadPlanner {
    * C2 alignment. Keeping that corridor preserves geographic/ownership constraints;
    * it is a search discretisation, never a drawn road grid. */
   private corridor(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
+    const plannedHighway = options.role === 'highway' && options.alignment === 'planned'
     const major = options.role === 'highway' || options.role === 'collector' || options.role === 'expressway' || options.role === 'ramp'
     const minimumRadius = options.role === 'expressway' ? 240 : options.role === 'ramp' ? 60 : options.role === 'highway' ? 85 : major ? 50 : 15
     const maximumGrade = options.maximumGrade ?? (options.role === 'expressway' ? .07 : options.role === 'ramp' ? .10 : Infinity)
@@ -445,7 +448,8 @@ export class RoadPlanner {
       for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
         const p = { x: (gx + dx!) * spacing, y: (gy + dy!) * spacing }, k = index(p)
         if (!this.suitable(p, corridorWidth) || !this.validSegment(current.p, p, corridorWidth) || !this.gradeAllowed([current.p, p], searchMaximumGrade)) continue
-        const cost = current.cost + distance(current.p, p) * this.field(p).cost + (this.railwayConstraints?.edgeCost(current.p, p, options.role) ?? 0) / roadConstructionFactor(options.role)
+        const fieldCost = this.field(p).cost, designCost = plannedHighway ? 1 + Math.min(4, Math.max(0, fieldCost - 1)) * .15 : fieldCost
+        const cost = current.cost + distance(current.p, p) * designCost + (this.railwayConstraints?.edgeCost(current.p, p, options.role) ?? 0) / roadConstructionFactor(options.role)
         if (cost >= (values.get(k) ?? Infinity)) continue
         values.set(k, cost); queue.push({ p, index: k, cost, previous: current }, cost + distance(p, searchGoal) * 1.25)
       }
@@ -456,11 +460,23 @@ export class RoadPlanner {
     coarse.reverse()
     if (options.startHeading !== undefined) coarse.unshift(start)
     if (options.endHeading !== undefined) coarse.push(goal)
+    if (plannedHighway) {
+      // Survey broad geographic controls before constructing pavement. These
+      // visible chords still obey full width/grade/rail/ownership constraints;
+      // they do not smooth or move an already accepted fine-grained road.
+      const visible: Point[] = [coarse[0]!]
+      for (let from = 0; from < coarse.length - 1;) {
+        let next = from + 1
+        for (let to = coarse.length - 1; to > from + 1; to--) if (this.validSegment(coarse[from]!, coarse[to]!, corridorWidth) && this.gradeAllowed([coarse[from]!, coarse[to]!], searchMaximumGrade) && this.railwayAllows([coarse[from]!, coarse[to]!], options.role)) { next = to; break }
+        visible.push(coarse[next]!); from = next
+      }
+      coarse.splice(0, coarse.length, ...visible)
+    }
     // Preserve the least-cost corridor. Farthest-visible simplification erased
     // terrain/ownership response and left kilometre-long rays joined by elbows.
     // Both endpoint tangents need their own control. A three-control short
     // corridor made the goal pin overwrite the start pin at controls[1].
-    const spacingForControls = options.role === 'expressway' ? 260 : options.role === 'highway' ? 140 : major ? 100 : 65
+    const spacingForControls = plannedHighway ? 500 : options.role === 'expressway' ? 260 : options.role === 'highway' ? 140 : major ? 100 : 65
     const bothPinned = options.startHeading !== undefined && options.endHeading !== undefined
     const controls = resampleAlignment(coarse, bothPinned ? Math.min(spacingForControls, roadLength(coarse) / 3) : spacingForControls)
     if (controls.length < 3) controls.splice(1, 0, lerp(start, goal, .5))
@@ -478,10 +494,11 @@ export class RoadPlanner {
     if (extendedPorts && firstPinned) controls[2] = along(coarse, Math.min(roadLength(coarse) * .42, distance(start, searchStart) + minimumRadius * 1.5))
     if (extendedPorts && lastPinned) controls[controls.length - 3] = along(coarse.slice().reverse(), Math.min(roadLength(coarse) * .42, distance(goal, searchGoal) + minimumRadius * 1.5))
     const pinned = (i: number) => (firstPinned && i <= (extendedPorts ? 2 : 1)) || (lastPinned && i >= controls.length - (extendedPorts ? 3 : 2))
-    const bending = options.role === 'expressway' ? 320 : options.role === 'highway' ? 140 : major ? 90 : 35
+    const bending = plannedHighway ? 650 : options.role === 'expressway' ? 320 : options.role === 'highway' ? 140 : major ? 90 : 35
     const energy = (a: Point, b: Point, c: Point) => {
       const ab = distance(a, b), bc = distance(b, c), angle = turn(Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(b.y - a.y, b.x - a.x))
-      return (ab * (this.field(a).cost + this.field(b).cost) + bc * (this.field(b).cost + this.field(c).cost)) / 2 + bending * bending * angle * angle / Math.max(30, (ab + bc) / 2) + ((this.railwayConstraints?.edgeCost(a, b, options.role) ?? 0) + (this.railwayConstraints?.edgeCost(b, c, options.role) ?? 0)) / roadConstructionFactor(options.role)
+      const land = plannedHighway ? ab + bc : (ab * (this.field(a).cost + this.field(b).cost) + bc * (this.field(b).cost + this.field(c).cost)) / 2
+      return land + bending * bending * angle * angle / Math.max(30, (ab + bc) / 2) + ((this.railwayConstraints?.edgeCost(a, b, options.role) ?? 0) + (this.railwayConstraints?.edgeCost(b, c, options.role) ?? 0)) / roadConstructionFactor(options.role)
     }
     for (const step of [28, 20, 12, 8]) for (let pass = 0; pass < 2; pass++) for (let i = 1; i < controls.length - 1; i++) {
       if (pinned(i)) continue
@@ -531,7 +548,8 @@ export class RoadPlanner {
       const a = this.plan(start, options.through, { ...options, through: undefined, endHeading: undefined })
       if (!a) return null
       const last = a.points.at(-1)!, before = a.points.at(-2)!, heading = Math.atan2(last.y - before.y, last.x - before.x)
-      const b = this.plan(options.through, goal, { ...options, through: undefined, startHeading: heading })
+      const crossedRiverIds = options.avoidRepeatedRiverCrossings ? [...(options.crossedRiverIds ?? []), ...(a.surveyedBridgeSpans ?? []).flatMap(span => span.riverId ? [span.riverId] : [])] : options.crossedRiverIds
+      const b = this.plan(options.through, goal, { ...options, through: undefined, startHeading: heading, ...(crossedRiverIds ? { crossedRiverIds } : {}) })
       if (!b) return null
       const result = this.cost([...a.points, ...b.points.slice(1)], options.role)
       const spans = [...(a.surveyedBridgeSpans ?? []), ...(b.surveyedBridgeSpans ?? [])]
@@ -549,12 +567,14 @@ export class RoadPlanner {
       const pairs = sites.flatMap(site => {
         const pair = this.banks(site)
         const gradeAllowed = pair && (!this.environment.terrain || Math.abs(this.environment.terrain.elevation(pair[1]) - this.environment.terrain.elevation(pair[0])) / distance(pair[0], pair[1]) <= maximumGrade)
-        return pair && gradeAllowed && this.validate(pair, options.width, true) ? [{ a: pair[0], b: pair[1] }] : []
+        const riverId = this.environment.terrain?.bridgeCandidates?.find(candidate => distance(candidate.point, site) < 5)?.riverId
+        return pair && gradeAllowed && this.validate(pair, options.width, true) ? [{ a: pair[0], b: pair[1], ...(riverId ? { riverId } : {}) }] : []
       })
       const pointKey = (p: Point) => `${p.x.toFixed(4)},${p.y.toFixed(4)}`
       const bridgeRoute = routeAcrossBridges({
         start, goal, pairs, role: options.role, width: options.width,
         startHeading: options.startHeading, endHeading: options.endHeading,
+        avoidRepeatedRiverCrossings: options.avoidRepeatedRiverCrossings, crossedRiverIds: options.crossedRiverIds,
         lowerBound: (a, b) => distance(a, b) * roadConstructionFactor(options.role),
         cost: points => this.cost(points, options.role, true),
         dry: (a, b, startHeading, endHeading) => {
@@ -576,6 +596,7 @@ export class RoadPlanner {
     }
     if (['highway', 'collector', 'expressway', 'ramp'].includes(options.role) || distance(start, goal) > 180) {
       const connector = this.endpointConnector(start, goal, options)
+      if (options.role === 'highway' && options.alignment === 'planned' && connector) return connector
       // A physically simple junction connector may beat geographic search, but
       // expensive land still gets the chance to choose a cheaper outer corridor.
       if (connector && connector.cost < direct.cost * 1.08) return connector

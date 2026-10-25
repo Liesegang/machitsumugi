@@ -190,7 +190,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     if (!points || !avoidsReservations(points, roadWidth) || !planner.railwayWidthAllows(points, .01, roadWidth, role) || environment.terrain && !surveyedRoadGradeAllowed({ ...route, points }, role === 'highway' ? .09 : .13, environment.terrain.elevation)) { diagnostics.rejected++; return null }
     const proposedPoints = route.points
     const moved = points.length !== proposedPoints.length || points.some((p, i) => distance(p, proposedPoints[i]!) > 1e-8)
-    if (moved && !planner.validate(points, roadWidth, route.bridgeLength > 0)) { diagnostics.rejected++; return null }
+    if (moved && !(boundary && regional ? regional.validate(points, roadWidth, route.bridgeLength > 0) : planner.validate(points, roadWidth, route.bridgeLength > 0))) { diagnostics.rejected++; return null }
     route = { ...route, points }
     // Outside-to-outside corridors join at their surveyed internal town point,
     // rather than at an outside endpoint. Verify that exact contact first.
@@ -241,8 +241,27 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
 
   // Regional roads acquire their own continuous physical alignment before
   // local streets exist. A later path over household streets is not a trunk.
-  if (regional && input.arterial !== false) surveyLayoutMainCorridors({ environment, center, zones, railways, signal }, proposal =>
-    !!accept(proposal.route, 'highway', proposal.width, proposal.builtYear, '周辺地域から町を通過する連続した幹線の測量', true, proposal.id))
+  if (regional && input.arterial !== false) surveyLayoutMainCorridors({ environment, center, zones, railways, signal }, proposal => {
+    if (!proposal.townConnection) return !!accept(proposal.route, 'highway', proposal.width, proposal.builtYear, '周辺地域から町を通過する連続した幹線の測量', true, proposal.id)
+    const mainPoints = canonicalSurvey(proposal.route, false), connectionPoints = canonicalSurvey(proposal.townConnection, true)
+    if (!mainPoints || !connectionPoints) return false
+    for (const [route, points, roadWidth, role, radius] of [[proposal.route, mainPoints, proposal.width, 'highway', 85], [proposal.townConnection, connectionPoints, 9, 'collector', 50]] as const) {
+      if (!avoidsReservations(points, roadWidth) || !planner.railwayWidthAllows(points, .01, roadWidth, role) || alignmentDiagnostics(points).minimumRadius < radius - 1e-6 || environment.terrain && !surveyedRoadGradeAllowed({ ...route, points }, role === 'highway' ? .09 : .13, environment.terrain.elevation) || !(role === 'highway' ? regional.validate(points, roadWidth, route.bridgeLength > 0) : planner.validate(points, roadWidth))) return false
+    }
+    const connectionMetadata = { id: `layout-road-${serial + 1}`, kind: 'local' as const, role: 'collector' as const, width: 9, builtYear: proposal.builtYear, phase: 'spatial-layout', reason: '町の旧道と独立した通過幹線を結ぶ集散道路', constructionCost: proposal.townConnection.cost, preserveEndpoint: true }
+    const mainMetadata = { id: `layout-road-${serial + 2}`, kind: 'arterial' as const, role: 'highway' as const, width: proposal.width, builtYear: proposal.builtYear, phase: 'surveyed-main-corridor', reason: '周辺地域から町を通過する連続した幹線の測量', constructionCost: proposal.route.cost, boundaryContinuation: true, throughRouteId: proposal.id, ...(proposal.route.bridgeLength > 0 ? { bridge: true } : {}) }
+    if (!junctionProfileAllowed({ ...mainMetadata, points: mainPoints }, connectionPoints.at(-1)!)) return false
+    const projects = [{ points: connectionPoints, metadata: connectionMetadata }, { points: mainPoints, metadata: mainMetadata, requireConnection: false }], staged = graph.fork()
+    const trial = staged.addBatch(projects)
+    if (!trial || ![mainPoints[0]!, mainPoints.at(-1)!].every(point => Number.isFinite(staged.accessibilityFrom(center)(point)))) return false
+    const built = graph.addBatch(projects)
+    if (!built) return false
+    serial += 2; diagnostics.accepted += built.length; diagnostics.streetLength += built.reduce((sum, road) => sum + roadLength(road.points), 0); diagnostics.boundaryConnections++
+    for (const span of proposal.route.surveyedBridgeSpans ?? []) bridgeSpans.push({ roadId: mainMetadata.id, bankA: span.bankA, bankB: span.bankB })
+    if (proposal.route.bridgeLength > 0) diagnostics.bridges++
+    if (crossingSurvey && built.some(road => crossingSurvey.crossings(road.points).length)) { planner.setRailwayRoadNetwork(graph.roads); regional.setRailwayRoadNetwork(graph.roads) }
+    return true
+  })
 
   // Survey exits before selecting building frontage. Endpoints remain outside
   // the crop, so clipping cannot manufacture a dead-ended major road.
@@ -412,6 +431,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
       if (alternative) { hub = alternative; connected = openStreet(hub, 1e-7, zone.builtYear) }
     }
     if (!connected) { diagnostics.unservedZoneIds.push(zone.id); continue }
+    if (junctionProfileAllowed(connected.road, connected.point)) graph.ensureJunction(connected.point)
     active.push({ zone, hub: connected.point })
   }
 

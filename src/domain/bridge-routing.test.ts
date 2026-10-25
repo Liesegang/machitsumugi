@@ -64,4 +64,44 @@ describe('surveyed bridge macro routing', () => {
     // Surveying 22 crossings must not launch all 44² bank-to-bank searches.
     expect(searches).toBe(3)
   })
+
+  it('can reserve a water body once for main roads without changing ordinary routing', () => {
+    // A cheap three-bridge zigzag and a more expensive single crossing both
+    // reach the goal. Only the main-road policy forbids the repeated river.
+    const start = { x: 0, y: 0 }, goal = { x: 400, y: 0 }
+    const pairs = [100, 200, 300].map(x => ({ a: { x, y: 0 }, b: { x: x + 10, y: 0 }, riverId: 'trunk' }))
+    const allowed = new Set(['0>100', '110>200', '210>300', '310>400', '110>400'])
+    const input: BridgeRoutingInput = { ...options, start, goal, pairs,
+      dry: (a, b) => allowed.has(`${a.x}>${b.x}`) ? route([a, b], a.x === 110 && b.x === 400 ? 100 : 1) : null,
+      cost: points => route(points, points.length === 2 ? 1 : length(points)),
+    }
+    expect(routeAcrossBridges(input)!.surveyedBridgeSpans).toHaveLength(3)
+    const main = routeAcrossBridges({ ...input, avoidRepeatedRiverCrossings: true })!
+    expect(main.surveyedBridgeSpans).toEqual([{ bankA: pairs[0]!.a, bankB: pairs[0]!.b, riverId: 'trunk' }])
+    expect(main.cost).toBe(102)
+    expect(routeAcrossBridges({ ...input, avoidRepeatedRiverCrossings: true, crossedRiverIds: ['trunk'] })).toBeNull()
+    expect(routeAcrossBridges({ ...input, avoidRepeatedRiverCrossings: true, dry: (a, b) => a.x === 110 && b.x === 400 ? null : input.dry(a, b) })).toBeNull()
+  })
+
+  it('allows distinct tributaries under the main-road policy and keeps the finite state cap', () => {
+    let dryCalls = 0
+    const pairs = [100, 200, 300].map((x, index) => ({ a: { x, y: 0 }, b: { x: x + 10, y: 0 }, riverId: `river-${index}` }))
+    const allowed = new Set(['0>100', '110>200', '210>300', '310>400'])
+    const input: BridgeRoutingInput = { ...options, start: { x: 0, y: 0 }, goal: { x: 400, y: 0 }, pairs, avoidRepeatedRiverCrossings: true, maximumPolicyStates: 32,
+      dry: (a, b) => { dryCalls++; return allowed.has(`${a.x}>${b.x}`) ? route([a, b]) : null }, cost: points => route(points),
+    }
+    const main = routeAcrossBridges(input)!
+    expect(main.surveyedBridgeSpans!.map(span => span.riverId)).toEqual(['river-0', 'river-1', 'river-2'])
+    expect(dryCalls).toBeLessThan((pairs.length * 2 + 2) ** 2)
+  })
+
+  it('stops a combinatorial main-road policy search at its finite state allowance', () => {
+    let dryCalls = 0
+    const goal = { x: 2000, y: 0 }, pairs = Array.from({ length: 10 }, (_, i) => ({ a: { x: 100 + i * 100, y: 0 }, b: { x: 110 + i * 100, y: 0 }, riverId: `river-${i}` }))
+    const result = routeAcrossBridges({ ...options, start: { x: 0, y: 0 }, goal, pairs, avoidRepeatedRiverCrossings: true, maximumPolicyStates: 32,
+      dry: () => { dryCalls++; return null }, cost: points => route(points, 0), lowerBound: (_a, b) => b === goal ? 10000 : 0,
+    })
+    expect(result).toBeNull()
+    expect(dryCalls).toBe(0)
+  })
 })

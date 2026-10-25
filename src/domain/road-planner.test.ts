@@ -4,11 +4,24 @@ import type { Area, Point } from './types'
 import { alignmentDiagnostics } from './road-alignment'
 import { PlanarRoadGraph } from './road-graph'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
+import { layoutMainRoadEfficiency } from './layout-first-main-corridors'
 
 const water: Area = { id: 'river', kind: 'water', polygon: [{ x: 480, y: 0 }, { x: 520, y: 0 }, { x: 520, y: 800 }, { x: 480, y: 800 }] }
 const river = (p: Point) => p.x >= 480 && p.x <= 520
 
 describe('terrain route planning', () => {
+  it('designs a broad efficient highway instead of following a cheap wavy field', () => {
+    const start = { x: 100, y: 700 }, goal = { x: 3000, y: 700 }
+    // This mock isolates alignment intent; it is not the native city's field.
+    const planner = new RoadPlanner({ width: 3200, height: 1400, core: null, areas: [], landCost: point => Math.abs(point.y - 700 - Math.sin((point.x - 100) / 2900 * Math.PI * 3) * 180) < 40 ? 0 : 3 })
+    const natural = planner.plan(start, goal, { role: 'highway', width: 12, maxNodes: 6000 }), planned = planner.plan(start, goal, { role: 'highway', width: 12, alignment: 'planned', startHeading: 0, endHeading: .15, maximumGrade: .09 })
+    expect(natural).not.toBeNull(); expect(planned).not.toBeNull()
+    expect(natural!.points.some(point => Math.abs(point.y - 700) > 70)).toBe(true)
+    expect(layoutMainRoadEfficiency(planned!.points).circuity).toBeLessThan(1.015)
+    expect(layoutMainRoadEfficiency(planned!.points).totalTurnDegrees).toBeLessThan(40)
+    expect(planner.validate(planned!.points, 12)).toBe(true)
+    expect(alignmentDiagnostics(planned!.points).minimumRadius).toBeGreaterThanOrEqual(85)
+  })
   it('keeps field cache cells distinct across rows and outside the planning frame', () => {
     const planner = new RoadPlanner({ width: 120, height: 120, areas: [], core: null,
       terrain: { elevation: p => Math.max(0, p.x * 2 + p.y), slope: () => 0, waterAt: () => false, bridgeSites: [] },

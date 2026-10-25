@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest'
-import { layoutMainCorridorBearings, layoutMainCorridorTangents, planLayoutMainCorridorAlignment, selectLayoutMainBridgeCandidates, surveyLayoutMainCorridors } from './layout-first-main-corridors'
+import { layoutMainCorridorBearings, layoutMainCorridorTangents, layoutMainRoadEfficiency, planLayoutMainCorridorAlignment, selectLayoutMainBridgeCandidates, surveyLayoutMainCorridors } from './layout-first-main-corridors'
 import type { LayoutFirstZone } from './layout-first-types'
-import { rectangle } from './geometry'
+import { distanceToSegment, rectangle } from './geometry'
 import { RoadPlanner } from './road-planner'
 import type { PlanningOptions } from './road-planner'
 import type { Point } from './types'
@@ -30,7 +30,7 @@ it('bounds a requested main-corridor search by distance while retaining the shor
 
 it('chooses a shared regional tangent before either approach instead of inheriting the first greedy arrival', () => {
   const start = { x: 0, y: 0 }, center = { x: 1000, y: 0 }, goal = { x: 2000, y: 0 }, requests: PlanningOptions[] = []
-  const bridge = { bankA: { x: 200, y: 0 }, bankB: { x: 240, y: 0 } }
+  const bridge = { bankA: { x: 200, y: 0 }, bankB: { x: 240, y: 0 }, riverId: 'western-river' }
   const route = planLayoutMainCorridorAlignment({
     plan: (a, b, options) => {
       requests.push(options)
@@ -44,6 +44,8 @@ it('chooses a shared regional tangent before either approach instead of inheriti
   expect(route).not.toBeNull()
   expect(requests).toHaveLength(2)
   expect(requests[0]!.endHeading).toBe(requests[1]!.startHeading)
+  expect(requests.every(options => options.avoidRepeatedRiverCrossings)).toBe(true)
+  expect(requests[1]!.crossedRiverIds).toEqual(['western-river'])
   expect(route!.points).toEqual([start, center, goal])
   expect(route!.cost).toBe(280)
   expect(route!.surveyedBridgeSpans).toEqual([bridge])
@@ -66,7 +68,7 @@ it('rejects a kink in assembled pavement even if both separately surveyed legs w
 
 it('joins two physical bridge approaches while keeping both surveyed decks and the centre tangent', () => {
   const waterAt = (p: Point) => p.x >= 480 && p.x <= 520 || p.x >= 960 && p.x <= 1000, elevation = (p: Point) => waterAt(p) ? -40 : 100
-  const bridgeCandidates = [{ point: { x: 500, y: 500 }, bankA: { x: 455, y: 500 }, bankB: { x: 545, y: 500 }, width: 40, cost: 100 }, { point: { x: 980, y: 500 }, bankA: { x: 935, y: 500 }, bankB: { x: 1025, y: 500 }, width: 40, cost: 100 }]
+  const bridgeCandidates = [{ point: { x: 500, y: 500 }, bankA: { x: 455, y: 500 }, bankB: { x: 545, y: 500 }, width: 40, cost: 100, riverId: 'trunk' }, { point: { x: 980, y: 500 }, bankA: { x: 935, y: 500 }, bankB: { x: 1025, y: 500 }, width: 40, cost: 100, riverId: 'tributary' }]
   const planner = new RoadPlanner({ width: 1600, height: 1000, areas: [], core: null, terrain: { elevation, slope: () => 0, waterAt, bridgeSites: bridgeCandidates.map(site => site.point), bridgeCandidates } })
   const route = planLayoutMainCorridorAlignment(planner, { x: 100, y: 400 }, { x: 800, y: 500 }, { x: 1500, y: 600 }, 12)
   expect(route).not.toBeNull()
@@ -83,8 +85,17 @@ it('surveys complete outside-to-outside alignments through the town before any l
   expect(proposals.length).toBeLessThanOrEqual(2)
   for (const proposal of proposals) {
     expect(proposal.width).toBe(12)
-    expect(proposal.route.points.some(point => Math.hypot(point.x - 900, point.y - 700) < 1e-7)).toBe(true)
+    expect([proposal.route.points, ...(proposal.townConnection ? [proposal.townConnection.points] : [])].some(points => points.slice(1).some((point, i) => distanceToSegment({ x: 900, y: 700 }, points[i]!, point) < 1e-7))).toBe(true)
     expect(alignmentDiagnostics(proposal.route.points).minimumRadius).toBeGreaterThanOrEqual(85)
     for (const point of [proposal.route.points[0]!, proposal.route.points.at(-1)!]) expect(point.x < 0 || point.x > 1800 || point.y < 0 || point.y > 1400).toBe(true)
   }
+})
+
+it('distinguishes smooth direct pavement from a locally reversing road independently of crossing count', () => {
+  const straight = layoutMainRoadEfficiency([{ x: 0, y: 0 }, { x: 2000, y: 0 }]), reversing = layoutMainRoadEfficiency([{ x: 0, y: 0 }, { x: 1200, y: 0 }, { x: 900, y: 100 }, { x: 2000, y: 0 }])
+  expect(straight.circuity).toBeCloseTo(1)
+  expect(straight.backwardLength).toBe(0)
+  expect(straight.totalTurnDegrees).toBe(0)
+  expect(reversing.maximum500mBacktrack).toBeGreaterThan(150)
+  expect(reversing.circuity).toBeGreaterThan(1.2)
 })

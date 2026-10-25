@@ -71,7 +71,7 @@ export class RegionalRoadPlanner {
   plan(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
     const route = this.planner.plan(this.move(start), this.move(goal), { ...options, ...(options.through ? { through: this.move(options.through) } : {}) })
     const local = (p: Point): Point => ({ x: p.x - this.padding, y: p.y - this.padding })
-    return route ? { ...route, points: route.points.map(local), ...(route.surveyedBridgeSpans ? { surveyedBridgeSpans: route.surveyedBridgeSpans.map(span => ({ bankA: local(span.bankA), bankB: local(span.bankB) })) } : {}) } : null
+    return route ? { ...route, points: route.points.map(local), ...(route.surveyedBridgeSpans ? { surveyedBridgeSpans: route.surveyedBridgeSpans.map(span => ({ ...span, bankA: local(span.bankA), bankB: local(span.bankB) })) } : {}) } : null
   }
   /** Existing relative construction-credit proxy over the surveyed terrain;
    * this is neither currency nor the A* priority/heuristic. */
