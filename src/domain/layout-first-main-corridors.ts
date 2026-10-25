@@ -19,6 +19,17 @@ export interface LayoutMainCorridorInput {
   signal?: AbortSignal
 }
 
+/** Nearby tributaries are different water barriers. Deduplicate alternatives
+ * only within the same actual river, and retain each river before extra sites. */
+export function selectLayoutMainBridgeCandidates<T extends { point: Point; riverId?: string }>(candidates: readonly T[], first: Point, last: Point, reach: number, limit = 24): T[] {
+  const ranked = candidates.filter(candidate => distanceToSegment(candidate.point, first, last) < reach).slice().sort((a, b) => distanceToSegment(a.point, first, last) - distanceToSegment(b.point, first, last))
+  const distinct: T[] = []
+  for (const candidate of ranked) if (!distinct.some(other => candidate.riverId !== undefined && other.riverId === candidate.riverId && distance(candidate.point, other.point) < 280)) distinct.push(candidate)
+  const rivers = new Set<string>(), firstSites: T[] = []
+  for (const [index, candidate] of distinct.entries()) { const river = candidate.riverId ?? `untagged-${index}`; if (!rivers.has(river)) { rivers.add(river); firstSites.push(candidate) } }
+  return [...firstSites, ...distinct.filter(candidate => !firstSites.includes(candidate))].slice(0, limit)
+}
+
 /** Demand supplies a regional direction, never rows or a spacing lattice. */
 export function layoutMainCorridorBearings(zones: readonly LayoutFirstZone[], center: Point): number[] {
   const points = zones.filter(zone => zone.kind !== 'rural')
@@ -50,9 +61,7 @@ export function surveyLayoutMainCorridors(input: LayoutMainCorridorInput, adopt:
     const first = edge(angle + Math.PI), last = edge(angle)
     // Limit the lazy bridge graph to surveyed crossings in this geographic
     // corridor. A distant valley must not become a cheap accidental detour.
-    const candidates = (environment.terrain.bridgeCandidates ?? []).filter(candidate => distanceToSegment(candidate.point, first, last) < Math.min(width, height) * .22)
-      .sort((a, b) => distanceToSegment(a.point, first, last) - distanceToSegment(b.point, first, last))
-    const crossings = candidates.filter((candidate, i) => !candidates.slice(0, i).some(other => distance(candidate.point, other.point) < 280)).slice(0, 14)
+    const crossings = selectLayoutMainBridgeCandidates(environment.terrain.bridgeCandidates ?? [], first, last, Math.min(width, height) * .22)
     const terrain = { ...environment.terrain, bridgeSites: crossings.map(crossing => crossing.point), bridgeCandidates: crossings }
     const planner = new RegionalRoadPlanner({ ...environment, terrain, bridgeSites: terrain.bridgeSites })
     planner.setRailwayCorridors(input.railways)
@@ -60,7 +69,11 @@ export function surveyLayoutMainCorridors(input: LayoutMainCorridorInput, adopt:
     const to = planner.boundaryPortals(center, { width: roadWidth, preferred: last, maxCandidates: 2 })
     const pairs = from.flatMap(start => to.map(goal => ({ start, goal, distance: distance(start, center) + distance(center, goal) }))).sort((a, b) => a.distance - b.distance).slice(0, 2)
     for (const { start, goal } of pairs) {
-        const route = planner.plan(start, goal, { role: 'highway', width: roadWidth, through: center, allowBridge: true, maximumGrade: .09, maxNodes: 4200 })
+        const options = { role: 'highway' as const, width: roadWidth, through: center, allowBridge: true, maximumGrade: .09, maxNodes: 16000 }
+        // A short geographic leg may still need a long dry detour around a
+        // tributary. Retry the same alignment once at the finite ceiling;
+        // neither the available land nor any physical guard changes.
+        const route = planner.plan(start, goal, { ...options, maxNodesPerKm: 1800 }) ?? planner.plan(start, goal, options)
         if (!route || route.length > distance(start, goal) * 1.8 || alignmentDiagnostics(route.points).minimumRadius < 75 || !planner.validate(route.points, roadWidth, route.bridgeLength > 0)) continue
         const proposal = { id: `layout-main-corridor-${index + 1}`, route, width: roadWidth, builtYear: 1650 }
         if (!adopt(proposal)) continue

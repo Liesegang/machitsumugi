@@ -26,11 +26,12 @@ export interface PlanningTerrain {
 export interface PlanningEnvironment { width: number; height: number; areas: Area[]; core: Point[] | null; terrain?: PlanningTerrain; bridgeSites?: Point[]; landCost?: (point: Point) => number; exactLandCost?: boolean; waterGeometryBounds?: { minX: number; minY: number; maxX: number; maxY: number } }
 export interface SurveyedBridgeSpan { bankA: Point; bankB: Point }
 export interface PlannedRoute { points: Point[]; length: number; cost: number; bridgeLength: number; method: 'direct' | 'heading-search' | 'bridge-project'; boundaryContinuation?: boolean; surveyedBridgeSpans?: SurveyedBridgeSpan[] }
-export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; alignment?: 'natural' | 'planned'; maximumGrade?: number }
+export interface PlanningOptions { role: RoadRole; width: number; allowBridge?: boolean; startHeading?: number; endHeading?: number; through?: Point; maxNodes?: number; /** Optional distance budget for long independently planned corridors; physical guards are unchanged. */ maxNodesPerKm?: number; alignment?: 'natural' | 'planned'; maximumGrade?: number }
 type PlanningField = { water: boolean; sea: boolean; grade: number; cost: number; coreDistance: number }
 type EarthField = { grade: number; cost: number }
 type WidthRailSegment = { a: Point; b: Point; id: string; along: number; length: number; levels?: [number, number]; bridges: [number, number][] }
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y)
+const searchNodeLimit = (length: number, options: PlanningOptions) => options.maxNodesPerKm === undefined ? options.maxNodes : Math.min(options.maxNodes ?? 16000, Math.max(4200, Math.ceil(length / 1000) * options.maxNodesPerKm))
 const lerp = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
 const turn = (a: number) => Math.atan2(Math.sin(a), Math.cos(a))
 /** Minimum dry-land credit/metre before nonnegative earthwork and ownership costs. */
@@ -500,6 +501,7 @@ export class RoadPlanner {
     return null
   }
   plan(start: Point, goal: Point, options: PlanningOptions): PlannedRoute | null {
+    if (options.maxNodesPerKm !== undefined) options = { ...options, maxNodes: searchNodeLimit(distance(start, goal), options) }
     const route = this.planGeometry(start, goal, options)
     if (route) {
       const first = route.points[0]!, last = route.points.at(-1)!, next = route.points.find(p => distance(first, p) > 1e-6), before = [...route.points].reverse().find(p => distance(last, p) > 1e-6)
@@ -556,9 +558,10 @@ export class RoadPlanner {
         lowerBound: (a, b) => distance(a, b) * roadConstructionFactor(options.role),
         cost: points => this.cost(points, options.role, true),
         dry: (a, b, startHeading, endHeading) => {
-          const key = `${pointKey(a)}>${pointKey(b)}:${options.role}:${options.width}:${startHeading?.toFixed(6)}:${endHeading?.toFixed(6)}:${options.alignment ?? 'natural'}:${options.maximumGrade ?? 'default'}`
+          const maxNodes = searchNodeLimit(distance(a, b), { ...options, maxNodes: options.maxNodes ?? 9000 }) ?? 9000
+          const key = `${pointKey(a)}>${pointKey(b)}:${options.role}:${options.width}:${startHeading?.toFixed(6)}:${endHeading?.toFixed(6)}:${options.alignment ?? 'natural'}:${options.maximumGrade ?? 'default'}:nodes${maxNodes}`
           if (this.dryRouteCache.has(key)) return this.dryRouteCache.get(key)!
-          const route = this.plan(a, b, { ...options, through: undefined, allowBridge: false, startHeading, endHeading, maxNodes: options.maxNodes ?? 9000 })
+          const route = this.plan(a, b, { ...options, through: undefined, allowBridge: false, startHeading, endHeading, maxNodes })
           this.dryRouteCache.set(key, route)
           return route
         },

@@ -14,6 +14,8 @@ import { adoptLayoutInfillZones, layoutStreetFaceCenter } from './layout-first-s
 import { planLayoutStreetFabricSplit } from './layout-first-street-fabric'
 import { surveyLayoutMainCorridors } from './layout-first-main-corridors'
 import { layoutFrontageLoop } from './layout-first-frontage-loops'
+import { layoutNeighborhoodHasStreetFace, proposeLayoutNeighborhoodLinks } from './layout-first-neighborhood-links'
+import type { LayoutNeighborhoodSite } from './layout-first-neighborhood-links'
 
 export interface LayoutAccessTarget { id: string; point: Point; builtYear: number }
 export interface LayoutRoadDiagnostics {
@@ -190,7 +192,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     route = { ...route, points }
     // Outside-to-outside corridors join at their surveyed internal town point,
     // rather than at an outside endpoint. Verify that exact contact first.
-    const internalContact = !!throughRouteId && route.points.some(point => !!graph.nearest(point, .15))
+    const internalContact = !!throughRouteId && route.points.some(point => !!graph.nearest(point, 1e-7))
     const added = graph.add(route.points, { id: `layout-road-${++serial}`, kind: throughRouteId && input.arterial !== false ? 'arterial' : 'local', width: roadWidth, role, builtYear: year, phase: throughRouteId ? 'surveyed-main-corridor' : boundary ? 'regional-connections' : 'spatial-layout', reason, constructionCost: route.cost, ...(throughRouteId ? { throughRouteId } : {}), ...(role === 'access' ? { preserveEndpoint: true } : {}), ...(route.bridgeLength > 0 ? { bridge: true } : {}), ...(boundary ? { boundaryContinuation: true } : {}) }, graph.roads.length > 0 && !internalContact)
     if (!added) { diagnostics.rejected++; return null }
     diagnostics.accepted++; diagnostics.streetLength += roadLength(added.points)
@@ -411,12 +413,37 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     active.push({ zone, hub: connected.point })
   }
 
-  // New town streets first acquire a closed reach from two actual frontage
-  // points. Without this, a single old through road has no face to subdivide.
-  const frontageLoops = new Map<string, { road: SimulatedRoad; point: Point }[]>()
-  for (const { zone, hub } of active) {
-    if (zone.kind === 'rural') continue
+  // Connect existing public streets BETWEEN urban hubs and real station
+  // gates before enclosing a neighbourhood on its own. No planning circle
+  // supplies the endpoints or the shape of these accepted town blocks.
+  const neighbourhoodSites: LayoutNeighborhoodSite[] = accessTargets.filter(target => target.id.startsWith('station-access-')).map(target => ({ id: target.id, point: target.point, builtYear: target.builtYear }))
+  for (const { zone, hub } of active) if (zone.kind !== 'rural' && !neighbourhoodSites.some(site => distance(site.point, hub) < 120)) neighbourhoodSites.push({ id: zone.id, point: hub, builtYear: zone.builtYear })
+  const connectNeighbourhoodStreets = () => {
+    let accepted = 0
+    for (const link of proposeLayoutNeighborhoodLinks({ roads: graph.roads, sites: neighbourhoodSites })) {
+      check()
+      const from = graph.nearest(link.from.point, 1e-6), to = graph.nearest(link.to.point, 1e-6)
+      if (!from || !to) continue
+      const year = Math.max(link.builtYear, from.road.builtYear, to.road.builtYear)
+      if (survey(from.point, to.point, 'collector', link.width, year, '隣接する住区と駅前の実公道を複数箇所で結ぶ連絡道路', false, 1200)) accepted++
+    }
+    return accepted
+  }
+  connectNeighbourhoodStreets()
+
+  // A single old street may genuinely leave an isolated neighbourhood with
+  // no face at its opening date. Only that case receives an outer reach;
+  // existing connected faces are never replaced by completed capsule stamps.
+  const faceCache = new Map<number, Point[][]>()
+  const facesAt = (year: number) => {
+    let faces = faceCache.get(year)
+    if (!faces) { faces = extractStreetBlocks(graph.roads.filter(road => road.builtYear <= year)); faceCache.set(year, faces) }
+    return faces
+  }
+  for (const { zone, hub } of active.slice().sort((a, b) => a.zone.builtYear - b.zone.builtYear || a.zone.id.localeCompare(b.zone.id))) {
+    if (zone.kind === 'rural' || layoutNeighborhoodHasStreetFace({ id: zone.id, point: hub, builtYear: zone.builtYear }, facesAt(zone.builtYear))) continue
     const anchors = openProjections(hub, zone.radius * 1.3, zone.builtYear, 32).filter(hit => hit.road.width >= 7.8 && roadLength(hit.road.points) >= 240)
+    let changed = false
     for (const side of [-1, 1]) {
       let adopted = false
       for (const anchor of anchors.slice(0, 3)) {
@@ -424,51 +451,22 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
           const points = layoutFrontageLoop(anchor.road, anchor.point, zone.radius * 1.9, zone.radius * fraction, side)
           if (!points || !planner.validate(points, 7) || environment.terrain && !surveyedRoadGradeAllowed({ points }, .13, environment.terrain.elevation)) continue
           diagnostics.attempted++
-          const added = accept(planner.cost(points, 'collector'), 'collector', 7, zone.builtYear, '既存の旧道から奥の街路へ回り込み二つの接道点を結ぶ地区道路')
-          if (added) {
-            const loops = frontageLoops.get(zone.id) ?? []
-            loops.push({ road: added, point: added.points[Math.floor(added.points.length / 2)]! }); frontageLoops.set(zone.id, loops)
-            adopted = true; break
-          }
+          if (accept(planner.cost(points, 'collector'), 'collector', 7, zone.builtYear, '孤立した住区で旧道上の二つの接道点を結ぶ補完街路')) { adopted = true; changed = true; break }
         }
         if (adopted) break
       }
     }
+    if (changed) faceCache.clear()
   }
+  // Newly accepted isolated reaches can now supply separate frontage contacts
+  // to their neighbours. This bounded second pass still creates no land until
+  // its complete surveyed routes have been adopted by the real road graph.
+  connectNeighbourhoodStreets()
 
-  // Neighbourhood collectors grow from the accepted old roads and regional
-  // alignments. A few land-only closing links create unequal town blocks;
-  // there are no citywide rows, columns or repeating corridor intervals.
   const radii = active.map(item => item.zone.radius).sort((a, b) => a - b)
   const corridorSpacing = Math.max(380, Math.min(900, (radii[Math.floor(radii.length / 2)] ?? 600) * .9))
   const closestZone = (point: Point) => zones.filter(zone => pointInRegion(point, zone)).sort((a, b) => distance(a.center, point) / a.radius - distance(b.center, point) / b.radius)[0]
     ?? zones.slice().sort((a, b) => distance(a.center, point) - distance(b.center, point))[0]
-  const connectedPairs = new Set<string>(), closingDegree = new Map<string, number>()
-  for (const { zone, hub } of active.slice().sort((a, b) => a.zone.builtYear - b.zone.builtYear || a.zone.id.localeCompare(b.zone.id))) {
-    if (zone.kind === 'rural' || (closingDegree.get(zone.id) ?? 0) >= 1) continue
-    const neighbours = active.filter(other => other.zone !== zone && other.zone.kind !== 'rural' && (closingDegree.get(other.zone.id) ?? 0) < 1 && distance(hub, other.hub) >= 240 && distance(hub, other.hub) <= (zone.radius + other.zone.radius) * 1.7)
-      .sort((a, b) => distance(hub, a.hub) - distance(hub, b.hub)).slice(0, 4)
-    for (const neighbour of neighbours) {
-      const key = [zone.id, neighbour.zone.id].sort().join(':')
-      if (connectedPairs.has(key)) continue
-      connectedPairs.add(key)
-      const year = Math.max(zone.builtYear, neighbour.zone.builtYear)
-      const pairs = (frontageLoops.get(zone.id) ?? []).flatMap(first => (frontageLoops.get(neighbour.zone.id) ?? []).map(last => ({ from: first.point, to: last.point })))
-        .sort((a, b) => distance(a.from, a.to) - distance(b.from, b.to))
-      if (!pairs.length) pairs.push({ from: hub, to: neighbour.hub })
-      let road: SimulatedRoad | null = null
-      for (const pair of pairs.slice(0, 4)) {
-        const from = graph.nearest(pair.from, 2)?.point, to = graph.nearest(pair.to, 2)?.point
-        if (!from || !to) continue
-        road = survey(from, to, 'collector', zone.kind === 'historic' || neighbour.zone.kind === 'historic' ? 7 : 8, year, '隣接する地区の旧道を結ぶ地形に沿った連絡道路', false, 1600)
-        if (road) break
-      }
-      if (!road) continue
-      closingDegree.set(zone.id, (closingDegree.get(zone.id) ?? 0) + 1)
-      closingDegree.set(neighbour.zone.id, (closingDegree.get(neighbour.zone.id) ?? 0) + 1)
-      break
-    }
-  }
 
   // The first regional surveys knew only the old centre/bridgeheads. Once
   // the citywide mesh exists, use its real edgeward pavement as the departure

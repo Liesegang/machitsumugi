@@ -210,6 +210,22 @@ describe('layout-first public street design', () => {
     expect(result.zones).not.toBe(zones)
   })
 
+  it('uses several real inter-neighbourhood links without stamping another outer loop on existing closed frontage', () => {
+    const old = { ...zone({ x: 600, y: 700 }, 400), id: 'old-neighbourhood', kind: 'historic' as const, builtYear: 1650 }
+    const modern = { ...zone({ x: 900, y: 700 }, 350), id: 'nearby-modern-neighbourhood', builtYear: 1975 }
+    const result = buildLayoutFirstRoads({ environment: flatEnvironment(2000, 1400), seed: 'shared-closed-frontage', center: old.center, zones: [old, modern] })
+    const links = result.roads.filter(road => road.reason === '隣接する住区と駅前の実公道を複数箇所で結ぶ連絡道路')
+    expect(links.length).toBeGreaterThanOrEqual(2)
+    for (const road of links) for (const endpoint of [road.points[0]!, road.points.at(-1)!]) {
+      expect(result.roads.some(other => other !== road && other.points.slice(1).some((b, i) => distanceToSegment(endpoint, other.points[i]!, b) < 1e-6))).toBe(true)
+    }
+    // Only the isolated old reach needs two fallback sides. Its neighbour
+    // already has usable actual faces and must not receive a second capsule.
+    expect(result.roads.filter(road => road.reason === '孤立した住区で旧道上の二つの接道点を結ぶ補完街路')).toHaveLength(2)
+    expect(result.blocks.some(block => pointInPolygon({ x: 900, y: 820 }, block))).toBe(true)
+    expect(result.roads.every(road => Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points.at(-1)!)))).toBe(true)
+  })
+
   it('selects actual near-edge public anchors for late outside surveys instead of restarting at the centre', () => {
     const roads: Road[] = [
       { id: 'old-centre', kind: 'local', width: 9, points: [{ x: 900, y: 650 }, { x: 950, y: 650 }] },
