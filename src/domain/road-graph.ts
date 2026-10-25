@@ -2,7 +2,7 @@ import type { Point, Road, TimelineVersion } from './types'
 
 export type RoadRole = 'highway' | 'collector' | 'lane' | 'access' | 'bridge' | 'farm' | 'expressway' | 'ramp'
 export interface SimulatedRoad extends Road { builtYear: number; role: RoadRole; reason: string; bridge?: boolean; phase: string; constructionCost: number }
-export interface RoadMetadata { id: string; builtYear: number; role: RoadRole; reason: string; phase: string; width: number; kind: Road['kind']; constructionCost: number; bridge?: boolean; preserveEndpoint?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean }
+export interface RoadMetadata { id: string; builtYear: number; role: RoadRole; reason: string; phase: string; width: number; kind: Road['kind']; constructionCost: number; bridge?: boolean; preserveEndpoint?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean; throughRouteId?: string }
 export interface RoadProject { points: Point[]; metadata: RoadMetadata; requireConnection?: boolean; modifies?: string }
 export interface RoadProjection { point: Point; distance: number; road: SimulatedRoad; a: Point; b: Point; t: number }
 /** Generalized uncongested speed in m/min; historical impedance is applied by
@@ -289,7 +289,7 @@ export class PlanarRoadGraph {
       samples++; if (!controlledRoad(metadata) && this.nearest(middle, metadata.width * .5 + 2)) covered++
     }
     if (samples > 3 && covered / samples > .72) return null
-    const road: SimulatedRoad = { id: metadata.id, points: normalized, kind: metadata.kind, width: metadata.width, builtYear: metadata.builtYear, role: metadata.role, phase: metadata.phase, reason: metadata.reason, constructionCost: metadata.constructionCost, ...(metadata.bridge ? { bridge: true } : {}), ...(metadata.level !== undefined ? { level: metadata.level } : {}), ...(metadata.controlledAccess ? { controlledAccess: true } : {}), ...(metadata.boundaryContinuation ? { boundaryContinuation: true } : {}) }
+    const road: SimulatedRoad = { id: metadata.id, points: normalized, kind: metadata.kind, width: metadata.width, builtYear: metadata.builtYear, role: metadata.role, phase: metadata.phase, reason: metadata.reason, constructionCost: metadata.constructionCost, ...(metadata.bridge ? { bridge: true } : {}), ...(metadata.level !== undefined ? { level: metadata.level } : {}), ...(metadata.controlledAccess ? { controlledAccess: true } : {}), ...(metadata.boundaryContinuation ? { boundaryContinuation: true } : {}), ...(metadata.throughRouteId ? { throughRouteId: metadata.throughRouteId } : {}) }
     for (const junction of junctions) this.insert(junction.road, junction.point)
     // Explicit endpoint snaps also split old curves even if the new path is tangent at the connection.
     for (const endpoint of controlledRoad(metadata) ? [] : [normalized[0]!, normalized.at(-1)!]) {

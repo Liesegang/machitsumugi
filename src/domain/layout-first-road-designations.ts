@@ -3,25 +3,26 @@ import { controlledRoad, MinHeap } from './road-graph'
 
 const key = (point: Point) => `${Math.round(point.x * 20)}:${Math.round(point.y * 20)}`
 const edgeKey = (a: Point, b: Point) => { const x = key(a), y = key(b); return x < y ? `${x}|${y}` : `${y}|${x}` }
+const routeEdgeKey = (road: Road, a: Point, b: Point) => `${road.throughRouteId ?? ''}:${edgeKey(a, b)}`
 const classify = (road: Road, through: boolean): Road => through ? { ...road, kind: 'arterial' } : { ...road, kind: 'local', ...(road.role === 'highway' ? { role: 'collector', reason: road.boundaryContinuation ? '地区から周辺地域へ続く道路' : '地区内を結ぶ広幅員道路' } : {}) }
 
 /** A through-route designation follows actual connected, surveyed pavement.
  * Assigning a national-road colour does not invent or widen its cross-section. */
 export function designateLayoutThroughRoads(roads: Road[], width: number, height: number): Road[] {
   const nodes = new Map<string, number>(), links: { to: number; cost: number; edge: string }[][] = [], exits = new Map<number, string>()
-  const node = (p: Point) => { const k = key(p), existing = nodes.get(k); if (existing !== undefined) return existing; const id = links.length; nodes.set(k, id); links.push([]); return id }
+  const node = (p: Point, routeId: string) => { const k = `${routeId}:${key(p)}`, existing = nodes.get(k); if (existing !== undefined) return existing; const id = links.length; nodes.set(k, id); links.push([]); return id }
   const publicGround = (road: Road) => !controlledRoad(road) && (road.level ?? 0) === 0
   const boundarySide = (point: Point) => {
     const candidates = [{ side: 'west', beyond: -point.x }, { side: 'east', beyond: point.x - width }, { side: 'north', beyond: -point.y }, { side: 'south', beyond: point.y - height }]
     return candidates.filter(value => value.beyond > 0).sort((a, b) => b.beyond - a.beyond)[0]?.side
   }
   for (const road of roads) {
-    if (controlledRoad(road) || (road.level ?? 0) !== 0 || road.width < 6.8) continue
+    if (!road.throughRouteId || controlledRoad(road) || (road.level ?? 0) !== 0 || road.width < 6.8) continue
     for (let i = 1; i < road.points.length; i++) {
-      const p = road.points[i - 1]!, q = road.points[i]!, a = node(p), b = node(q), edge = edgeKey(p, q), cost = Math.hypot(q.x - p.x, q.y - p.y) * (road.role === 'lane' ? 1.25 : 1)
+      const p = road.points[i - 1]!, q = road.points[i]!, a = node(p, road.throughRouteId), b = node(q, road.throughRouteId), edge = routeEdgeKey(road, p, q), cost = Math.hypot(q.x - p.x, q.y - p.y)
       links[a]!.push({ to: b, cost, edge }); links[b]!.push({ to: a, cost, edge })
     }
-    if (road.boundaryContinuation) for (const p of [road.points[0]!, road.points.at(-1)!]) { const side = boundarySide(p); if (side) exits.set(node(p), side) }
+    if (road.boundaryContinuation) for (const p of [road.points[0]!, road.points.at(-1)!]) { const side = boundarySide(p); if (side) exits.set(node(p, road.throughRouteId), side) }
   }
   const designated = new Set<string>()
   const visited = new Set<number>()
@@ -41,7 +42,7 @@ export function designateLayoutThroughRoads(roads: Road[], width: number, height
   }
   return roads.flatMap(road => {
     if (!publicGround(road)) return [road]
-    const flags = road.points.slice(1).map((p, i) => designated.has(edgeKey(road.points[i]!, p)))
+    const flags = road.points.slice(1).map((p, i) => !!road.throughRouteId && designated.has(routeEdgeKey(road, road.points[i]!, p)))
     if (flags.every(flag => !flag)) return [road.kind === 'arterial' || road.role === 'highway' ? classify(road, false) : road]
     if (flags.every(Boolean)) return [classify(road, true)]
     const pieces: Road[] = []; let start = 0
@@ -62,7 +63,7 @@ export function layoutThroughRoadHistory(roads: readonly Road[], width: number, 
   for (const phase of phases) {
     const through = new Set<string>()
     for (const road of designateLayoutThroughRoads(roads.filter(road => (road.builtYear ?? 1650) <= phase), width, height)) if (road.kind === 'arterial' && !controlledRoad(road) && (road.level ?? 0) === 0) {
-      for (let i = 1; i < road.points.length; i++) through.add(edgeKey(road.points[i - 1]!, road.points[i]!))
+      for (let i = 1; i < road.points.length; i++) through.add(routeEdgeKey(road, road.points[i - 1]!, road.points[i]!))
     }
     atPhase.set(phase, through)
   }
@@ -71,7 +72,7 @@ export function layoutThroughRoadHistory(roads: readonly Road[], width: number, 
     const opening = road.builtYear ?? 1650, activePhases = phases.filter(phase => phase >= opening), count = road.points.length - 1
     if (!activePhases.length || count < 1) continue
     if (controlledRoad(road) || (road.level ?? 0) !== 0) { result.push({ from: opening, value: road }); continue }
-    const flags = activePhases.map(phase => road.points.slice(1).map((point, i) => atPhase.get(phase)!.has(edgeKey(road.points[i]!, point))))
+    const flags = activePhases.map(phase => road.points.slice(1).map((point, i) => !!road.throughRouteId && atPhase.get(phase)!.has(routeEdgeKey(road, road.points[i]!, point))))
     const cuts = [0]
     for (let i = 1; i < count; i++) if (flags.some(values => values[i] !== values[i - 1])) cuts.push(i)
     cuts.push(count)

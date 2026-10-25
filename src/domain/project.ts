@@ -145,6 +145,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       ...(r.level === undefined ? {} : { level: number(r.level, '道路の階層', -10, 10, true) }),
       ...(r.controlledAccess === undefined ? {} : { controlledAccess: boolean(r.controlledAccess, '沿道からの進入制限') }),
       ...(r.boundaryContinuation === undefined ? {} : { boundaryContinuation: boolean(r.boundaryContinuation, '範囲外への道路継続') }),
+      ...(r.throughRouteId === undefined ? {} : { throughRouteId: string(r.throughRouteId, '連続幹線の計画ID', 128) }),
       ...(r.reason === undefined ? {} : { reason: string(r.reason, '道路の建設理由', 2000, true) }),
       ...(r.bridge === undefined ? {} : { bridge: boolean(r.bridge, '橋の指定') }),
       ...(r.phase === undefined ? {} : { phase: string(r.phase, '道路の成立段階', 128) }),

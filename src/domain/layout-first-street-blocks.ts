@@ -1,7 +1,7 @@
 import type { Point } from './types'
 import type { PolygonRegion } from './geometry'
 import type { LayoutFirstZone } from './layout-first-types'
-import { boundsOf, distance, distanceToSegment, pointInPolygon, pointInRegion, polygonArea, polygonOverlapsRegion, seededRandom } from './geometry'
+import { boundsOf, distance, distanceToSegment, pointInPolygon, pointInRegion, polygonArea, polygonOverlapsRegion, seededRandom, segmentsCross } from './geometry'
 
 /** Survey vertices are denser on curved arterial edges than straight streets.
  * Their arithmetic mean is not the location of the enclosed land. */
@@ -64,8 +64,42 @@ export interface LayoutStreetFaceSplitOptions {
   jitter?: number
   seed: string
   minimumArea?: number
+  /** Relative location across the face; omitted retains the original brief. */
+  cutFraction?: number
 }
 export interface LayoutStreetFaceSplit { points: [Point, Point]; polygons: Point[][] }
+
+/** Split one surveyed face with a complete boundary-to-boundary polyline.
+ * This checks the geometric subdivision only, never engineering acceptance. */
+export function splitLayoutStreetFacePath(polygon: readonly Point[], path: readonly Point[], minimumArea = 150): Point[][] | null {
+  if (polygon.length < 3 || path.length < 2) return null
+  const ring = [...polygon], first = path[0]!, last = path.at(-1)!
+  const start = ring.findIndex((a, i) => distanceToSegment(first, a, ring[(i + 1) % ring.length]!) < 1e-6)
+  const end = ring.findIndex((a, i) => distanceToSegment(last, a, ring[(i + 1) % ring.length]!) < 1e-6)
+  if (start < 0 || end < 0 || start === end || distance(first, last) < 1) return null
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1]!, b = path[i]!
+    if (distance(a, b) < .01 || ring.some((c, j) => segmentsCross(a, b, c, ring[(j + 1) % ring.length]!))) return null
+    for (let j = 1; j < i - 1; j++) if (segmentsCross(a, b, path[j - 1]!, path[j]!)) return null
+    const samples = Math.max(2, Math.ceil(distance(a, b) / 10))
+    for (let n = 1; n < samples; n++) if (!pointInPolygon({ x: a.x + (b.x - a.x) * n / samples, y: a.y + (b.y - a.y) * n / samples }, ring)) return null
+  }
+  if (path.slice(1, -1).some(point => !pointInPolygon(point, ring))) return null
+  const walk = (from: number, to: number, a: Point, b: Point) => {
+    const result = [a]
+    for (let n = 1; n <= ring.length; n++) {
+      const index = (from + n) % ring.length
+      if (distance(result.at(-1)!, ring[index]!) > 1e-7) result.push(ring[index]!)
+      if (index === to) break
+    }
+    if (distance(result.at(-1)!, b) > 1e-7) result.push(b)
+    return result
+  }
+  const a = [...walk(start, end, first, last), ...path.slice(1, -1).reverse()]
+  const b = [...walk(end, start, last, first), ...path.slice(1, -1)]
+  if (polygonArea(a) < minimumArea || polygonArea(b) < minimumArea || Math.abs(polygonArea(a) + polygonArea(b) - polygonArea(ring)) > Math.max(.01, polygonArea(ring) * 1e-8)) return null
+  return [a, b]
+}
 
 /** A street proposal joins two real edges of one existing road face. The
  * returned children are geometric proposals only: callers must survey the
@@ -95,7 +129,8 @@ export function splitLayoutStreetFace(polygon: readonly Point[], options: Layout
   for (let attempt = 0; attempt < 8; attempt++) {
     const bearing = normal + (random() - .5) * (options.jitter ?? .06)
     const nx = Math.cos(bearing), ny = Math.sin(bearing), range = extent(bearing)
-    const offset = range.low + (range.high - range.low) * (.43 + random() * .14)
+    const fraction = options.cutFraction === undefined ? .43 + random() * .14 : Math.max(.2, Math.min(.8, options.cutFraction))
+    const offset = range.low + (range.high - range.low) * fraction
     const hits: { point: Point; edge: number; order: number }[] = []
     for (let edge = 0; edge < ring.length; edge++) {
       const a = ring[edge]!, b = ring[(edge + 1) % ring.length]!, da = a.x * nx + a.y * ny - offset, db = b.x * nx + b.y * ny - offset

@@ -1,6 +1,6 @@
 import type { Point, Railway, Road } from './types'
 import type { PolygonRegion } from './geometry'
-import { corridorPolygon, distance, pointInRegion, polygonArea, polygonOverlapsRegion, seededRandom } from './geometry'
+import { corridorPolygon, distance, pointInRegion, polygonOverlapsRegion } from './geometry'
 import type { LayoutFirstZone } from './layout-first-types'
 import { PlanarRoadGraph, extractStreetBlocks, projectOnRoadSegment, roadLength } from './road-graph'
 import type { RoadProjection, RoadRole, SimulatedRoad } from './road-graph'
@@ -10,7 +10,10 @@ import { RegionalRoadPlanner } from './regional-road-planner'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { RailwayRoadConstraints } from './railway-road-constraints'
 import { alignmentDiagnostics, tangentAlignment } from './road-alignment'
-import { adoptLayoutInfillZones, layoutStreetFaceCenter, splitLayoutStreetFace } from './layout-first-street-blocks'
+import { adoptLayoutInfillZones, layoutStreetFaceCenter } from './layout-first-street-blocks'
+import { planLayoutStreetFabricSplit } from './layout-first-street-fabric'
+import { surveyLayoutMainCorridors } from './layout-first-main-corridors'
+import { layoutFrontageLoop } from './layout-first-frontage-loops'
 
 export interface LayoutAccessTarget { id: string; point: Point; builtYear: number }
 export interface LayoutRoadDiagnostics {
@@ -177,7 +180,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     }
     return canonical.length >= 2 ? canonical : null
   }
-  const accept = (route: PlannedRoute | null, role: RoadRole, roadWidth: number, year: number, reason: string, boundary = false) => {
+  const accept = (route: PlannedRoute | null, role: RoadRole, roadWidth: number, year: number, reason: string, boundary = false, throughRouteId?: string) => {
     if (!route || !Number.isFinite(route.cost)) { diagnostics.rejected++; return null }
     const points = canonicalSurvey(route, role === 'access')
     if (!points || !avoidsReservations(points, roadWidth) || !planner.railwayWidthAllows(points, .01, roadWidth, role) || environment.terrain && !surveyedRoadGradeAllowed({ ...route, points }, role === 'highway' ? .09 : .13, environment.terrain.elevation)) { diagnostics.rejected++; return null }
@@ -185,7 +188,10 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     const moved = points.length !== proposedPoints.length || points.some((p, i) => distance(p, proposedPoints[i]!) > 1e-8)
     if (moved && !planner.validate(points, roadWidth, route.bridgeLength > 0)) { diagnostics.rejected++; return null }
     route = { ...route, points }
-    const added = graph.add(route.points, { id: `layout-road-${++serial}`, kind: (boundary || role === 'highway') && input.arterial !== false ? 'arterial' : 'local', width: roadWidth, role, builtYear: year, phase: boundary ? 'regional-connections' : 'spatial-layout', reason, constructionCost: route.cost, ...(role === 'access' ? { preserveEndpoint: true } : {}), ...(route.bridgeLength > 0 ? { bridge: true } : {}), ...(boundary ? { boundaryContinuation: true } : {}) }, graph.roads.length > 0)
+    // Outside-to-outside corridors join at their surveyed internal town point,
+    // rather than at an outside endpoint. Verify that exact contact first.
+    const internalContact = !!throughRouteId && route.points.some(point => !!graph.nearest(point, .15))
+    const added = graph.add(route.points, { id: `layout-road-${++serial}`, kind: throughRouteId && input.arterial !== false ? 'arterial' : 'local', width: roadWidth, role, builtYear: year, phase: throughRouteId ? 'surveyed-main-corridor' : boundary ? 'regional-connections' : 'spatial-layout', reason, constructionCost: route.cost, ...(throughRouteId ? { throughRouteId } : {}), ...(role === 'access' ? { preserveEndpoint: true } : {}), ...(route.bridgeLength > 0 ? { bridge: true } : {}), ...(boundary ? { boundaryContinuation: true } : {}) }, graph.roads.length > 0 && !internalContact)
     if (!added) { diagnostics.rejected++; return null }
     diagnostics.accepted++; diagnostics.streetLength += roadLength(added.points)
     for (const span of route.surveyedBridgeSpans ?? []) bridgeSpans.push({ roadId: added.id, bankA: span.bankA, bankB: span.bankB })
@@ -229,6 +235,11 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     if (graph.roads.length) break
   }
 
+  // Regional roads acquire their own continuous physical alignment before
+  // local streets exist. A later path over household streets is not a trunk.
+  if (regional && input.arterial !== false) surveyLayoutMainCorridors({ environment, center, zones, railways, signal }, proposal =>
+    !!accept(proposal.route, 'highway', proposal.width, proposal.builtYear, '周辺地域から町を通過する連続した幹線の測量', true, proposal.id))
+
   // Survey exits before selecting building frontage. Endpoints remain outside
   // the crop, so clipping cannot manufacture a dead-ended major road.
   if (regional) {
@@ -241,6 +252,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     }).sort((a, b) => b.score - a.score)
     for (const { edge } of sides) {
       check()
+      if (graph.roads.some(road => road.boundaryContinuation && road.points.some(p => edge.x === 0 ? p.x < 0 : edge.x === width ? p.x > width : edge.y === 0 ? p.y < 0 : p.y > height))) continue
       // Candidate checks see actual surrounding land; no edge-clamping or
       // arbitrary extension into the sea. At most two expensive searches/side.
       for (const portal of regional.boundaryPortals(center, { width: roadWidth, preferred: edge, maxCandidates: 2 })) {
@@ -399,93 +411,63 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     active.push({ zone, hub: connected.point })
   }
 
-  // One continuous citywide corridor frame crosses planning territories.
-  // Rows/columns have coherent bearings and spacing; centres and stations
-  // attach to this frame rather than seeding diagonals through every face.
-  const random = seededRandom(`${input.seed}:citywide-corridors`)
-  const coverage = zones.reduce((sum, zone) => sum + polygonArea(zone.polygon), 0)
-  const corridorSpacing = Math.max(300, Math.min(430, Math.sqrt(coverage / Math.max(1, zones.length)) / 3.2))
-  const corridorAngle = zones.find(zone => zone.kind === 'historic')?.angle ?? backboneAngle
-  const cos = Math.cos(corridorAngle), sin = Math.sin(corridorAngle)
-  const local = (p: Point) => ({ x: (p.x - center.x) * cos + (p.y - center.y) * sin, y: -(p.x - center.x) * sin + (p.y - center.y) * cos })
-  const world = (u: number, v: number): Point => ({ x: center.x + cos * u - sin * v, y: center.y + sin * u + cos * v })
+  // New town streets first acquire a closed reach from two actual frontage
+  // points. Without this, a single old through road has no face to subdivide.
+  const frontageLoops = new Map<string, { road: SimulatedRoad; point: Point }[]>()
+  for (const { zone, hub } of active) {
+    if (zone.kind === 'rural') continue
+    const anchors = openProjections(hub, zone.radius * 1.3, zone.builtYear, 32).filter(hit => hit.road.width >= 7.8 && roadLength(hit.road.points) >= 240)
+    for (const side of [-1, 1]) {
+      let adopted = false
+      for (const anchor of anchors.slice(0, 3)) {
+        for (const fraction of [.86, .63, .42]) {
+          const points = layoutFrontageLoop(anchor.road, anchor.point, zone.radius * 1.9, zone.radius * fraction, side)
+          if (!points || !planner.validate(points, 7) || environment.terrain && !surveyedRoadGradeAllowed({ points }, .13, environment.terrain.elevation)) continue
+          diagnostics.attempted++
+          const added = accept(planner.cost(points, 'collector'), 'collector', 7, zone.builtYear, '既存の旧道から奥の街路へ回り込み二つの接道点を結ぶ地区道路')
+          if (added) {
+            const loops = frontageLoops.get(zone.id) ?? []
+            loops.push({ road: added, point: added.points[Math.floor(added.points.length / 2)]! }); frontageLoops.set(zone.id, loops)
+            adopted = true; break
+          }
+        }
+        if (adopted) break
+      }
+    }
+  }
+
+  // Neighbourhood collectors grow from the accepted old roads and regional
+  // alignments. A few land-only closing links create unequal town blocks;
+  // there are no citywide rows, columns or repeating corridor intervals.
+  const radii = active.map(item => item.zone.radius).sort((a, b) => a - b)
+  const corridorSpacing = Math.max(380, Math.min(900, (radii[Math.floor(radii.length / 2)] ?? 600) * .9))
   const closestZone = (point: Point) => zones.filter(zone => pointInRegion(point, zone)).sort((a, b) => distance(a.center, point) / a.radius - distance(b.center, point) / b.radius)[0]
     ?? zones.slice().sort((a, b) => distance(a.center, point) - distance(b.center, point))[0]
-  type CorridorSite = { point: Point; year: number; row: number; column: number }
-  type CorridorEdge = { a: string; b: string; major: boolean; order: number }
-  const sites = new Map<string, CorridorSite>(), edges: CorridorEdge[] = []
-  const corners = zones.flatMap(zone => zone.polygon.map(local))
-  const mainRow = (row: number) => row % 6 === 0
-  const mainColumn = (column: number) => column % 7 === 0
-  const connectCorridor = (from: Point, to: Point, year: number, major = false, attachment = false) => {
-    const role: RoadRole = major && input.arterial !== false ? 'highway' : 'collector', roadWidth = major && input.arterial !== false ? 14 : 8.5
-    const maximumGrade = role === 'highway' ? .09 : .13
-    const reason = attachment ? '地区の中心から共通の市域幹線への接続' : major ? '市域を連続して通り抜ける広幅員の都市幹線' : '市域を連続して結ぶ生活幹線'
-    check(); diagnostics.attempted++
-    const openingYear = Math.max(year, graph.nearest(from, .15)?.road.builtYear ?? year)
-    if (planner.validate([from, to], roadWidth) && avoidsReservations([from, to], roadWidth) && planner.railwayWidthAllows([from, to], .01, roadWidth, role) && (!environment.terrain || surveyedRoadGradeAllowed({ points: [from, to] }, maximumGrade, environment.terrain.elevation))) return accept(planner.cost([from, to], role), role, roadWidth, openingYear, reason)
-    diagnostics.attempted--
-    return survey(from, to, role, roadWidth, openingYear, reason, false, 500)
-  }
-  if (corners.length) {
-    const minColumn = Math.floor(Math.min(...corners.map(p => p.x)) / corridorSpacing) - 1, maxColumn = Math.ceil(Math.max(...corners.map(p => p.x)) / corridorSpacing) + 1
-    const minRow = Math.floor(Math.min(...corners.map(p => p.y)) / corridorSpacing) - 1, maxRow = Math.ceil(Math.max(...corners.map(p => p.y)) / corridorSpacing) + 1
-    const coordinates = (low: number, high: number) => {
-      const values = new Map<number, number>([[0, 0]])
-      for (const sign of [-1, 1]) {
-        let position = 0
-        for (let n = 1; n <= Math.max(Math.abs(low), Math.abs(high)); n++) { position += corridorSpacing * (.94 + random() * .12); values.set(sign * n, sign * position) }
+  const connectedPairs = new Set<string>(), closingDegree = new Map<string, number>()
+  for (const { zone, hub } of active.slice().sort((a, b) => a.zone.builtYear - b.zone.builtYear || a.zone.id.localeCompare(b.zone.id))) {
+    if (zone.kind === 'rural' || (closingDegree.get(zone.id) ?? 0) >= 1) continue
+    const neighbours = active.filter(other => other.zone !== zone && other.zone.kind !== 'rural' && (closingDegree.get(other.zone.id) ?? 0) < 1 && distance(hub, other.hub) >= 240 && distance(hub, other.hub) <= (zone.radius + other.zone.radius) * 1.7)
+      .sort((a, b) => distance(hub, a.hub) - distance(hub, b.hub)).slice(0, 4)
+    for (const neighbour of neighbours) {
+      const key = [zone.id, neighbour.zone.id].sort().join(':')
+      if (connectedPairs.has(key)) continue
+      connectedPairs.add(key)
+      const year = Math.max(zone.builtYear, neighbour.zone.builtYear)
+      const pairs = (frontageLoops.get(zone.id) ?? []).flatMap(first => (frontageLoops.get(neighbour.zone.id) ?? []).map(last => ({ from: first.point, to: last.point })))
+        .sort((a, b) => distance(a.from, a.to) - distance(b.from, b.to))
+      if (!pairs.length) pairs.push({ from: hub, to: neighbour.hub })
+      let road: SimulatedRoad | null = null
+      for (const pair of pairs.slice(0, 4)) {
+        const from = graph.nearest(pair.from, 2)?.point, to = graph.nearest(pair.to, 2)?.point
+        if (!from || !to) continue
+        road = survey(from, to, 'collector', zone.kind === 'historic' || neighbour.zone.kind === 'historic' ? 7 : 8, year, '隣接する地区の旧道を結ぶ地形に沿った連絡道路', false, 1600)
+        if (road) break
       }
-      return values
+      if (!road) continue
+      closingDegree.set(zone.id, (closingDegree.get(zone.id) ?? 0) + 1)
+      closingDegree.set(neighbour.zone.id, (closingDegree.get(neighbour.zone.id) ?? 0) + 1)
+      break
     }
-    const us = coordinates(minColumn, maxColumn), vs = coordinates(minRow, maxRow)
-    // A whole row/column shares its small offset. Independent node jitter was
-    // the source of the previous triangular puzzle-shard street fabric.
-    const rowOffsets = new Map(Array.from({ length: maxRow - minRow + 1 }, (_, i) => { const row = minRow + i; return [row, row === 0 ? 0 : (random() - .5) * corridorSpacing * .045] }))
-    const columnOffsets = new Map(Array.from({ length: maxColumn - minColumn + 1 }, (_, i) => { const column = minColumn + i; return [column, column === 0 ? 0 : (random() - .5) * corridorSpacing * .045] }))
-    const nearUrbanEnvelope = (point: Point) => zones.some(zone => pointInRegion(point, zone) || zone.polygon.some((a, i) => distance(point, projectOnRoadSegment(point, a, zone.polygon[(i + 1) % zone.polygon.length]!).point) <= corridorSpacing * .72))
-    for (let row = minRow; row <= maxRow; row++) for (let column = minColumn; column <= maxColumn; column++) {
-      const point = world(us.get(column)! + rowOffsets.get(row)!, vs.get(row)! + columnOffsets.get(column)!)
-      if (point.x < 18 || point.y < 18 || point.x > width - 18 || point.y > height - 18 || !nearUrbanEnvelope(point)) continue
-      const surveyed = site(point, 48, mainRow(row) || mainColumn(column) ? 14 : 8.5)
-      if (!surveyed || !nearUrbanEnvelope(surveyed)) continue
-      sites.set(`${column}:${row}`, { point: surveyed, year: closestZone(surveyed)?.builtYear ?? 1920, row, column })
-    }
-    for (const [key, node] of sites) for (const [column, row, major] of [[node.column + 1, node.row, mainRow(node.row)], [node.column, node.row + 1, mainColumn(node.column)]] as const) {
-      const other = `${column}:${row}`
-      if (sites.has(other)) edges.push({ a: key, b: other, major, order: Math.abs(node.column) + Math.abs(node.row) })
-    }
-  }
-  edges.sort((a, b) => Number(b.major) - Number(a.major) || a.order - b.order || a.a.localeCompare(b.a) || a.b.localeCompare(b.b))
-  const unfinished = new Set(edges), connectedSites = new Set<string>()
-  for (const [key, node] of sites) if (graph.nearest(node.point, 2)) connectedSites.add(key)
-  // Hubs are public-street attachments, never extra mesh vertices. This also
-  // lets an already surveyed opposite-bank bridgehead seed its local frame.
-  for (const { zone, hub } of active) {
-    const candidates = [...sites.entries()].sort((a, b) => distance(hub, a[1].point) - distance(hub, b[1].point)).slice(0, 3)
-    for (const [key, node] of candidates) {
-      if (connectedSites.has(key)) break
-      const start = graph.nearest(hub, 2)?.point
-      if (!start) break
-      if (distance(start, node.point) < 2 || connectCorridor(start, node.point, Math.max(zone.builtYear, node.year), false, true)) { connectedSites.add(key); break }
-    }
-  }
-  // This changes construction order only. Four grid neighbours define the
-  // complete spatial proposal first; accepted closing edges form real faces.
-  for (let pass = 0; pass <= sites.size && unfinished.size; pass++) {
-    let progress = false
-    for (const edge of [...unfinished]) {
-      const aConnected = connectedSites.has(edge.a), bConnected = connectedSites.has(edge.b)
-      if (!aConnected && !bConnected) continue
-      const a = sites.get(aConnected ? edge.a : edge.b)!, b = sites.get(aConnected ? edge.b : edge.a)!
-      const start = graph.nearest(a.point, 2)?.point, end = graph.nearest(b.point, 2)?.point ?? b.point
-      if (!start) continue
-      unfinished.delete(edge)
-      if (distance(start, end) < 12) { connectedSites.add(edge.a); connectedSites.add(edge.b); progress = true; continue }
-      const road = connectCorridor(start, end, Math.max(a.year, b.year), edge.major)
-      if (road) { a.point = start; b.point = end; connectedSites.add(edge.a); connectedSites.add(edge.b); progress = true }
-    }
-    if (!progress) break
   }
 
   // The first regional surveys knew only the old centre/bridgeheads. Once
@@ -525,15 +507,22 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
     const middle = layoutStreetFaceCenter(polygon)
     const zone = closestZone(middle)
     if (!zone || !zones.some(candidate => pointInRegion(middle, candidate))) continue
-    const spacing = zone.kind === 'historic' ? 70 : zone.kind === 'industrial' ? 175 : zone.kind === 'rural' ? 150 : 108
-    const angle = zone.angle ?? corridorAngle
+    const frontages = polygon.flatMap((a, index) => {
+      const b = polygon[(index + 1) % polygon.length]!, hit = graph.nearest(lerp(a, b, .5), .15)
+      return hit ? [{ a, b, roadId: hit.road.id, width: hit.road.width, builtYear: hit.road.builtYear }] : []
+    })
     for (let attempt = 0; attempt < 4; attempt++) {
-      const split = splitLayoutStreetFace(polygon, { spacing, angle, jitter: zone.kind === 'historic' ? .30 : .045, seed: `${input.seed}:face:${cursor}:${attempt}` })
+      const split = planLayoutStreetFabricSplit({ polygon, zone, seed: `${input.seed}:face:${cursor}:${attempt}`, depth, frontages, terrain: environment.terrain })
       if (!split) break
-      const from = graph.nearest(split.points[0], .08), to = graph.nearest(split.points[1], .08)
+      const from = graph.nearest(split.points[0]!, .08), to = graph.nearest(split.points.at(-1)!, .08)
       if (!from || !to) continue
       const year = Math.max(zone.builtYear, from.road.builtYear, to.road.builtYear)
-      const added = survey(from.point, to.point, 'lane', zone.kind === 'historic' ? 5.2 : zone.kind === 'industrial' ? 7 : 6, year, '実在する周囲の道路を結んで街区を分割する生活道路', false, 0)
+      const points = split.points.map((point, index) => index === 0 ? from.point : index === split.points.length - 1 ? to.point : point)
+      diagnostics.attempted++
+      // Child faces describe this exact polyline. Validate its complete ROW;
+      // replanning just the endpoints would invent a different street and lots.
+      if (!planner.validate(points, split.width) || environment.terrain && !surveyedRoadGradeAllowed({ points }, .13, environment.terrain.elevation)) { diagnostics.rejected++; continue }
+      const added = accept(planner.cost(points, 'lane'), 'lane', split.width, year, split.kind === 'readjusted' ? '平坦地の限られた一団で整えた街路' : split.kind === 'historic' ? '旧道の向きと地割に沿う短い街路' : '実在する周囲の道路へずらして接続する生活道路')
       if (!added) continue
       // Survey can insert extra junctions, but it cannot move the accepted
       // straight chord. Its exact two child faces remain the next briefs.
@@ -551,6 +540,12 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
   for (const target of accessTargets) if (retryIds.has(target.id) && !connectGate(target, true)) diagnostics.unservedAccessIds.push(target.id)
 
   const roads = graph.roads
+  const outsideSides = new Set<string>()
+  for (const road of roads) if (road.boundaryContinuation) for (const point of [road.points[0]!, road.points.at(-1)!]) {
+    if (point.x < 0) outsideSides.add('west'); if (point.x > width) outsideSides.add('east')
+    if (point.y < 0) outsideSides.add('north'); if (point.y > height) outsideSides.add('south')
+  }
+  diagnostics.boundaryConnections = outsideSides.size
   // Final roads keep their actual opening phase. A weak spatial brief cannot
   // waive a longitudinal grade constraint at a later stage.
   if (environment.terrain) for (const road of roads) if (!road.bridge && !road.boundaryContinuation && !surveyedRoadGradeAllowed({ points: road.points }, road.role === 'highway' ? .09 : .13, environment.terrain.elevation)) throw new Error(`Layout road profile failed: ${road.id}`, { cause: { road, diagnostics } })

@@ -6,6 +6,7 @@ import type { PlanningEnvironment } from './road-planner'
 import { corridorPolygon, distanceToSegment, polygonArea, pointInPolygon, polygonOverlapsRegion, rectangle } from './geometry'
 import { roadLength } from './road-graph'
 import { RailwayRoadConstraints } from './railway-road-constraints'
+import { certifyLayoutAccess } from './layout-first-access'
 
 function flatEnvironment(width = 1800, height = 1400): PlanningEnvironment {
   const terrain = { elevation: () => 12, slope: () => 0, waterAt: () => false, seaAt: () => false }
@@ -20,10 +21,15 @@ describe('layout-first public street design', () => {
     const result = buildLayoutFirstRoads({ environment: flatEnvironment(), seed: 'same-spatial-brief', center: { x: 900, y: 700 }, zones: [zone()] })
     expect(result.diagnostics.boundaryConnections).toBe(4)
     expect(result.roads.filter(r => r.boundaryContinuation).every(r => r.points.some(p => p.x < 0 || p.x > 1800 || p.y < 0 || p.y > 1400))).toBe(true)
-    expect(result.roads.length).toBeGreaterThan(80)
     expect(result.blocks.length).toBeGreaterThan(30)
     const livingBlocks = result.blocks.filter(p => polygonArea(p) < 25000 && polygonArea(p) > 2500)
     expect(livingBlocks.length).toBeGreaterThan(25)
+    // Road record counts depend on segmentation. House-scale closed faces
+    // must instead be bounded by real public pavement along every edge.
+    for (const block of livingBlocks) for (let i = 0; i < block.length; i++) {
+      const a = block[i]!, b = block[(i + 1) % block.length]!
+      expect(result.graph.nearest({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, .08)).not.toBeNull()
+    }
     expect(result.diagnostics.unservedZoneIds).toEqual([])
     expect(result.roads.every(road => Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points.at(-1)!)))).toBe(true)
     expect(result.diagnostics.attempted).toBeLessThan(350)
@@ -95,9 +101,10 @@ describe('layout-first public street design', () => {
     expect(result.diagnostics.unservedAccessIds).toEqual([])
     const schoolRoad = result.roads.find(road => road.reason === '施設の敷地入口への公道接続')!
     expect(schoolRoad.builtYear).toBe(1875)
-    const historic = result.roads.filter(road => road.builtYear <= 1875)
-    const keys = new Set(historic.filter(road => road.boundaryContinuation).flatMap(road => road.points.map(p => `${p.x.toFixed(4)}:${p.y.toFixed(4)}`)))
-    expect(keys.has(`${schoolRoad.points[0]!.x.toFixed(4)}:${schoolRoad.points[0]!.y.toFixed(4)}`)).toBe(true)
+    // A continuous outside-to-outside main road joins the old backbone at
+    // an interior junction. The school's approach need not start on its
+    // endpoint, but must reach an actual outside road by the opening date.
+    expect(certifyLayoutAccess({ width: 1800, height: 1400, roads: result.roads, targets: [{ id: 'school', point: gate, builtYear: 1875 }] })).toEqual({ unserved: [], certified: 1 })
     expect(result.roads.some(road => road.builtYear === 1995)).toBe(true)
   })
   it('moves the primary junction off an already reserved running track', () => {
@@ -131,43 +138,63 @@ describe('layout-first public street design', () => {
     expect(result.roads[0]!.points.some(p => Math.hypot(p.x - peak.x, p.y - peak.y) < 1e-7)).toBe(false)
   })
 
-  it('closes most of the urban envelope and terminates every subdivision on real perimeter streets', () => {
+  it('closes both sides of a single neighbourhood and terminates every subdivision on real perimeter streets', () => {
     const result = buildLayoutFirstRoads({ environment: flatEnvironment(), seed: 'whole-envelope', center: { x: 900, y: 700 }, zones: [zone()] })
-    const area = result.blocks.reduce((sum, block) => sum + polygonArea(block), 0)
-    expect(area).toBeGreaterThan(960 ** 2 * .72)
-    const subdivisions = result.roads.filter(road => road.reason === '実在する周囲の道路を結んで街区を分割する生活道路')
+    // Rounded frontage projects intentionally retain fringe land. Verify
+    // closure of the buildable town interior in all four quadrants rather
+    // than requiring a fixed fraction of the former square planning frame.
+    for (const dx of [-240, 240]) for (const dy of [-240, 240]) {
+      const point = { x: 900 + dx, y: 700 + dy }
+      expect(result.blocks.some(block => pointInPolygon(point, block))).toBe(true)
+    }
+    const subdivisions = result.roads.filter(road => road.role === 'lane' && road.phase === 'spatial-layout')
     expect(subdivisions.length).toBeGreaterThan(30)
     for (const road of subdivisions) for (const endpoint of [road.points[0]!, road.points.at(-1)!]) {
       expect(result.roads.some(other => other !== road && other.points.slice(1).some((b, i) => distanceToSegment(endpoint, other.points[i]!, b) < 1e-6))).toBe(true)
     }
   })
 
-  it('continues one coarse network across adjoining planning territories', () => {
+  it('connects different neighbourhood fabrics across their planning boundary', () => {
     const left = { ...zone({ x: 600, y: 700 }, 400), id: 'old-bank', kind: 'historic' as const, builtYear: 1650, polygon: rectangle(200, 300, 800, 800) }
     const right = { ...zone({ x: 1300, y: 700 }, 400), id: 'postwar-bank', builtYear: 1975, polygon: rectangle(1000, 300, 700, 800) }
     const result = buildLayoutFirstRoads({ environment: flatEnvironment(2000, 1400), seed: 'one-city-many-briefs', center: left.center, zones: [left, right] })
-    const crossing = result.roads.filter(road => road.reason.includes('市域') && road.points.some(p => p.x < 1000) && road.points.some(p => p.x > 1000))
+    const crossing = result.roads.filter(road => road.points.some(p => p.x < 1000) && road.points.some(p => p.x > 1000))
     expect(crossing.length).toBeGreaterThan(1)
     expect(result.blocks.filter(block => block.some(p => p.x < 1000) && block.some(p => p.x > 1000)).length).toBeGreaterThan(2)
     expect(result.diagnostics.unservedZoneIds).toEqual([])
     expect(result.roads.every(road => Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points.at(-1)!)))).toBe(true)
+    const oldLanes = result.roads.filter(road => road.role === 'lane' && road.builtYear === 1650 && road.points.some(point => pointInPolygon(point, left.polygon)))
+    const modernLanes = result.roads.filter(road => road.role === 'lane' && road.builtYear >= 1975 && road.points.some(point => pointInPolygon(point, right.polygon)))
+    expect(oldLanes.some(road => road.width === 4.8)).toBe(true)
+    expect(modernLanes.some(road => road.width === 5.6 || road.width === 6.5)).toBe(true)
+    // Local alignments must be able to follow their own old/perimeter roads;
+    // they are not required to repeat the two regional-corridor bearings.
+    const mainBearings = result.roads.filter(road => road.throughRouteId).map(road => Math.atan2(road.points.at(-1)!.y - road.points[0]!.y, road.points.at(-1)!.x - road.points[0]!.x))
+    expect([...oldLanes, ...modernLanes].some(road => {
+      const angle = Math.atan2(road.points.at(-1)!.y - road.points[0]!.y, road.points.at(-1)!.x - road.points[0]!.x)
+      return mainBearings.every(main => Math.abs(Math.sin(angle - main)) > Math.sin(Math.PI / 18))
+    })).toBe(true)
   })
 
-  it('uses four-neighbour corridor families and continuous wider centre axes', () => {
+  it('surveys two continuous independent main alignments across all four real crop edges', () => {
     const result = buildLayoutFirstRoads({ environment: flatEnvironment(), seed: 'shared-corridor-frame', center: { x: 900, y: 700 }, zones: [zone()] })
-    const corridors = result.roads.filter(road => road.reason === '市域を連続して結ぶ生活幹線' || road.reason === '市域を連続して通り抜ける広幅員の都市幹線')
-    expect(corridors.length).toBeGreaterThan(12)
-    for (const road of corridors) {
-      const a = road.points[0]!, b = road.points.at(-1)!, angle = Math.atan2(b.y - a.y, b.x - a.x)
-      // Shared rows/columns may bend slightly; diagonal triangulation cannot
-      // pass this topology requirement even if it creates many closed faces.
-      expect(Math.abs(Math.sin(2 * (angle - .12)))).toBeLessThan(.16)
+    const main = result.roads.filter(road => road.throughRouteId)
+    expect(main).toHaveLength(2)
+    expect(new Set(main.map(road => road.throughRouteId)).size).toBe(2)
+    const sides = new Set<string>()
+    for (const road of main) {
+      const endpoints = [road.points[0]!, road.points.at(-1)!]
+      expect(endpoints.every(point => point.x < 0 || point.y < 0 || point.x > 1800 || point.y > 1400)).toBe(true)
+      expect(road).toMatchObject({ role: 'highway', kind: 'arterial', phase: 'surveyed-main-corridor', boundaryContinuation: true })
+      for (const point of endpoints) {
+        if (point.x < 0) sides.add('west'); if (point.x > 1800) sides.add('east')
+        if (point.y < 0) sides.add('north'); if (point.y > 1400) sides.add('south')
+      }
+      expect(Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points[0]!))).toBe(true)
+      expect(Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points.at(-1)!))).toBe(true)
     }
-    const main = corridors.filter(road => road.role === 'highway')
-    expect(main.length).toBeGreaterThan(4)
-    expect(main.every(road => road.width === 14 && road.kind === 'arterial')).toBe(true)
-    expect(main.reduce((sum, road) => sum + roadLength(road.points), 0)).toBeGreaterThan(1600)
-    expect(corridors.some(road => road.width === 8.5 && road.role === 'collector')).toBe(true)
+    expect([...sides].sort()).toEqual(['east', 'north', 'south', 'west'])
+    expect(result.roads.filter(road => road.role === 'lane').every(road => !road.throughRouteId && road.kind === 'local')).toBe(true)
   })
 
   it('subdivides adopted enclosed urban gaps rather than leaving their whole coarse faces empty', () => {

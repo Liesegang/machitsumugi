@@ -95,7 +95,7 @@ describe('layout-first composed city integration on a known surveyed DEM', () =>
       // report retains the actual faces supplied to land composition.
       expect(report.composition.streetBlocks).toBeGreaterThan(30)
       expect(report.composition.streetBlocks).toBe(extractStreetBlocks(map.roads).length)
-      expect(map.generatorVersion).toBe('2.6.0-layout.3')
+      expect(map.generatorVersion).toBe('2.6.0-layout.4')
       expect(map.areas.some(area => area.id.startsWith('layout-station-zone-'))).toBe(false)
     }
   })

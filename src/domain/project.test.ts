@@ -2,6 +2,8 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
 import type { Project } from './project'
 import type { CityMap } from './types'
+import { createCityTimeline } from './timeline'
+import { portableProject } from './project'
 
 const sample = (): Project => ({
   version: 2,
@@ -150,12 +152,23 @@ describe('saved projects', () => {
   it('preserves complete geometry, historic dates, parcels and growth history byte for byte as values', () => {
     const input = withSnapshot()
     input.snapshot!.generatorVersion = 'future-engine-9.2'
-    Object.assign(input.snapshot!.roads[0], { phase: 'oldtown', constructionCost: 12345.6 })
+    Object.assign(input.snapshot!.roads[0], { phase: 'oldtown', constructionCost: 12345.6, throughRouteId: 'surveyed-corridor-1' })
     Object.assign(input.snapshot!.growthLog![0], { households: 1300, unmetHouseholds: 300, constructionCost: 24680.1 })
     const restored = parseProject(JSON.stringify(input))
     expect(restored).toEqual(input)
     expect(restored.snapshot!.buildings[0].polygon).not.toBe(input.snapshot!.buildings[0].polygon)
     expect(restored.snapshot!.parcels![0].entrance).not.toBe(input.snapshot!.parcels![0].entrance)
+  })
+
+  it('keeps the independent through-alignment identity in portable dated road versions', () => {
+    const input = withSnapshot(), map = input.snapshot!
+    input.config.targetYear = 2025; map.config.targetYear = 2025; map.year = 2025
+    const road = { ...map.roads[0]!, builtYear: 1850, throughRouteId: 'surveyed-corridor-1' }
+    map.roads = [{ ...road, kind: 'arterial', modifiedYear: 1975 }]
+    map.timeline = createCityTimeline(map, { roads: [{ from: 1850, to: 1975, value: { ...road, kind: 'local' } }, { from: 1975, value: map.roads[0]! }] })
+    const restored = parseProject(JSON.stringify(portableProject(input)))
+    expect(restored.snapshot!.roads[0]!.throughRouteId).toBe('surveyed-corridor-1')
+    expect(restored.snapshot!.timeline!.roads.map(version => version.value.throughRouteId)).toEqual(['surveyed-corridor-1', 'surveyed-corridor-1'])
   })
 
   it('restores historic snapshots without requiring modern railways or a minimum building count', () => {
