@@ -36,7 +36,7 @@ function index<T extends Indexed>(cellSize = 80) {
   }
 }
 interface RoadSegment extends Indexed { road: Road; a: Point; b: Point; polygon: Point[] }
-interface Holding { polygon: Point[]; entrance: Point; access: Point[]; body: [number, number, number, number]; rear: boolean }
+interface Holding { polygon: Point[]; entrance: Point; access: Point[]; body: [number, number, number, number]; rear: boolean; compact?: boolean }
 interface Lot extends Holding { road: Road; zone: LayoutFirstZone; origin: Point; tangent: Point; normal: Point; initialYear: number; id: string; form: 'house' | 'shop' | 'apartment' | 'workshop'; stockProfile: LayoutLandFrontage['stockProfile']; formAvailableYear: number; minimumFloors: number; maximumFloors: number }
 const EPSILON = 1e-6
 const clamp = (value: number, minimum: number, maximum: number) => Math.max(minimum, Math.min(maximum, value))
@@ -50,6 +50,31 @@ function insideRegion(polygon: Point[], region: PolygonRegion) {
 }
 const localPoint = (origin: Point, tangent: Point, normal: Point, u: number, v: number): Point => ({ x: origin.x + tangent.x * u + normal.x * v, y: origin.y + tangent.y * u + normal.y * v })
 const rectangleAt = (world: (u: number, v: number) => Point, u0: number, u1: number, v0: number, v1: number) => [world(u0, v0), world(u1, v0), world(u1, v1), world(u0, v1)]
+
+/** Divide the entire surveyed depth, rather than shortening the frontage and
+ * abandoning its interior. Every rear owner has a separate full-width stem;
+ * a deeper stem never crosses a nearer owner's body or shares an assumed road. */
+function compactHoldings(world: (u: number, v: number) => Point, attachment: (u: number) => Point, body: [number, number, number, number], random: () => number): Holding[] {
+  const [u0, u1, v0, v1] = body, depth = v1 - v0, width = u1 - u0, stem = 3.4, pitch = stem + .3
+  const rows = depth >= 59 && width >= 8 + pitch * 2 ? 3 : depth >= 38 && width >= 8 + pitch ? 2 : 1
+  if (rows === 1) return []
+  const mirror = random() < .5, reflect = (u: number) => mirror ? u0 + u1 - u : u
+  const local = (u: number, v: number) => world(reflect(u), v)
+  const cuts = [v0]
+  for (let row = 1; row < rows; row++) cuts.push(v0 + depth * row / rows + (random() - .5) * 1.8)
+  cuts.push(v1)
+  const holdings: Holding[] = []
+  for (let row = 0; row < rows; row++) {
+    const start = cuts[row]!, end = cuts[row + 1]! - (row < rows - 1 ? .35 : 0)
+    const right = u1 - (rows - 1 - row) * pitch, left = right - stem
+    const bodyRight = row ? Math.min(right - 1, u0 + 18) : right
+    const entrance = row ? local((left + right) / 2, v0) : local((u0 + right) / 2, v0)
+    const access = row ? [attachment(reflect((left + right) / 2)), local((left + right) / 2, v0 + 1.5), local((left + right) / 2, start + 1.8), local(right - 3, start + 1.8)] : [attachment(reflect((u0 + right) / 2)), entrance]
+    const polygon = row ? [local(left, v0), local(right, v0), local(right, end), local(u0, end), local(u0, start), local(left, start)] : rectangleAt(local, u0, right, start, end)
+    holdings.push({ polygon, entrance, access, body: [Math.min(reflect(u0), reflect(bodyRight)), Math.max(reflect(u0), reflect(bodyRight)), start, end], rear: row > 0, compact: true })
+  }
+  return holdings
+}
 
 /** Walk one physical polyline by accumulated chainage, including short curve samples. */
 function roadAt(road: Road, chainage: number): { point: Point; tangent: Point } {
@@ -76,12 +101,12 @@ function zoneScore(zone: LayoutFirstZone, point: Point) {
 
 /** Local surveyed title coordinates. Ordinary stock uses readable building bars;
  * a generous title is not itself evidence of a courtyard/campus programme. */
-export function layoutFirstBuildingFootprint(input: { body: readonly [number, number, number, number]; form: 'house' | 'apartment' | 'shop' | 'workshop'; rear: boolean; year: number; random: () => number }): Point[] {
+export function layoutFirstBuildingFootprint(input: { body: readonly [number, number, number, number]; form: 'house' | 'apartment' | 'shop' | 'workshop'; rear: boolean; compact?: boolean; year: number; random: () => number }): Point[] {
   const { body: [u0, u1, v0, v1], form, rear: rearTitle, year, random } = input
   const apartment = form === 'apartment' && year >= 1955, width = u1 - u0, depth = v1 - v0
   const side = form === 'shop' ? .7 : apartment ? 2.5 : 1.1 + random() * .9
   let left = u0 + side, right = u1 - side
-  const front = v0 + (rearTitle ? 4.4 + random() * 1.2 : form === 'shop' ? 1.8 : 2.8 + random() * 1.8)
+  const front = v0 + (rearTitle ? input.compact ? 3.4 + random() * .5 : 4.4 + random() * 1.2 : form === 'shop' ? 1.8 : input.compact ? 1.8 + random() * .8 : 2.8 + random() * 1.8)
   const depthDraw = random()
   const houseDepth = Math.min(depth - 6, form === 'workshop' ? 17 + depthDraw * 12 : form === 'shop' ? 12 + depthDraw * 10 : 10 + depthDraw * 6)
   let rear = front + houseDepth
@@ -126,7 +151,7 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
   for (const region of input.reserves ?? []) reserveIndex.add({ ...region, bounds: boundsOf(region.polygon) })
   const parcels: Parcel[] = [], buildings: Building[] = [], events: GrowthEvent[] = []
   const history = { parcels: [] as TimelineVersion<Parcel>[], buildings: [] as TimelineVersion<Building>[], buildingStates: [] as BuildingState[] }
-  const reject = (kind: keyof LayoutFirstLandMetrics['rejected']) => { metrics.rejected[kind]++; return false }
+  const reject = (kind: keyof LayoutFirstLandMetrics['rejected']): false => { metrics.rejected[kind]++; return false }
   const validLand = (polygon: Point[], zone: LayoutFirstZone) => {
     const bounds = boundsOf(polygon)
     if (!insideRegion(polygon, zone)) return reject('outsideZone')
@@ -140,7 +165,7 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     const random = seededRandom(`${config.seed}:${lot.id}:frame:${year}:${serial}`), [u0, u1] = lot.body
     const world = (u: number, v: number) => localPoint(lot.origin, lot.tangent, lot.normal, u, v)
     const modern = year >= 1955, apartment = lot.form === 'apartment' && modern
-    const local = layoutFirstBuildingFootprint({ body: lot.body, form: lot.form, rear: lot.rear, year, random })
+    const local = layoutFirstBuildingFootprint({ body: lot.body, form: lot.form, rear: lot.rear, compact: lot.compact, year, random })
     const polygon = local.map(point => world(point.x, point.y)), front = local[0]!.y, rear = local[2]!.y
     if (apartment && rear - front < 12 - EPSILON) return null
     if (polygonArea(polygon) < 25 || !insideRegion(polygon, { polygon: lot.polygon }) || !input.canPlace(polygon)) return null
@@ -174,7 +199,7 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     if (selection < vacancy + underuse && (capacity > 1 || building.kind !== 'residential')) return { occupancy: 'underused', occupiedHouseholds: capacity > 1 ? Math.max(1, Math.min(capacity - 1, Math.floor(capacity * (.35 + useFraction * .4)))) : 0 }
     return { occupancy: 'occupied', occupiedHouseholds: capacity }
   }
-  function accept(lot: Lot) {
+  function prepare(lot: Lot) {
     metrics.candidates++
     if (!validLand(lot.polygon, lot.zone)) return false
     // Private access is an actual3m corridor, including both sides of each bend.
@@ -202,6 +227,10 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     const current = frames.at(-1)!.value
     const privatePaths = lot.access.slice(1).map((point, i) => corridorPolygon(lot.access[i]!, point, 1.4))
     if (privatePaths.some(path => allFrames.some(frame => polygonsOverlap(path, frame.value.polygon)))) return reject('access')
+    return { lot, parcel, frames, current }
+  }
+  function place(prepared: Exclude<ReturnType<typeof prepare>, false>) {
+    const { lot, parcel, frames, current } = prepared
     titles.add({ polygon: lot.polygon, bounds: boundsOf(lot.polygon) })
     metrics.accepted++; metrics.rearTitles += Number(lot.rear); metrics.replacements += frames.length - 1
     metrics.titleArea += polygonArea(lot.polygon); metrics.footprintArea += polygonArea(current.polygon); metrics.grossFloorArea += polygonArea(current.polygon) * current.height
@@ -220,6 +249,29 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     }
     return true
   }
+  function accept(lot: Lot) {
+    const prepared = prepare(lot)
+    return prepared ? place(prepared) : false
+  }
+  function acceptTogether(lots: Lot[]) {
+    const prepared: Exclude<ReturnType<typeof prepare>, false>[] = []
+    for (const lot of lots) {
+      const candidate = prepare(lot)
+      if (!candidate) return false
+      prepared.push(candidate)
+    }
+    // Commit the complete subdivision only after every owner's pad, dates and
+    // private access survive. A failed rear title leaves no half-claimed group.
+    for (let i = 0; i < prepared.length; i++) for (let j = i + 1; j < prepared.length; j++) {
+      const first = prepared[i]!.lot, second = prepared[j]!.lot
+      if (polygonsOverlap(first.polygon, second.polygon)) return reject('title')
+      // A curved road's projected attachment can bend outside its stem. Test
+      // the whole group before claiming any frontage, including that approach.
+      for (const [owner, other] of [[first, second], [second, first]]) for (let k = 1; k < owner!.access.length; k++) if (polygonsOverlap(corridorPolygon(owner!.access[k - 1]!, owner!.access[k]!, 1.4), other!.polygon)) return reject('access')
+    }
+    for (const candidate of prepared) place(candidate)
+    return true
+  }
   for (const road of roads) {
     // A collector may contain one bridge span. Its dry approaches still have
     // frontage; the exact water/pad/access tests reject only the wet portions.
@@ -236,7 +288,8 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
         const sampleNormal = { x: -sample.tangent.y * side, y: sample.tangent.x * side }
         const frontage = landContext.at(road, sample.point, localPoint(sample.point, sample.tangent, sampleNormal, 0, road.width / 2 + 9))
         const broad = primary?.kind === 'industrial' || frontage.form === 'apartment'
-        const width = broad ? 30 + random() * 18 : frontage.stockProfile === 'main-street' ? 19 + random() * 12 : primary?.kind === 'historic' ? 9 + random() * 10 : 11 + random() * 10
+        const compactFrontage = frontage.titleProfile === 'compact' && primary?.kind !== 'rural'
+        const width = broad ? 30 + random() * 18 : frontage.stockProfile === 'main-street' ? 19 + random() * 12 : compactFrontage ? 12.5 + random() * 4 : primary?.kind === 'historic' ? 9 + random() * 10 : 11 + random() * 10
         chainage += width / 2
         if (chainage + width / 2 > length - 4) break
         const { point: origin, tangent } = roadAt(road, chainage)
@@ -259,16 +312,25 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
         const form: Lot['form'] = zone.kind === 'industrial' ? 'workshop' : frontage.form === 'apartment' && width >= 27 ? 'apartment' : frontage.form === 'shop' || zone.kind === 'historic' && lotRandom() < .45 ? 'shop' : 'house'
         const stockProfile = form === 'workshop' ? 'lowrise' : frontage.stockProfile
         const contextualForm = form !== 'house' && form === frontage.form || stockProfile !== 'lowrise'
-        const initialYear = Math.max(1650, road.builtYear ?? 1650, zone.builtYear, contextualForm ? frontage.formAvailableYear : 1650)
-        if (initialYear > endYear) continue
         const attachment = (u: number) => {
           const target = world(u, 0)
           return road.points.slice(1).map((p, i) => projectPoint(target, road.points[i]!, p)).sort((a, b) => distance(target, a) - distance(target, b))[0]!
         }
+        const compact = frontage.titleProfile === 'compact' && zone.kind !== 'industrial' && zone.kind !== 'rural' && form !== 'apartment'
+        const innerHoldings = compact ? compactHoldings(world, attachment, [u0, u1, v0, v0 + depth], lotRandom) : []
+        const initialYear = Math.max(1650, road.builtYear ?? 1650, zone.builtYear, contextualForm ? frontage.formAvailableYear : 1650, compact ? frontage.titleAvailableYear : 1650)
+        if (initialYear > endYear) { chainage += width / 2 + .45; serial++; continue }
         const base = { road, zone, origin, tangent, normal, initialYear, form, stockProfile, formAvailableYear: frontage.formAvailableYear, minimumFloors: form === 'workshop' ? 1 : frontage.minimumFloors, maximumFloors: form === 'workshop' ? 2 : frontage.maximumFloors }
         const id = `${road.id}-${serial}-${side > 0 ? 'left' : 'right'}`
         let placed = false
-        if (form === 'house' && depth >= 46 && width >= 15) {
+        if (innerHoldings.length) {
+          const lots = innerHoldings.map((holding, row): Lot => {
+            const rearProfile = stockProfile === 'lowrise' ? 'lowrise' : 'walkup'
+            return { ...base, ...holding, ...(row ? { form: 'house', stockProfile: rearProfile, minimumFloors: rearProfile === 'walkup' ? 3 : 1, maximumFloors: rearProfile === 'walkup' ? 4 : 2 } as const : {}), id: row ? `layout-parcel-${id}${innerHoldings.length > 2 ? `-inner-${row}` : ''}-rear` : `layout-parcel-${id}` }
+          })
+          placed = acceptTogether(lots)
+        }
+        if (!placed && !compact && form === 'house' && depth >= 46 && width >= 15) {
           const stem = 3.4, frontDepth = 23 + lotRandom() * 3, seam = v0 + frontDepth, rearEntry = u1 - stem / 2
           const front: Holding = { polygon: rectangleAt(world, u0, u1 - stem - .3, v0, seam - .35), entrance: world((u0 + u1 - stem - .3) / 2, v0), access: [], body: [u0, u1 - stem - .3, v0, seam - .35], rear: false }
           front.access = [attachment((u0 + u1 - stem - .3) / 2), front.entrance]

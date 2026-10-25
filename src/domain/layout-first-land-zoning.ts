@@ -16,6 +16,9 @@ export interface LayoutLandFrontage {
   blockId?: string
   form: 'house' | 'shop' | 'apartment'
   stockProfile: 'lowrise' | 'walkup' | 'main-street' | 'bar'
+  titleProfile: 'ordinary' | 'compact'
+  /** Opening of the actual route that supports compact inner-block holdings. */
+  titleAvailableYear: number
   /** Opening of the complete route and station that justify this form. */
   formAvailableYear: number
   maximumFloors: number
@@ -146,11 +149,12 @@ export function buildLayoutFirstLandContext(input: LayoutLandContextInput) {
   const stationWalkupReach = metropolitan ? 850 : 500, centerWalkupReach = metropolitan ? 1050 : 650
   const stationFrontageReach = metropolitan ? 320 : 180, centerFrontageReach = metropolitan ? 520 : 260
   const stationBarReach = metropolitan ? 750 : 520, centerBarReach = metropolitan ? 950 : 520
+  const stationCompactReach = metropolitan ? 650 : 400, centerCompactReach = metropolitan ? 800 : 500
   const contextCache = new Map<Edge, { stationWalk: number; centerWalk: number }>()
   return {
     at(road: Road, point: Point, landPoint: Point = point): LayoutLandFrontage {
       const projection = nearest(point, byRoad.get(road.id) ?? [])
-      if (!projection) return { stationWalk: Infinity, centerWalk: Infinity, form: 'house', stockProfile: 'lowrise', minimumFloors: 1, maximumFloors: 2, formAvailableYear: 1650 }
+      if (!projection) return { stationWalk: Infinity, centerWalk: Infinity, form: 'house', stockProfile: 'lowrise', titleProfile: 'ordinary', titleAvailableYear: 1650, minimumFloors: 1, maximumFloors: 2, formAvailableYear: 1650 }
       const { edge } = projection
       let context = contextCache.get(edge)
       if (!context) {
@@ -173,6 +177,13 @@ export function buildLayoutFirstLandContext(input: LayoutLandContextInput) {
       const stationWalkups = urban && !!block?.walkupSite && context.stationWalk <= stationWalkupReach && block.stationWalk <= stationWalkupReach * .9
       const centerWalkups = urban && !!block?.walkupSite && context.centerWalk <= centerWalkupReach && block.centerWalk <= centerWalkupReach * .9
       const walkup = !apartment && !major && road.width >= 5.2 && (stationWalkups || centerWalkups)
+      // Fine-grain land division is a block catchment, including narrow public
+      // lanes. It is distinct from the height profile of an individual building.
+      const stationCompact = urban && road.width >= 4 && !!block?.walkupSite && context.stationWalk <= stationCompactReach && block.stationWalk <= stationCompactReach * .9
+      const centerCompact = urban && road.width >= 4 && !!block?.walkupSite && context.centerWalk <= centerCompactReach && block.centerWalk <= centerCompactReach * .9
+      const titleRoutes = [stationCompact ? stationRoute : undefined, centerCompact ? centerRoute : undefined].filter((route): route is WalkingRoute => !!route)
+      const titleProfile = titleRoutes.length ? 'compact' : 'ordinary'
+      const titleAvailableYear = titleRoutes.length ? titleRoutes.sort(routeOrder)[0]!.availableYear : 1650
       const qualifyingRoutes: WalkingRoute[] = []
       if (shop ? stationShop : apartment ? stationBars : walkup && stationWalkups) qualifyingRoutes.push(stationRoute)
       if (shop ? centerShop : apartment ? centralBars : walkup && centerWalkups) qualifyingRoutes.push(centerRoute)
@@ -182,7 +193,7 @@ export function buildLayoutFirstLandContext(input: LayoutLandContextInput) {
       const stockProfile = mainStreet ? 'main-street' : apartment ? 'bar' : walkup ? 'walkup' : 'lowrise'
       const minimumFloors = mainStreet || apartment ? urban ? 4 : 2 : walkup ? 3 : 1
       const maximumFloors = mainStreet ? metropolitan && coreFrontage ? 8 : 6 : apartment ? metropolitan ? 6 : urban ? 5 : settlement === 'village' ? 2 : 3 : walkup ? 4 : shop ? 3 : 2
-      return { stationWalk, centerWalk, ...(block ? { blockId: block.id } : {}), form: shop ? 'shop' : apartment ? 'apartment' : 'house', stockProfile, formAvailableYear, minimumFloors, maximumFloors }
+      return { stationWalk, centerWalk, ...(block ? { blockId: block.id } : {}), form: shop ? 'shop' : apartment ? 'apartment' : 'house', stockProfile, titleProfile, titleAvailableYear, formAvailableYear, minimumFloors, maximumFloors }
     },
   }
 }

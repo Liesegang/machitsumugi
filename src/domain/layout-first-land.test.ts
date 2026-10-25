@@ -3,7 +3,8 @@ import { developLayoutFirstLand, layoutFirstBuildingFootprint } from './layout-f
 import type { LayoutFirstZone } from './layout-first-types'
 import type { CityConfig, Point, Road } from './types'
 import { buildingServiceYears } from './building-lifecycle'
-import { corridorPolygon, distance, distanceToSegment, pointInPolygon, polygonArea, polygonsOverlap, rectangle, seededRandom } from './geometry'
+import { extractStreetBlocks } from './road-graph'
+import { boundsOf, corridorPolygon, distance, distanceToSegment, pointInPolygon, polygonArea, polygonsOverlap, rectangle, seededRandom } from './geometry'
 
 const config: CityConfig = { name: '試験町', seed: 'layout-physical-frames', type: 'post', terrain: 'plain', density: 75, forest: 0, railway: false, stations: 0, arterial: false, facilities: [], targetYear: 2025, settlement: 'regional-city' }
 const zone: LayoutFirstZone = { id: 'district', center: { x: 220, y: 180 }, radius: 500, polygon: rectangle(0, 0, 440, 360), kind: 'historic', builtYear: 1770, density: 1, maximumFloors: 4 }
@@ -84,7 +85,9 @@ describe('layout-first land composition', () => {
     for (const building of walkups) {
       expect(building.height).toBeLessThanOrEqual(4)
       expect(polygonArea(building.polygon)).toBeLessThan(350)
-      expect(['local']).toContain(roads.find(road => road.id === result.parcels.find(parcel => parcel.id === building.parcelId)!.roadId)!.kind)
+      const parcel = result.parcels.find(parcel => parcel.id === building.parcelId)!
+      const frontage = roads.find(road => road.id === parcel.roadId)!
+      expect(frontage.kind === 'local' || parcel.id.endsWith('-rear') && parcel.access!.length > 2).toBe(true)
     }
     const wideFrontage = result.buildings.filter(building => building.kind === 'commercial' && result.parcels.find(parcel => parcel.id === building.parcelId)!.roadId === 'vertical-2')
     expect(wideFrontage.length).toBeGreaterThan(5)
@@ -100,6 +103,63 @@ describe('layout-first land composition', () => {
       expect(result.buildings.every(building => polygonArea(building.polygon) < 350)).toBe(true)
     }
   })
+
+  it('packs connected inner blocks with narrower frontages and rear homes while keeping outer grain and mixed building sizes', () => {
+    const roads = grid(90), blocks = [0, 1, 2, 3].flatMap(x => [0, 1, 2].map(y => ({ id: `compact-${x}-${y}`, polygon: rectangle(x * 90, y * 90, 90, 90) })))
+    const input = { config: { ...config, settlement: 'metropolis' as const }, roads, blocks, zones: [{ ...zone, maximumFloors: 2 }] }
+    const outer = run(input), dense = run({ ...input, center: { x: 180, y: 135 } }), disconnected = run({ ...input, center: { x: 9000, y: 9000 } })
+    expect(disconnected.parcels).toEqual(outer.parcels)
+    expect(disconnected.history.buildings).toEqual(outer.history.buildings)
+    const interior = (result: typeof dense) => result.parcels.filter(parcel => parcel.polygon.every(point => point.x > 0 && point.x < 360 && point.y > 0 && point.y < 270))
+    const median = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)]!
+    const residential = (result: typeof dense) => result.buildings.filter(building => building.kind === 'residential' && interior(result).some(parcel => parcel.id === building.parcelId))
+    const denseHomes = residential(dense), outerHomes = residential(outer)
+    const coverage = (result: typeof dense, homes: typeof denseHomes) => homes.map(building => polygonArea(building.polygon) / polygonArea(result.parcels.find(parcel => parcel.id === building.parcelId)!.polygon))
+    expect(denseHomes.length).toBeGreaterThan(outerHomes.length * 1.25)
+    expect(median(interior(dense).map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(median(interior(outer).map(parcel => polygonArea(parcel.polygon))) * .75)
+    expect(median(coverage(dense, denseHomes))).toBeGreaterThan(median(coverage(outer, outerHomes)) + .08)
+    expect(median(denseHomes.map(building => polygonArea(building.polygon)))).toBeGreaterThan(median(outerHomes.map(building => polygonArea(building.polygon))) * .55)
+    expect(median(denseHomes.map(building => polygonArea(building.polygon)))).toBeLessThan(median(outerHomes.map(building => polygonArea(building.polygon))))
+    expect(new Set(denseHomes.map(building => Math.round(polygonArea(building.polygon)))).size).toBeGreaterThan(35)
+    expect(dense.buildings.some(building => building.kind === 'commercial' && polygonArea(building.polygon) > 150)).toBe(true)
+    expect(interior(dense).filter(parcel => parcel.id.endsWith('-rear')).length).toBeGreaterThan(30)
+  })
+
+  it('owns the entire deep inner holding through separately accessed rear titles without crossing water, reserves or other buildings', () => {
+    const roads: Road[] = [
+      { id: 'north', points: [{ x: 20, y: 30 }, { x: 420, y: 30 }], kind: 'arterial', role: 'collector', width: 9, builtYear: 1770 },
+      { id: 'east', points: [{ x: 420, y: 30 }, { x: 420, y: 180 }], kind: 'local', width: 6, builtYear: 1770 },
+      { id: 'south', points: [{ x: 420, y: 180 }, { x: 20, y: 180 }], kind: 'local', width: 6, builtYear: 1770 },
+      { id: 'west', points: [{ x: 20, y: 180 }, { x: 20, y: 30 }], kind: 'local', width: 6, builtYear: 1770 },
+    ]
+    const water = rectangle(210, 50, 12, 110), reserve = rectangle(275, 110, 20, 35)
+    const result = run({ config: { ...config, settlement: 'metropolis' }, roads, center: { x: 20, y: 30 }, blocks: [{ id: 'deep-inner-block', polygon: rectangle(20, 30, 400, 150) }], zones: [{ ...zone, polygon: rectangle(0, 0, 440, 220) }], reserves: [{ polygon: reserve }], canPlace: polygon => !polygonsOverlap(polygon, water) })
+    expect(result.parcels.some(parcel => parcel.id.endsWith('-inner-2-rear'))).toBe(true)
+    const groups = new Map<string, typeof result.parcels>()
+    for (const parcel of result.parcels.filter(parcel => parcel.polygon.every(point => point.x > 20 && point.x < 420 && point.y > 30 && point.y < 180))) {
+      const id = parcel.id.replace(/(?:-inner-\d+)?-rear$/, ''), group = groups.get(id) ?? []
+      group.push(parcel); groups.set(id, group)
+    }
+    const divided = [...groups].filter(([, group]) => group.some(parcel => parcel.id.endsWith('-rear')))
+    expect(divided.length).toBeGreaterThan(8)
+    for (const [id, group] of divided) {
+      expect(group.some(parcel => parcel.id === id)).toBe(true)
+      const bounds = boundsOf(group.flatMap(parcel => parcel.polygon))
+      expect(group.reduce((sum, parcel) => sum + polygonArea(parcel.polygon), 0) / ((bounds.maxX - bounds.minX) * (bounds.maxY - bounds.minY))).toBeGreaterThan(.96)
+    }
+    for (const parcel of result.parcels) {
+      expect(polygonsOverlap(parcel.polygon, water)).toBe(false)
+      expect(polygonsOverlap(parcel.polygon, reserve)).toBe(false)
+      for (const other of result.parcels) if (other !== parcel) expect(polygonsOverlap(parcel.polygon, other.polygon)).toBe(false)
+      for (let i = 1; i < parcel.access!.length; i++) {
+        const corridor = corridorPolygon(parcel.access![i - 1]!, parcel.access![i]!, 1.4)
+        expect(polygonsOverlap(corridor, water)).toBe(false)
+        expect(polygonsOverlap(corridor, reserve)).toBe(false)
+        for (const frame of result.history.buildings) expect(polygonsOverlap(corridor, frame.value.polygon)).toBe(false)
+        for (const other of result.parcels) if (other !== parcel) expect(polygonsOverlap(corridor, other.polygon)).toBe(false)
+      }
+    }
+  })
   it('does not backdate station shops before the station or a future connecting road opens', () => {
     const frontage: Road = { id: 'old-frontage', points: [{ x: 100, y: 180 }, { x: 420, y: 180 }], kind: 'local', width: 6, builtYear: 1770 }
     for (const connectionYear of [1770, 1975]) {
@@ -112,6 +172,36 @@ describe('layout-first land composition', () => {
       expect(present.history.buildings.filter(frame => shops.some(parcel => parcel.id === frame.value.parcelId)).every(frame => frame.from >= Math.max(1900, connectionYear))).toBe(true)
       expect(beforeRail.buildings.every(building => building.kind !== 'commercial')).toBe(true)
       expect(beforeRail.buildings.some(building => building.kind === 'residential')).toBe(true)
+    }
+  })
+  it('dates compact narrow-lane houses and their inner titles by the station and the complete connecting route', () => {
+    const frontage: Road = { id: 'old-narrow-lane', points: [{ x: 100, y: 180 }, { x: 420, y: 180 }], kind: 'local', width: 4.5, builtYear: 1770 }
+    const block = { id: 'station-lane-block', polygon: rectangle(100, 180, 320, 90) }
+    for (const connectionYear of [1770, 1975]) {
+      const connector: Road = { ...frontage, id: 'narrow-station-connector', points: [{ x: 20, y: 180 }, { x: 100, y: 180 }], builtYear: connectionYear }
+      const input = { config: { ...config, settlement: 'metropolis' as const }, roads: [frontage, connector], blocks: [block], stations: [{ point: { x: 20, y: 180 }, builtYear: 1900 }], zones: [{ ...zone, kind: 'residential' as const }] }
+      const present = run(input), old = run({ ...input, config: { ...input.config, targetYear: 1850 } })
+      const inner = present.parcels.filter(parcel => parcel.roadId === frontage.id && parcel.entrance!.y > 180)
+      expect(inner.filter(parcel => parcel.use === 'residential' && parcel.id.endsWith('-rear')).length).toBeGreaterThan(3)
+      expect(inner.every(parcel => parcel.createdYear >= Math.max(1900, connectionYear))).toBe(true)
+      expect(present.history.buildings.filter(frame => inner.some(parcel => parcel.id === frame.value.parcelId)).every(frame => frame.from >= Math.max(1900, connectionYear))).toBe(true)
+      expect(old.parcels.some(parcel => parcel.roadId === frontage.id && parcel.entrance!.y > 180)).toBe(false)
+      expect(old.parcels).toEqual(present.parcels.filter(parcel => parcel.createdYear <= 1850))
+      expect(old.history.buildings.map(frame => frame.value)).toEqual(present.history.buildings.filter(frame => frame.from <= 1850).map(frame => frame.value))
+    }
+  })
+  it('keeps every compact private approach inside its ownership beside a curved street', () => {
+    const top = Array.from({ length: 81 }, (_, i): Point => ({ x: 25 + i * 4, y: 120 + Math.sin(i / 8) * 12 }))
+    const bottom = [...top].reverse().map(point => ({ x: point.x, y: point.y + 90 }))
+    const road: Road = { id: 'curved-block', points: [...top, ...bottom, top[0]!], kind: 'local', width: 6, builtYear: 1770 }
+    const blocks = extractStreetBlocks([road]).map((polygon, i) => ({ id: `curved-${i}`, polygon }))
+    expect(blocks).toHaveLength(1)
+    const result = run({ config: { ...config, settlement: 'metropolis' }, roads: [road], blocks, center: top[0] })
+    expect(result.metrics.rearTitles).toBeGreaterThan(10)
+    for (const parcel of result.parcels) for (let i = 1; i < parcel.access!.length; i++) {
+      const path = corridorPolygon(parcel.access![i - 1]!, parcel.access![i]!, 1.4)
+      for (const other of result.parcels) if (other !== parcel) expect(polygonsOverlap(path, other.polygon)).toBe(false)
+      for (const frame of result.history.buildings) expect(polygonsOverlap(path, frame.value.polygon)).toBe(false)
     }
   })
   it('retains shallow recesses on small ordinary stock while bounding apartment mass on deep plots', () => {

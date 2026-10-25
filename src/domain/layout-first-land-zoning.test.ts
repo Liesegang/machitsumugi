@@ -82,4 +82,17 @@ describe('layout-first street and block land context', () => {
     const futureCentre = buildLayoutFirstLandContext({ roads: [future, frontage], center: { x: 0, y: 0 } })
     expect(futureCentre.at(frontage, { x: 150, y: 100 })).toMatchObject({ centerWalk: 250, form: 'shop', formAvailableYear: 1975 })
   })
+
+  it('gives narrow connected inner streets compact holdings without extending the profile across disconnected or outer blocks', () => {
+    const main = { ...collector('spine', [{ x: 0, y: 0 }, { x: 0, y: 1400 }]), builtYear: 1975 }
+    const near: Road = { id: 'inner-lane', kind: 'local', width: 4.5, builtYear: 1770, points: [{ x: 0, y: 300 }, { x: 200, y: 300 }] }
+    const outer: Road = { ...near, id: 'outer-lane', points: [{ x: 0, y: 1000 }, { x: 200, y: 1000 }] }
+    const separate: Road = { ...near, id: 'separate-lane', points: [{ x: 20, y: 100 }, { x: 220, y: 100 }] }
+    const context = buildLayoutFirstLandContext({ roads: [main, near, outer, separate], stations: [{ point: { x: 0, y: 0 }, builtYear: 1900 }], settlement: 'metropolis', blocks: [
+      { id: 'inner', polygon: rectangle(0, 300, 200, 90) }, { id: 'outer', polygon: rectangle(0, 1000, 200, 90) }, { id: 'separate', polygon: rectangle(20, 100, 200, 90) },
+    ] })
+    expect(context.at(near, { x: 100, y: 300 }, { x: 100, y: 310 })).toMatchObject({ titleProfile: 'compact', titleAvailableYear: 1975, stockProfile: 'lowrise' })
+    expect(context.at(outer, { x: 100, y: 1000 }, { x: 100, y: 1010 }).titleProfile).toBe('ordinary')
+    expect(context.at(separate, { x: 100, y: 100 }, { x: 100, y: 110 })).toMatchObject({ stationWalk: Infinity, titleProfile: 'ordinary' })
+  })
 })
