@@ -5,7 +5,7 @@ import { createTerrainModel } from './terrain'
 import { resolveGenerationConfig } from './generation-config'
 import type { GenerationTerrainSource } from './generation-terrain-cache'
 import { terrainGenerationPreview } from './generator'
-import { planLayoutFirstZones } from './layout-first-zones'
+import { planLayoutFirstStationZones, planLayoutFirstZones } from './layout-first-zones'
 import { reserveLayoutFirstCivics, resurveyLayoutFirstHospital, hospitalRepairReport } from './layout-first-civic'
 import { surveyLayoutFirstRail } from './layout-first-rail'
 import { buildLayoutFirstRoads } from './layout-first-roads'
@@ -18,14 +18,14 @@ import { shoppingStreetHistory } from './commercial-history'
 import { buildLayoutFirstDistricts } from './layout-first-districts'
 import { createCityTimeline, sliceCityAtYear } from './timeline'
 import { planSubway } from './subway'
-import { materializeRoadJunctions } from './road-graph'
+import { extractStreetBlocks, materializeRoadJunctions } from './road-graph'
 import { certifyLayoutAccess } from './layout-first-access'
 import { LAYOUT_GENERATOR_VERSION } from './layout-first-types'
-import { designateLayoutThroughRoads } from './layout-first-road-designations'
+import { layoutThroughRoadHistory } from './layout-first-road-designations'
 import { regionQuery } from './region-query'
 
 export { LAYOUT_GENERATOR_VERSION } from './layout-first-types'
-const reports = new WeakMap<CityMap, { zones: number; transport: ReturnType<typeof buildLayoutFirstRoads>['diagnostics']; rail: ReturnType<typeof surveyLayoutFirstRail>['diagnostics']; land: ReturnType<typeof developLayoutFirstLand>['metrics']; regional: ReturnType<typeof augmentLayoutFirstRegional>['diagnostics'] }>()
+const reports = new WeakMap<CityMap, { composition: { input: 'configuration-and-terrain-only'; inheritedRoads: 0; inheritedParcels: 0; inheritedBuildings: 0; center: Point; stationDoors: Point[]; streetBlocks: number }; zones: number; transport: ReturnType<typeof buildLayoutFirstRoads>['diagnostics']; rail: ReturnType<typeof surveyLayoutFirstRail>['diagnostics']; land: ReturnType<typeof developLayoutFirstLand>['metrics']; regional: ReturnType<typeof augmentLayoutFirstRegional>['diagnostics'] }>()
 export const layoutGenerationReport = (map: CityMap) => reports.get(map)
 const facilityOpening: Record<FacilityKind, number> = { castle: 1650, shrine: 1650, onsen: 1650, port: 1920, shop: 1700, school: 1875, police: 1880, hospital: 1920, park: 1955, university: 1965 }
 const areaOpening = (area: Area) => area.id.startsWith('station-') ? 1900 : area.id.startsWith('facility-') ? facilityOpening[(Object.keys(facilityOpening) as FacilityKind[]).find(kind => area.id.includes(kind)) ?? 'park'] : 1650
@@ -106,11 +106,17 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
   }
   const reserves = [...civic.reserves, ...rail.stationGrounds]
   let reservedAt = regionQuery(reserves)
-  const stationZones = rail.stations.map((station, i) => ({ id: `layout-station-zone-${i}`, center: station.entrance ?? station.point, radius: config.settlement === 'village' ? 200 : 360, kind: 'station' as const, builtYear: 1900, density: .7 + config.density * .0025, maximumFloors: config.settlement === 'metropolis' ? 12 : 5, polygon: [{ x: Math.max(5, station.point.x - 360), y: Math.max(5, station.point.y - 360) }, { x: Math.min(width - 5, station.point.x + 360), y: Math.max(5, station.point.y - 360) }, { x: Math.min(width - 5, station.point.x + 360), y: Math.min(height - 5, station.point.y + 360) }, { x: Math.max(5, station.point.x - 360), y: Math.min(height - 5, station.point.y + 360) }] }))
-  const zones = [...brief.zones, ...stationZones]
+  // The brief cannot invent a station neighbourhood before rail has acquired
+  // a door and a public gate. Land intensity is measured from these real doors
+  // through the connected public streets after their blocks have been built.
+  const plannedZones = [...brief.zones, ...planLayoutFirstStationZones({ config, width, height, terrain, zones: brief.zones, stations: rail.stations, gates: rail.accessTargets })]
   onProgress?.('外へ続く幹線・橋と住区内の街路を接続中…')
-  const transport = buildLayoutFirstRoads({ seed: config.seed, center: brief.center, settlement: config.settlement, density: config.density, arterial: config.arterial, zones, railways: rail.railways, reservedRegions: reserves,
+  const transport = buildLayoutFirstRoads({ seed: config.seed, center: brief.center, settlement: config.settlement, density: config.density, arterial: config.arterial, zones: plannedZones, railways: rail.railways, reservedRegions: reserves,
     accessTargets: [...civic.accessTargets, ...rail.accessTargets], environment: { width, height, core: null, areas: planningAreas, terrain: planningTerrain, bridgeSites: terrain.bridgeSites, exactLandCost: true, landCost: p => reservedAt(p) ? Infinity : 0 } })
+  // The street survey may acquire physically enclosed infill ground between
+  // the original neighbourhood briefs. Develop and clear that accepted frame,
+  // rather than treating initial planning outlines as permanent urban holes.
+  const zones = transport.zones
   const regional = augmentLayoutFirstRegional({ config, width, height, terrain: planningTerrain, areas: planningAreas, reserves, railways: rail.railways, transport })
   let roads: Road[] = materializeRoadJunctions([...regional.roads, ...civic.roads, ...rail.stationPaths])
   let access = certifyLayoutAccess({ width, height, roads, targets: [...civic.accessTargets, ...rail.accessTargets] })
@@ -145,11 +151,15 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
     transport.diagnostics.unservedAccessIds = transport.diagnostics.unservedAccessIds.filter(id => !accessIds.has(id))
     access = certifyLayoutAccess({ width, height, roads, targets: [...civic.accessTargets, ...rail.accessTargets] })
   }
+  // Show the actual surveyed transport stage even when a later completion
+  // check must stop generation. A preview never certifies a completed city.
+  onPreview?.(frame({ roads, areas: [...naturalAreas, ...civic.areas, ...rail.stationGrounds], railways: rail.railways, stations: rail.stations, buildings: civic.buildings, facilities: civic.facilities }, 'roads'))
   if (access.unserved.length) {
     const names = [...new Set(access.unserved.map(id => civic.facilities.find(facility => id.includes(facility.kind))?.name ?? (id.startsWith('station-') ? '駅前広場' : '公共施設')))]
     throw new Error(`${names.join('・')}への道を、外へ続く公道に接続できませんでした。生成を中止しました。`, { cause: { access, transport: transport.diagnostics, hospitalRepair: hospitalRepairReport(civic), outsideRoads: roads.filter(road => road.boundaryContinuation).map(road => ({ id: road.id, builtYear: road.builtYear, from: road.points[0], to: road.points.at(-1) })) } })
   }
-  if (config.arterial) roads = designateLayoutThroughRoads(roads, width, height)
+  const designatedRoadHistory: TimelineVersion<Road>[] = config.arterial ? layoutThroughRoadHistory(roads, width, height) : roads.map(value => ({ from: value.builtYear ?? 1650, value }))
+  roads = designatedRoadHistory.filter(version => version.to === undefined).map(version => version.value)
   onPreview?.(frame({ roads, areas: [...naturalAreas, ...civic.areas, ...rail.stationGrounds], railways: rail.railways, stations: rail.stations, buildings: civic.buildings, facilities: civic.facilities }, 'roads'))
   const railwayRegions = rail.railways.flatMap(line => line.points.slice(1).map((p, i) => ({ polygon: corridorPolygon(line.points[i]!, p, 7) })))
   const blocked = regionIndex([...planningAreas.filter(area => area.kind === 'water'), ...reserves, ...railwayRegions])
@@ -160,7 +170,11 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
     return polygon.every(p => !terrain.waterAt(p) && terrain.slope(p) <= .16)
   }
   onProgress?.('街区の奥行きに合わせて宅地・店舗・集合住宅を配置中…')
-  const land = developLayoutFirstLand({ config, roads, zones, reserves, canPlace: physicalLand, slope: terrain.slope, elevation: terrain.elevation })
+  // Civic paths, station approaches and regional roads have now been adopted.
+  // Their cuts change the real faces; the transport draft is no longer the
+  // final cadastral frame supplied to land development.
+  const blocks = extractStreetBlocks(roads).map((polygon, i) => ({ id: `layout-block-${i}`, polygon }))
+  const land = developLayoutFirstLand({ config, roads, zones, center: transport.center, stations: rail.stations, blocks, reserves, canPlace: physicalLand, slope: terrain.slope, elevation: terrain.elevation })
   onProgress?.('農地・森林・草地と市街地の境界を整備中…')
   const coverInput = { config, width, height, terrain: { ...terrain, areas: [...naturalAreas, ...civic.areas.filter(area => area.kind === 'water')] }, zones, parcels: land.parcels, roads, reserves, buildings: [...land.buildings, ...civic.buildings] }
   const cover = buildLayoutFirstCover(coverInput)
@@ -168,11 +182,14 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
   const areas: Area[] = [...cover, ...civicGrounds, ...rail.stationGrounds]
   const civicHistory = civicBuildingHistory(civic.buildings, config.seed, 2025)
   const buildings = [...land.buildings, ...civicHistory.filter(version => version.to === undefined).map(version => version.value)]
-  const roadHistory: TimelineVersion<Road>[] = roads.flatMap(road => {
-    const from = road.builtYear ?? 1650
-    if (from >= 1955 || road.width <= 5 || road.role === 'bridge' || road.role === 'access') return [{ from, value: road }]
-    const historicWidth = Math.min(road.width, road.kind === 'arterial' ? 6 : 4.5)
-    return [{ from, to: 1955, value: { ...road, width: historicWidth } }, { from: 1955, value: { ...road, modifiedYear: 1955, reason: '既存の街路用地内で拡幅・舗装を更新' } }]
+  const roadHistory: TimelineVersion<Road>[] = designatedRoadHistory.flatMap(version => {
+    const { from, to, value: road } = version
+    if (from >= 1955 || road.width <= 5 || road.role === 'bridge' || road.role === 'access') return [version]
+    // A designation change cannot widen a physical cross-section. Only the
+    // separate 1955 pavement update changes this dated width.
+    const historicWidth = Math.min(road.width, road.width >= 10 ? 6 : 4.5)
+    if (to !== undefined && to <= 1955) return [{ ...version, value: { ...road, width: historicWidth } }]
+    return [{ from, to: 1955, value: { ...road, width: historicWidth } }, { from: 1955, ...(to === undefined ? {} : { to }), value: { ...road, modifiedYear: 1955, reason: '既存の街路用地内で拡幅・舗装を更新' } }]
   })
   const shopHistory = config.facilities.includes('shop') ? shoppingStreetHistory({ buildings: land.history.buildings, parcels: land.history.parcels, roads: roadHistory, name: '中央商店街', throughYear: 2025 }) : []
   const coverHistory = layoutFirstCoverHistory({ input: coverInput, finalCover: cover, roadHistory, reserveDates: reserves.map(region => {
@@ -187,7 +204,6 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
   }
   const subway = planSubway({ config, throughYear: 2025, roads: roadHistory, buildings: land.history.buildings, stations: rail.stations, terrain })
   const railways = [...rail.railways, ...(subway ? [subway.railway] : [])], stations = [...rail.stations, ...(subway?.stations ?? [])]
-  const blocks = transport.blocks.map((polygon, i) => ({ id: `layout-block-${i}`, polygon }))
   onProgress?.('町域と建て替え・道路改良の年代を記録中…')
   const districts = buildLayoutFirstDistricts({ width, height, config, roads, blocks, parcels: land.parcels, areas, stations, facilities })
   const civicEvents = civicHistory.flatMap((version): GrowthEvent[] => [
@@ -205,6 +221,6 @@ export function generateLayoutCity(input: CityConfig, onProgress?: (label: strin
     areas: [...coverHistory, ...civicGrounds.map(value => ({ from: areaOpening(value), value })), ...rail.stationGrounds.map(value => ({ from: 1900, value }))] })
   onPreview?.(frame(map, 'development'))
   const result = sliceCityAtYear(map, requestedYear)
-  reports.set(result, { zones: zones.length, transport: transport.diagnostics, rail: rail.diagnostics, land: land.metrics, regional: regional.diagnostics })
+  reports.set(result, { composition: { input: 'configuration-and-terrain-only', inheritedRoads: 0, inheritedParcels: 0, inheritedBuildings: 0, center: transport.center, stationDoors: rail.stations.map(station => station.entrance ?? station.point), streetBlocks: blocks.length }, zones: zones.length, transport: transport.diagnostics, rail: rail.diagnostics, land: land.metrics, regional: regional.diagnostics })
   return result
 }

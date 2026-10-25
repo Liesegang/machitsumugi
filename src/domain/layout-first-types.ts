@@ -1,8 +1,9 @@
 import type { Point } from './types'
 import type { PolygonRegion } from './geometry'
-export const LAYOUT_GENERATOR_VERSION = '2.6.0-layout.2'
+export const LAYOUT_GENERATOR_VERSION = '2.6.0-layout.3'
 
-/** A spatial brief; dates describe coherent development phases, not a growth loop. */
+/** A whole-city land brief. Actual station catchments are measured on the final
+ * public street network; this shape does not grant a building form or a title. */
 export interface LayoutFirstZone extends PolygonRegion {
   id: string
   center: Point

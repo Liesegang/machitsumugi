@@ -123,7 +123,7 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
     parts.push(`<path data-elevation="${line.elevation}" d="${path(line.points)}" fill="none" stroke="${options.style === 'mono' ? '#777777' : '#9b8060'}" stroke-width="${(line.index ? 1.15 : .6) * px}" opacity="${line.index ? .85 : .48}"/>`)
     if (line.index && line.points.length > 8) parts.push(text(`${line.elevation}m`, line.points[Math.floor(line.points.length * .43)]!, '#816849', 10))
   }
-  if (layers.labels) for (const district of map.districts) for (const region of district.regions ?? []) parts.push(`<path d="${[region.polygon, ...(region.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="none" stroke="${options.style === 'night' ? '#b3a6c8' : '#8a8293'}" stroke-width="${(district.kind === 'ward' ? 1.25 : .65) * px}" stroke-dasharray="${4 * px} ${3 * px}" opacity=".65"/>`)
+  if (layers.districts) for (const district of map.districts) for (const region of district.regions ?? []) parts.push(`<path d="${[region.polygon, ...(region.holes ?? [])].map(ring => path(ring, true)).join(' ')}" fill="none" stroke="${options.style === 'night' ? '#b3a6c8' : '#8a8293'}" stroke-width="${(district.kind === 'ward' ? 1.25 : .65) * px}" stroke-dasharray="${4 * px} ${3 * px}" opacity=".65"/>`)
   if (layers.buildings && map.parcels) for (const p of map.parcels.filter(p => p.developedYear && p.retiredYear === undefined)) parts.push(`<path d="${path(p.polygon, true)}" fill="none" stroke="${c.roadEdge}" stroke-width=".6"/>`)
   if (layers.buildings) for (const b of map.buildings) parts.push(`<path d="${path(b.polygon, true)}" fill="${buildingColor(b, options.style)}"/>`)
   if (layers.roads) {

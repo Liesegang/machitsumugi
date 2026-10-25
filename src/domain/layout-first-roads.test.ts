@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { buildLayoutFirstRoads } from './layout-first-roads'
+import { buildLayoutFirstRoads, layoutNearEdgeExitAnchors } from './layout-first-roads'
+import type { Road } from './types'
 import type { LayoutFirstZone } from './layout-first-types'
 import type { PlanningEnvironment } from './road-planner'
-import { corridorPolygon, polygonArea, pointInPolygon, polygonOverlapsRegion, rectangle } from './geometry'
+import { corridorPolygon, distanceToSegment, polygonArea, pointInPolygon, polygonOverlapsRegion, rectangle } from './geometry'
 import { roadLength } from './road-graph'
 import { RailwayRoadConstraints } from './railway-road-constraints'
 
@@ -128,5 +129,69 @@ describe('layout-first public street design', () => {
     const result = buildLayoutFirstRoads({ ...input, accessTargets: [{ id: 'steep-gate', point: peak, builtYear: 1650 }] })
     expect(result.diagnostics.unservedAccessIds).toEqual(['steep-gate'])
     expect(result.roads[0]!.points.some(p => Math.hypot(p.x - peak.x, p.y - peak.y) < 1e-7)).toBe(false)
+  })
+
+  it('closes most of the urban envelope and terminates every subdivision on real perimeter streets', () => {
+    const result = buildLayoutFirstRoads({ environment: flatEnvironment(), seed: 'whole-envelope', center: { x: 900, y: 700 }, zones: [zone()] })
+    const area = result.blocks.reduce((sum, block) => sum + polygonArea(block), 0)
+    expect(area).toBeGreaterThan(960 ** 2 * .72)
+    const subdivisions = result.roads.filter(road => road.reason === '実在する周囲の道路を結んで街区を分割する生活道路')
+    expect(subdivisions.length).toBeGreaterThan(30)
+    for (const road of subdivisions) for (const endpoint of [road.points[0]!, road.points.at(-1)!]) {
+      expect(result.roads.some(other => other !== road && other.points.slice(1).some((b, i) => distanceToSegment(endpoint, other.points[i]!, b) < 1e-6))).toBe(true)
+    }
+  })
+
+  it('continues one coarse network across adjoining planning territories', () => {
+    const left = { ...zone({ x: 600, y: 700 }, 400), id: 'old-bank', kind: 'historic' as const, builtYear: 1650, polygon: rectangle(200, 300, 800, 800) }
+    const right = { ...zone({ x: 1300, y: 700 }, 400), id: 'postwar-bank', builtYear: 1975, polygon: rectangle(1000, 300, 700, 800) }
+    const result = buildLayoutFirstRoads({ environment: flatEnvironment(2000, 1400), seed: 'one-city-many-briefs', center: left.center, zones: [left, right] })
+    const crossing = result.roads.filter(road => road.reason.includes('市域') && road.points.some(p => p.x < 1000) && road.points.some(p => p.x > 1000))
+    expect(crossing.length).toBeGreaterThan(1)
+    expect(result.blocks.filter(block => block.some(p => p.x < 1000) && block.some(p => p.x > 1000)).length).toBeGreaterThan(2)
+    expect(result.diagnostics.unservedZoneIds).toEqual([])
+    expect(result.roads.every(road => Number.isFinite(result.graph.accessibilityFrom(result.center)(road.points.at(-1)!)))).toBe(true)
+  })
+
+  it('uses four-neighbour corridor families and continuous wider centre axes', () => {
+    const result = buildLayoutFirstRoads({ environment: flatEnvironment(), seed: 'shared-corridor-frame', center: { x: 900, y: 700 }, zones: [zone()] })
+    const corridors = result.roads.filter(road => road.reason === '市域を連続して結ぶ生活幹線' || road.reason === '市域を連続して通り抜ける広幅員の都市幹線')
+    expect(corridors.length).toBeGreaterThan(12)
+    for (const road of corridors) {
+      const a = road.points[0]!, b = road.points.at(-1)!, angle = Math.atan2(b.y - a.y, b.x - a.x)
+      // Shared rows/columns may bend slightly; diagonal triangulation cannot
+      // pass this topology requirement even if it creates many closed faces.
+      expect(Math.abs(Math.sin(2 * (angle - .12)))).toBeLessThan(.16)
+    }
+    const main = corridors.filter(road => road.role === 'highway')
+    expect(main.length).toBeGreaterThan(4)
+    expect(main.every(road => road.width === 14 && road.kind === 'arterial')).toBe(true)
+    expect(main.reduce((sum, road) => sum + roadLength(road.points), 0)).toBeGreaterThan(1600)
+    expect(corridors.some(road => road.width === 8.5 && road.role === 'collector')).toBe(true)
+  })
+
+  it('subdivides adopted enclosed urban gaps rather than leaving their whole coarse faces empty', () => {
+    const left = { ...zone({ x: 450, y: 650 }, 300), id: 'west-neighbourhood', polygon: rectangle(250, 400, 400, 500) }
+    const right = { ...zone({ x: 1250, y: 650 }, 300), id: 'east-neighbourhood', polygon: rectangle(1050, 400, 400, 500) }
+    const zones = [left, right], original = JSON.stringify(zones)
+    const result = buildLayoutFirstRoads({ environment: flatEnvironment(), seed: 'enclosed-urban-gap', center: left.center, zones, settlement: 'metropolis', density: 85 })
+    const infill = result.zones.filter(zone => zone.id.startsWith('layout-infill-face-'))
+    expect(infill.some(zone => zone.center.x > 650 && zone.center.x < 1050)).toBe(true)
+    expect(result.blocks.filter(block => polygonArea(block) < 25000 && block.every(p => p.x > 650 && p.x < 1050)).length).toBeGreaterThan(2)
+    expect(result.roads.some(road => road.role === 'lane' && road.points.every(p => p.x > 650 && p.x < 1050))).toBe(true)
+    expect(JSON.stringify(zones)).toBe(original)
+    expect(result.zones).not.toBe(zones)
+  })
+
+  it('selects actual near-edge public anchors for late outside surveys instead of restarting at the centre', () => {
+    const roads: Road[] = [
+      { id: 'old-centre', kind: 'local', width: 9, points: [{ x: 900, y: 650 }, { x: 950, y: 650 }] },
+      { id: 'new-east', kind: 'local', width: 8.5, points: [{ x: 1450, y: 650 }, { x: 1740, y: 650 }] },
+      { id: 'new-west', kind: 'local', width: 8.5, points: [{ x: 40, y: 600 }, { x: 400, y: 600 }] },
+      { id: 'elevated', kind: 'arterial', width: 22, controlledAccess: true, points: [{ x: 1790, y: 650 }, { x: 1795, y: 900 }] },
+      { id: 'door-path', kind: 'local', width: 3, points: [{ x: 1792, y: 700 }, { x: 1797, y: 700 }] },
+    ]
+    expect(layoutNearEdgeExitAnchors(roads, 'east', 1800, 1400)[0]).toMatchObject({ point: { x: 1740, y: 650 }, road: { id: 'new-east' } })
+    expect(layoutNearEdgeExitAnchors(roads, 'west', 1800, 1400)[0]).toMatchObject({ point: { x: 40, y: 600 }, road: { id: 'new-west' } })
   })
 })

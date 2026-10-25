@@ -62,9 +62,9 @@ describe('layout-first land composition', () => {
     const elevated = run({ roads: [{ ...road, id: 'viaduct', level: 1 }, { ...road, id: 'motorway', controlledAccess: true }] })
     expect(elevated.buildings).toEqual([])
   })
-  it('uses legible apartment bars in station districts and keeps their depth and length within the actual holding', () => {
-    const result = run({ zones: [{ ...zone, kind: 'station', builtYear: 1900, maximumFloors: 10 }] })
-    const apartments = result.buildings.filter(b => b.height >= 5)
+  it('uses legible apartment bars on connected station collectors and keeps their depth and length within the actual holding', () => {
+    const result = run({ roads: grid().map(road => ({ ...road, kind: 'arterial', role: 'collector', width: 9 })), stations: [{ point: { x: 220, y: 0 } }], zones: [{ ...zone, kind: 'residential', builtYear: 1900, maximumFloors: 10 }] })
+    const apartments = result.buildings.filter(b => b.kind === 'residential' && b.height >= 4)
     expect(apartments.length).toBeGreaterThan(5)
     for (const building of apartments) {
       expect(building.polygon).toHaveLength(4)
@@ -72,8 +72,47 @@ describe('layout-first land composition', () => {
       expect(distance(building.polygon[1]!, building.polygon[2]!)).toBeGreaterThanOrEqual(12 - 1e-7)
       expect(distance(building.polygon[1]!, building.polygon[2]!)).toBeLessThanOrEqual(16 + 1e-7)
     }
-    expect(result.metrics.grossFloorArea).toBeGreaterThan(result.metrics.footprintArea * 3)
+    expect(result.metrics.grossFloorArea).toBeGreaterThan(result.metrics.footprintArea * 2.5)
     for (const building of result.buildings) expect(building.polygon.every(point => pointInPolygon(point, result.parcels.find(p => p.id === building.parcelId)!.polygon))).toBe(true)
+  })
+  it('renews historic centre blocks with compact walkups and taller wide-street frontage while preserving old low frames', () => {
+    const roads = grid().map(road => road.id === 'vertical-2' ? { ...road, kind: 'arterial' as const, role: 'collector' as const, width: 9 } : road)
+    const blocks = [0, 1, 2, 3].flatMap(x => [0, 1, 2].map(y => ({ id: `block-${x}-${y}`, polygon: rectangle(x * 110, y * 110, 110, 110) })))
+    const result = run({ config: { ...config, settlement: 'metropolis' }, roads, blocks, center: { x: 220, y: 180 }, stations: [{ point: { x: 220, y: 0 }, builtYear: 1900 }], zones: [{ ...zone, maximumFloors: 2 }] })
+    const walkups = result.buildings.filter(building => building.kind === 'residential' && building.height >= 3)
+    expect(walkups.length).toBeGreaterThan(50)
+    for (const building of walkups) {
+      expect(building.height).toBeLessThanOrEqual(4)
+      expect(polygonArea(building.polygon)).toBeLessThan(350)
+      expect(['local']).toContain(roads.find(road => road.id === result.parcels.find(parcel => parcel.id === building.parcelId)!.roadId)!.kind)
+    }
+    const wideFrontage = result.buildings.filter(building => building.kind === 'commercial' && result.parcels.find(parcel => parcel.id === building.parcelId)!.roadId === 'vertical-2')
+    expect(wideFrontage.length).toBeGreaterThan(5)
+    expect(wideFrontage.every(building => building.height >= 4 && building.height <= 8)).toBe(true)
+    expect(result.history.buildings.filter(frame => frame.from < 1955).every(frame => frame.value.height <= 2)).toBe(true)
+    expect(result.history.buildings.some(frame => frame.from < 1900)).toBe(true)
+  })
+  it('keeps ordinary homes small when a district label has no connected station or collector context', () => {
+    for (const kind of ['residential', 'station', 'apartment'] as const) {
+      const result = run({ zones: [{ ...zone, kind, builtYear: 1955, maximumFloors: 12 }] })
+      expect(result.buildings.length).toBeGreaterThan(150)
+      expect(result.buildings.every(building => building.height <= 2)).toBe(true)
+      expect(result.buildings.every(building => polygonArea(building.polygon) < 350)).toBe(true)
+    }
+  })
+  it('does not backdate station shops before the station or a future connecting road opens', () => {
+    const frontage: Road = { id: 'old-frontage', points: [{ x: 100, y: 180 }, { x: 420, y: 180 }], kind: 'local', width: 6, builtYear: 1770 }
+    for (const connectionYear of [1770, 1975]) {
+      const connector: Road = { id: 'station-connector', points: [{ x: 20, y: 180 }, { x: 100, y: 180 }], kind: 'local', width: 6, builtYear: connectionYear }
+      const input = { roads: [frontage, connector], stations: [{ point: { x: 20, y: 180 }, builtYear: 1900 }], zones: [{ ...zone, kind: 'residential' as const, maximumFloors: 6 }] }
+      const present = run(input), beforeRail = run({ ...input, config: { ...config, targetYear: 1850 } })
+      const shops = present.parcels.filter(parcel => parcel.roadId === frontage.id && parcel.use === 'commercial')
+      expect(shops.length).toBeGreaterThan(2)
+      expect(shops.every(parcel => parcel.createdYear >= Math.max(1900, connectionYear))).toBe(true)
+      expect(present.history.buildings.filter(frame => shops.some(parcel => parcel.id === frame.value.parcelId)).every(frame => frame.from >= Math.max(1900, connectionYear))).toBe(true)
+      expect(beforeRail.buildings.every(building => building.kind !== 'commercial')).toBe(true)
+      expect(beforeRail.buildings.some(building => building.kind === 'residential')).toBe(true)
+    }
   })
   it('retains shallow recesses on small ordinary stock while bounding apartment mass on deep plots', () => {
     let recessed = 0

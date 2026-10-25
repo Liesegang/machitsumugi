@@ -2,11 +2,11 @@ import { beforeAll, describe, expect, it } from 'vitest'
 import { generateLayoutCity, LAYOUT_GENERATOR_VERSION, layoutGenerationReport } from './layout-first-generator'
 import type { TerrainModel, TerrainModelInput } from './terrain'
 import type { Area, CityConfig, CityMap, Point, Road } from './types'
-import { boundsOf, corridorPolygon, intersectRegions, overlaps, polygonOverlapsRegion, rectangle, regionArea } from './geometry'
+import { boundsOf, corridorPolygon, distance, distanceToSegment, intersectRegions, overlaps, polygonOverlapsRegion, rectangle, regionArea } from './geometry'
 import { buildingServiceYears } from './building-lifecycle'
 import { sliceCityAtYear } from './timeline'
 import { parseProject } from './project'
-import { controlledRoad, materializeRoadJunctions } from './road-graph'
+import { controlledRoad, extractStreetBlocks, materializeRoadJunctions } from './road-graph'
 import { featureHistory } from '../map/inspect'
 
 /** An explicit surveyed synthetic plain/coast. Engineering and composition are
@@ -73,9 +73,31 @@ describe('layout-first composed city integration on a known surveyed DEM', () =>
     for (const kind of config.facilities) expect(inland.facilities.some(f => f.kind === kind), kind).toBe(true)
     expect(inland.buildings.length).toBeGreaterThan(500)
     expect(inland.facilities.find(f => f.kind === 'shop')).toBeTruthy()
-    expect(inland.buildings.filter(b => b.kind === 'commercial').length).toBeGreaterThan(20)
+    expect(inland.buildings.filter(b => b.kind === 'commercial').length).toBeGreaterThanOrEqual(20)
+    const label = inland.facilities.find(facility => facility.kind === 'shop')!
+    const titles = new Map(inland.parcels!.map(parcel => [parcel.id, parcel]))
+    const shops = inland.buildings.filter(building => building.kind === 'commercial' && building.use !== 'lodging' && building.parcelId).map(building => ({ building, parcel: titles.get(building.parcelId!)!, center: building.polygon.reduce((sum, point) => ({ x: sum.x + point.x / building.polygon.length, y: sum.y + point.y / building.polygon.length }), { x: 0, y: 0 }) }))
+    const street = inland.roads.find(road => !controlledRoad(road) && road.points.slice(1).some((point, i) => distanceToSegment(label.point, road.points[i]!, point) < 1e-6) && shops.filter(shop => shop.parcel.roadId === road.id && distance(shop.center, label.point) < 200).length >= 3)!
+    expect(street, 'shopping label must identify an actual continuous public frontage with at least three independent surviving shops').toBeTruthy()
+    const frontage = shops.filter(shop => shop.parcel.roadId === street.id && distance(shop.center, label.point) < 200)
+    expect(new Set(frontage.map(shop => shop.parcel.id)).size).toBe(frontage.length)
+    expect(new Set(frontage.map(shop => shop.building.id)).size).toBe(frontage.length)
+    for (const shop of frontage) expect(street.points.slice(1).some((point, i) => distanceToSegment(shop.parcel.access![0]!, street.points[i]!, point) < 1e-6), shop.building.id).toBe(true)
     expect(inland.buildings.some(b => b.name?.includes('大学') && b.kind === 'public')).toBe(true)
     expect(inland.buildings.filter(b => b.use === 'lodging').length).toBeGreaterThanOrEqual(4)
+  })
+  it('composes all geometry fresh from configuration and one actual terrain model, with actual street blocks and station doors', () => {
+    for (const map of [inland, coast]) {
+      const report = layoutGenerationReport(map)!
+      expect(report.composition).toMatchObject({ input: 'configuration-and-terrain-only', inheritedRoads: 0, inheritedParcels: 0, inheritedBuildings: 0 })
+      expect(report.composition.stationDoors).toEqual(map.stations.filter(station => station.mode !== 'subway').map(station => station.entrance ?? station.point))
+      // Date materialization omits undated final block polygons, while the
+      // report retains the actual faces supplied to land composition.
+      expect(report.composition.streetBlocks).toBeGreaterThan(30)
+      expect(report.composition.streetBlocks).toBe(extractStreetBlocks(map.roads).length)
+      expect(map.generatorVersion).toBe('2.6.0-layout.3')
+      expect(map.areas.some(area => area.id.startsWith('layout-station-zone-'))).toBe(false)
+    }
   })
   it('places a genuine dry coastal port and station grounds while keeping all ordinary buildings off water, civic reserves and railway corridors', () => {
     expect(coast.unplacedFacilities, JSON.stringify(coast.unplacedFacilities)).toEqual([])

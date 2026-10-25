@@ -51,10 +51,10 @@ function sessionDraft(fallback: CityConfig): CityConfig {
 }
 const normalizeConfig = (config: CityConfig): CityConfig => ({ ...config, era: config.era ?? 'present', relief: config.relief ?? 'hills', terrain: (config.type === 'port' || config.facilities.includes('port')) && config.terrain === 'plain' ? 'coast' : config.terrain })
 const newProject = (): Project => {
-  const config: CityConfig = { ...DEFAULT_CONFIG, cityEngine: 'history' }
+  const config: CityConfig = { ...DEFAULT_CONFIG, cityEngine: 'layout' }
   return { version: 2, config: livePreview ? sessionDraft(config) : config, layers: DEFAULT_LAYERS, annotations: [], style: 'standard' }
 }
-const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', facilities: '施設', grid: '100 m グリッド' }
+const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', districts: '町域・区境', facilities: '施設', grid: '100 m グリッド' }
 // A disposable development preview must never replace a saved TRPG world.
 const livePreview = import.meta.env.DEV && new URLSearchParams(location.search).get('preview') === 'latest'
 
@@ -412,7 +412,7 @@ function App() {
         {tab === 'create' && <SettingsPanel config={draft} onChange={setDraft} generating={generating} dirty={dirty} onGenerate={generate} onCancel={cancelGeneration} unplacedCount={project.snapshot?.unplacedFacilities?.length} onReport={() => setDialog('report')} />}
         {tab === 'edit' && <MapEditor year={displayYear} tool={editorTool} onTool={startEditorTool} targetKind={editorTargetKind} onTargetKind={kind => { setEditorTargetKind(kind); setEditorSelection(null) }} selection={editorSelection} points={editPoints} values={editorValues} onValues={setEditorValues} onFinish={finishEdit} onCancel={cancelEdit} onBack={() => setEditPoints(old => old.slice(0, -1))} onDelete={() => changeSelectedEdit('delete')} onRename={() => changeSelectedEdit('rename')} onRedraw={redrawSelectedEdit} onUndo={undoEdit} onRedo={redoEdit} canUndo={!!project.edits?.length} canRedo={!!redoEdits.length} disabled={generating || !project.snapshot} />}
         {tab === 'layers' && <div className="panel-scroll">
-          <section><h2>レイヤー</h2>{Object.entries(layerNames).map(([key, name]) => <Toggle key={key} label={name} value={project.layers[key as keyof typeof layerNames]} onChange={value => setProject(old => ({ ...old, layers: { ...old.layers, [key]: value } }))} />)}</section>
+          <section><h2>レイヤー</h2>{Object.entries(layerNames).map(([key, name]) => <Toggle key={key} label={name} value={project.layers[key as keyof typeof layerNames] ?? false} onChange={value => setProject(old => ({ ...old, layers: { ...old.layers, [key]: value } }))} />)}</section>
           <section><h2>配色</h2><div className="style-options">{([{ id: 'standard', name: '標準' }, { id: 'mono', name: 'モノクロ' }, { id: 'night', name: '夜間' }] as const).map(style => <button key={style.id} className={project.style === style.id ? 'selected' : ''} aria-pressed={project.style === style.id} onClick={() => setProject(old => ({ ...old, style: style.id }))}>{style.name}</button>)}</div></section>
           {map && <DistrictNaming key={JSON.stringify(map.config)} map={map} disabled={generating} onApply={applyDistrictNames} />}
         </div>}

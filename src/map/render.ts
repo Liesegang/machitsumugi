@@ -14,6 +14,7 @@ export type LayerSettings = {
   roads: boolean
   railway: boolean
   labels: boolean
+  districts?: boolean
   facilities: boolean
   terrain: boolean
   grid: boolean
@@ -32,7 +33,7 @@ export type RenderOptions = {
 
 export const DEFAULT_LAYERS: LayerSettings = {
   buildings: true, roads: true, railway: true, labels: true,
-  facilities: true, terrain: true, grid: false,
+  facilities: true, terrain: true, grid: false, districts: false,
 }
 
 export const PALETTES = {
@@ -223,7 +224,7 @@ export function renderMap(ctx: DrawingContext, map: CityMap, options: RenderOpti
 
   if (options.contours) renderContours(ctx, map, scale, style)
 
-  if (layers.labels) {
+  if (layers.districts) {
     ctx.save()
     ctx.strokeStyle = style === 'night' ? '#b3a6c8' : '#8a8293'
     ctx.globalAlpha = .65

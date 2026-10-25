@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { distance, distanceToSegment, pointInPolygon, polygonOverlapsRegion, rectangle } from './geometry'
-import { surveyLayoutFirstRail } from './layout-first-rail'
+import { surveyLayoutFirstRail, surveyLayoutStationApproaches } from './layout-first-rail'
 import type { LayoutFirstRailInput } from './layout-first-rail'
-import { planLayoutFirstZones } from './layout-first-zones'
+import { planLayoutFirstStationZones, planLayoutFirstZones } from './layout-first-zones'
 import { reserveLayoutFirstCivics } from './layout-first-civic'
 import { buildLayoutFirstRoads } from './layout-first-roads'
 import { materializeRoadJunctions } from './road-graph'
@@ -16,6 +16,21 @@ function fixture(): LayoutFirstRailInput {
 }
 
 describe('layout-first regional railway', () => {
+  it('rejects a forecourt trapped between its railway and parallel creek while surveying the open opposite side', () => {
+    const input = fixture(), water = { id: 'parallel-creek', kind: 'water' as const, polygon: rectangle(100, 870, 2200, 20) }
+    const terrain = { ...input.terrain, areas: [water], waterAt: (p: { y: number }) => p.y >= 870 && p.y <= 890 }
+    const common = { terrain, railPoints: [{ x: 100, y: 1000 }, { x: 2300, y: 1000 }], reserves: [], width: input.width, height: input.height }
+    expect(surveyLayoutStationApproaches({ ...common, gate: { x: 1200, y: 953 }, outward: { x: 0, y: -1 } })).toEqual([])
+    const openSide = surveyLayoutStationApproaches({ ...common, gate: { x: 1200, y: 1047 }, outward: { x: 0, y: 1 } })
+    expect(openSide).toHaveLength(5)
+    expect(openSide.every(path => distance(path[0]!, path[1]!) >= 179.99)).toBe(true)
+  })
+
+  it('checks complete approach width rather than only its dry centreline', () => {
+    const input = fixture(), water = { id: 'road-shoulder-water', kind: 'water' as const, polygon: rectangle(1202, 700, 4, 300) }
+    const paths = surveyLayoutStationApproaches({ gate: { x: 1200, y: 953 }, outward: { x: 0, y: -1 }, terrain: { ...input.terrain, areas: [water], waterAt: (p: { x: number }) => p.x >= 1202 && p.x <= 1206 }, railPoints: [{ x: 100, y: 1000 }, { x: 2300, y: 1000 }], reserves: [], width: input.width, height: input.height })
+    expect(paths.some(path => Math.abs(path[1]!.x - 1200) < 1e-7)).toBe(false)
+  })
   it('honours the rail toggle without surveying land', () => {
     const input = fixture(); input.config.railway = false
     input.terrain.elevation = () => { throw new Error('unrequested terrain query') }
@@ -97,7 +112,7 @@ describe('layout-first regional railway', () => {
     expect(rail.stations).toHaveLength(2)
     for (const station of rail.stations) expect((station.entrance!.x - station.point.x) * (brief.center.x - station.point.x) + (station.entrance!.y - station.point.y) * (brief.center.y - station.point.y)).toBeGreaterThan(0)
     const reserves = [...civic.reserves, ...rail.stationGrounds]
-    const stationZones = rail.stations.map((station, i) => ({ id: `layout-station-zone-${i}`, kind: 'station' as const, center: station.entrance!, builtYear: 1900, density: .84, maximumFloors: 5, radius: 360, polygon: rectangle(Math.max(5, station.point.x - 360), Math.max(5, station.point.y - 360), Math.min(720, width - 5 - Math.max(5, station.point.x - 360)), Math.min(720, height - 5 - Math.max(5, station.point.y - 360))) }))
+    const stationZones = planLayoutFirstStationZones({ ...input, ...brief, stations: rail.stations, gates: rail.accessTargets })
     const transport = buildLayoutFirstRoads({ seed: config.seed, center: brief.center, settlement: config.settlement, density: config.density, arterial: true, zones: [...brief.zones, ...stationZones], railways: rail.railways, reservedRegions: reserves, accessTargets: [...civic.accessTargets, ...rail.accessTargets],
       environment: { width, height, core: null, areas: planningAreas, terrain: planningTerrain, bridgeSites: [], exactLandCost: true, landCost: p => reserves.some(region => pointInPolygon(p, region.polygon)) ? Infinity : 0 } })
     const roads = materializeRoadJunctions([...transport.roads, ...rail.stationPaths])

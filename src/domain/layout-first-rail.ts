@@ -2,7 +2,7 @@ import type { Area, CityConfig, Point, Railway, Road, Station } from './types'
 import type { PolygonRegion } from './geometry'
 import type { LayoutFirstZone } from './layout-first-types'
 import type { TerrainModel } from './terrain'
-import { distance, distanceToSegment, pointInRegion, polygonOverlapsRegion, rectangle, segmentsCross } from './geometry'
+import { corridorPolygon, distance, distanceToSegment, pointInRegion, polygonOverlapsRegion, rectangle, segmentsCross } from './geometry'
 import { planRailway } from './railway-planner'
 import type { RailwayPlan } from './railway-planner'
 
@@ -45,6 +45,32 @@ interface StationCandidate {
 }
 const MINIMUM_SPACING = 650
 const nearestDistance = (point: Point, points: Point[]) => Math.min(...points.slice(1).map((b, i) => distanceToSegment(point, points[i]!, b)))
+
+/** A dry platform/forecourt pad is insufficient when a parallel creek traps
+ * the public gate against its own railway. Survey complete street-width exits
+ * on the acquired side, including all intervening water/reserved geometry.
+ * These are qualification corridors; the road stage must still connect the
+ * selected real gate to an existing public network and certify that access. */
+export function surveyLayoutStationApproaches(input: { gate: Point; outward: Point; railPoints: Point[]; terrain: RailTerrain; reserves: readonly PolygonRegion[]; width: number; height: number }): Point[][] {
+  const bearing = Math.atan2(input.outward.y, input.outward.x), result: Point[][] = [], streetWidth = 6, reach = 180
+  for (const degrees of [-60, -30, 0, 30, 60]) {
+    const angle = bearing + degrees * Math.PI / 180, along = { x: Math.cos(angle), y: Math.sin(angle) }, across = { x: -along.y, y: along.x }
+    const end = { x: input.gate.x + along.x * reach, y: input.gate.y + along.y * reach }, polygon = corridorPolygon(input.gate, end, streetWidth / 2)
+    if (input.reserves.some(region => polygonOverlapsRegion(polygon, region)) || input.terrain.areas.some(area => area.kind === 'water' && polygonOverlapsRegion(polygon, area))) continue
+    let valid = true, previousLevel: number | undefined
+    for (let step = 0; step <= reach && valid; step += 5) {
+      const center = { x: input.gate.x + along.x * step, y: input.gate.y + along.y * step }, level = input.terrain.elevation(center)
+      if (previousLevel !== undefined && Math.abs(level - previousLevel) / 5 > .13) { valid = false; break }
+      previousLevel = level
+      for (const offset of [-streetWidth / 2, 0, streetWidth / 2]) {
+        const point = { x: center.x + across.x * offset, y: center.y + across.y * offset }
+        if (point.x < 4 || point.y < 4 || point.x > input.width - 4 || point.y > input.height - 4 || input.terrain.waterAt(point) || input.terrain.slope(point) > .13 || nearestDistance(point, input.railPoints) < 7) { valid = false; break }
+      }
+    }
+    if (valid) result.push([input.gate, end])
+  }
+  return result
+}
 
 /** One physically surveyed regional line. Stations have dry, reserved land and
  * a street-facing entrance; their road approaches are constructed by the next
@@ -106,7 +132,12 @@ export function surveyLayoutFirstRail(input: LayoutFirstRailInput): LayoutFirstR
       // sometimes leaving the entrance across the track from every old street.
       // Prefer the town-facing forecourt before any new crossing is proposed.
       const townApproach = distance(gate, input.center)
-      candidates.push({ point, along: chain[i]!, tangent, building, forecourt, entrance, gate, score: targetDistance + townApproach * .5 + Math.min(1500, roadDistance) * .4 + input.terrain.slope(point) * 2000 })
+      const approaches = surveyLayoutStationApproaches({ gate, outward: { x: (gate.x - point.x) / 47, y: (gate.y - point.y) / 47 }, railPoints: plan.points, terrain: input.terrain, reserves: input.reserves, width: input.width, height: input.height })
+      // Prefer a broad usable side without banning a confined mountain or
+      // valley station whose single narrower access can still be certified by
+      // the road stage. The acquired pad/ROW checks above remain mandatory.
+      const confinement = (5 - approaches.length) * 180
+      candidates.push({ point, along: chain[i]!, tangent, building, forecourt, entrance, gate, score: targetDistance + townApproach * .5 + confinement + Math.min(1500, roadDistance) * .4 + input.terrain.slope(point) * 2000 })
     }
   }
   const count = Math.min(requested, Math.max(1, Math.floor((length - 320) / MINIMUM_SPACING) + 1))

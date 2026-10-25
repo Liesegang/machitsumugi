@@ -341,6 +341,7 @@ export function validateProject(data: unknown): Project {
   })
   const inputLayers = object(input.layers, 'レイヤー')
   const layers = Object.fromEntries(LAYER_KEYS.map(key => [key, boolean(inputLayers[key], `レイヤー「${key}」`)])) as unknown as LayerSettings
+  if (inputLayers.districts !== undefined) layers.districts = boolean(inputLayers.districts, 'レイヤー「districts」')
   const factor = config.mapSize === 'large' ? 3 : config.mapSize === 'medium' ? 2 : 1
   const edits = input.edits === undefined ? undefined : validateMapEdits(input.edits, snapshot?.width ?? 4000 * factor, snapshot?.height ?? 3000 * factor)
   return { version: 2, config, annotations, layers, style: choice(input.style, STYLES, '地図の配色'), ...(snapshot ? { snapshot } : {}), ...(edits === undefined ? {} : { edits }) }

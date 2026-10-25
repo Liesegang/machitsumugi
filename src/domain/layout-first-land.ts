@@ -1,15 +1,20 @@
-import type { Building, BuildingState, CityConfig, GrowthEvent, Parcel, Point, Road, TimelineVersion } from './types'
+import type { Building, BuildingState, CityConfig, GrowthEvent, Parcel, Point, Road, Station, TimelineVersion } from './types'
 import type { Bounds, PolygonRegion } from './geometry'
 import type { LayoutFirstZone } from './layout-first-types'
 import { boundsOf, corridorPolygon, distance, distanceToSegment, overlaps, pointInRegion, polygonArea, polygonOverlapsRegion, polygonsOverlap, projectPoint, seededRandom, segmentsCross } from './geometry'
 import { buildingServiceYears } from './building-lifecycle'
 import { surveyDevelopmentSite } from './development-terrain'
 import { controlledRoad } from './road-graph'
+import { buildLayoutFirstLandContext } from './layout-first-land-zoning'
+import type { LayoutLandBlock, LayoutLandFrontage } from './layout-first-land-zoning'
 
 export interface LayoutFirstLandInput {
   config: CityConfig
   roads: Road[]
   zones: LayoutFirstZone[]
+  center?: Point
+  stations?: Pick<Station, 'point' | 'entrance' | 'builtYear'>[]
+  blocks?: LayoutLandBlock[]
   reserves?: PolygonRegion[]
   /** Complete physical terrain/water test. Ordinary road ROW is checked here. */
   canPlace(polygon: Point[]): boolean
@@ -32,7 +37,7 @@ function index<T extends Indexed>(cellSize = 80) {
 }
 interface RoadSegment extends Indexed { road: Road; a: Point; b: Point; polygon: Point[] }
 interface Holding { polygon: Point[]; entrance: Point; access: Point[]; body: [number, number, number, number]; rear: boolean }
-interface Lot extends Holding { road: Road; zone: LayoutFirstZone; origin: Point; tangent: Point; normal: Point; initialYear: number; id: string; form: 'house' | 'shop' | 'apartment' | 'workshop' }
+interface Lot extends Holding { road: Road; zone: LayoutFirstZone; origin: Point; tangent: Point; normal: Point; initialYear: number; id: string; form: 'house' | 'shop' | 'apartment' | 'workshop'; stockProfile: LayoutLandFrontage['stockProfile']; formAvailableYear: number; minimumFloors: number; maximumFloors: number }
 const EPSILON = 1e-6
 const clamp = (value: number, minimum: number, maximum: number) => Math.max(minimum, Math.min(maximum, value))
 const nearBoundary = (point: Point, polygon: Point[]) => polygon.some((p, i) => distanceToSegment(point, p, polygon[(i + 1) % polygon.length]!) < .001)
@@ -107,7 +112,10 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
   const metrics: LayoutFirstLandMetrics = { candidates: 0, accepted: 0, rearTitles: 0, replacements: 0,
     rejected: { outsideZone: 0, terrain: 0, reserve: 0, road: 0, title: 0, formation: 0, access: 0, density: 0 },
     titleArea: 0, footprintArea: 0, grossFloorArea: 0, zoneArea: input.zones.reduce((sum, zone) => sum + polygonArea(zone.polygon) - (zone.holes ?? []).reduce((n, hole) => n + polygonArea(hole), 0), 0), developedFraction: 0 }
-  const roads = input.roads.filter(road => road.points.length >= 2).sort((a, b) => (a.builtYear ?? 1650) - (b.builtYear ?? 1650) || a.id.localeCompare(b.id))
+  // Same-phase major frontages acquire their holdings before side streets can
+  // consume the entire block depth; dates still govern every accepted title.
+  const roads = input.roads.filter(road => road.points.length >= 2).sort((a, b) => (a.builtYear ?? 1650) - (b.builtYear ?? 1650) || b.width - a.width || a.id.localeCompare(b.id))
+  const landContext = buildLayoutFirstLandContext({ roads, center: input.center, stations: input.stations, blocks: input.blocks, settlement: config.settlement })
   const roadIndex = index<RoadSegment>(), reserveIndex = index<Indexed & PolygonRegion>(), titles = index<Indexed & { polygon: Point[] }>()
   for (const road of roads) for (let i = 1; i < road.points.length; i++) {
     const a = road.points[i - 1]!, b = road.points[i]!
@@ -134,11 +142,17 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     const modern = year >= 1955, apartment = lot.form === 'apartment' && modern
     const local = layoutFirstBuildingFootprint({ body: lot.body, form: lot.form, rear: lot.rear, year, random })
     const polygon = local.map(point => world(point.x, point.y)), front = local[0]!.y, rear = local[2]!.y
+    if (apartment && rear - front < 12 - EPSILON) return null
     if (polygonArea(polygon) < 25 || !insideRegion(polygon, { polygon: lot.polygon }) || !input.canPlace(polygon)) return null
     const survey = surveyDevelopmentSite({ slope: input.slope, elevation: input.elevation }, world((u0 + u1) / 2, (front + rear) / 2), polygon)
     if (!survey.viable) return null
-    const maximum = Math.max(1, Math.min(lot.zone.maximumFloors, survey.maximumFloors))
-    const height = apartment ? Math.min(maximum, 3 + Math.floor(random() * Math.max(1, maximum - 2))) : lot.form === 'workshop' ? Math.min(2, maximum) : Math.min(maximum, year < 1900 ? 1 + Number(random() < .4) : 2 + Number(modern && lot.form === 'shop' && random() < .35))
+    // The old district's two-storey limit describes its historical frames.
+    // A real modern station/centre route can support renewal above that limit;
+    // the building pad's surveyed ground limit still applies in every year.
+    const modernContext = modern && lot.stockProfile !== 'lowrise' && year >= lot.formAvailableYear
+    const permitted = modernContext ? lot.maximumFloors : Math.min(lot.zone.maximumFloors, lot.maximumFloors, modern ? Infinity : 2)
+    const maximum = Math.max(1, Math.min(permitted, survey.maximumFloors)), minimum = Math.min(maximum, lot.minimumFloors)
+    const height = modernContext ? minimum + Math.floor(random() * (maximum - minimum + 1)) : lot.form === 'workshop' ? Math.min(2, maximum) : Math.min(maximum, year < 1900 ? 1 + Number(random() < .4) : 2 + Number(modern && lot.form === 'shop' && random() < .35))
     const kind: Building['kind'] = lot.form === 'workshop' ? 'industrial' : lot.form === 'shop' ? 'commercial' : 'residential'
     return { id: `layout-building-${lot.id}-${year}-${serial}`, polygon, kind, height, parcelId: lot.id, builtYear: year } satisfies Building
   }
@@ -210,25 +224,28 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     // A collector may contain one bridge span. Its dry approaches still have
     // frontage; the exact water/pad/access tests reject only the wet portions.
     if (road.role === 'bridge' || controlledRoad(road) || (road.level ?? 0) !== 0 || road.role === 'farm' || (road.builtYear ?? 1650) > endYear) continue
-    const length = road.points.slice(1).reduce((sum, point, i) => sum + distance(road.points[i]!, point), 0), random = seededRandom(`${config.seed}:layout-titles:${road.id}`)
-    let chainage = 5 + random() * 5, serial = 0
-    while (chainage < length - 5) {
-      const sample = roadAt(road, chainage), nearbyZones = input.zones.filter(zone => contains(sample.point, zone)).sort((a, b) => zoneScore(a, sample.point) - zoneScore(b, sample.point))
-      const primary = nearbyZones[0]
-      const broad = primary?.kind === 'industrial' || primary?.kind === 'apartment' || primary?.kind === 'station' && random() < .45
-      const width = broad ? 28 + random() * 24 : primary?.kind === 'historic' ? 9 + random() * 10 : 11 + random() * 10
-      chainage += width / 2
-      if (chainage + width / 2 > length - 4) break
-      const { point: origin, tangent } = roadAt(road, chainage)
-      for (const side of [-1, 1]) {
+    const length = road.points.slice(1).reduce((sum, point, i) => sum + distance(road.points[i]!, point), 0)
+    // Survey the two frontages independently: a station bar on one block face
+    // must not make a broad detached house on the opposite neighbourhood edge.
+    for (const side of [-1, 1]) {
+      const random = seededRandom(`${config.seed}:layout-titles:${road.id}:${side}`)
+      let chainage = 5 + random() * 5, serial = 0
+      while (chainage < length - 5) {
+        const sample = roadAt(road, chainage), nearbyZones = input.zones.filter(zone => contains(sample.point, zone)).sort((a, b) => zoneScore(a, sample.point) - zoneScore(b, sample.point))
+        const primary = nearbyZones[0]
+        const sampleNormal = { x: -sample.tangent.y * side, y: sample.tangent.x * side }
+        const frontage = landContext.at(road, sample.point, localPoint(sample.point, sample.tangent, sampleNormal, 0, road.width / 2 + 9))
+        const broad = primary?.kind === 'industrial' || frontage.form === 'apartment'
+        const width = broad ? 30 + random() * 18 : frontage.stockProfile === 'main-street' ? 19 + random() * 12 : primary?.kind === 'historic' ? 9 + random() * 10 : 11 + random() * 10
+        chainage += width / 2
+        if (chainage + width / 2 > length - 4) break
+        const { point: origin, tangent } = roadAt(road, chainage)
         const normal = { x: -tangent.y * side, y: tangent.x * side }, world = (u: number, v: number) => localPoint(origin, tangent, normal, u, v)
         const probe = world(0, road.width / 2 + 9)
         const zone = input.zones.filter(z => contains(probe, z)).sort((a, b) => zoneScore(a, probe) - zoneScore(b, probe))[0]
         if (!zone || zone.density <= 0) { metrics.rejected.outsideZone++; continue }
         const lotRandom = seededRandom(`${config.seed}:layout-title:${road.id}:${serial}:${side}`)
         if (lotRandom() > zone.density) { metrics.rejected.density++; continue }
-        const initialYear = Math.max(1650, road.builtYear ?? 1650, zone.builtYear)
-        if (initialYear > endYear) continue
         const v0 = road.width / 2 + .85, u0 = -width / 2 + .35, u1 = width / 2 - .35
         const search = boundsOf([world(u0, 0), world(u1, 0), world(u0, 175), world(u1, 175)])
         let depth = zone.kind === 'industrial' ? 55 : zone.kind === 'rural' ? 30 : 43
@@ -239,13 +256,16 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
           for (const offset of [u0, 0, u1]) nearest = Math.min(nearest, rayDistance(world(offset, 0), normal, segment) - segment.road.width / 2)
         }
         if (Number.isFinite(nearest)) depth = clamp((nearest - v0) / 2 - .65, 16, 82)
-        const apartment = zone.kind === 'apartment' || zone.kind === 'station' && width >= 27 || zone.kind === 'residential' && width >= 27 && lotRandom() < .45
-        const form: Lot['form'] = zone.kind === 'industrial' ? 'workshop' : apartment ? 'apartment' : zone.kind === 'historic' && lotRandom() < .45 || zone.kind === 'station' && lotRandom() < .4 ? 'shop' : 'house'
+        const form: Lot['form'] = zone.kind === 'industrial' ? 'workshop' : frontage.form === 'apartment' && width >= 27 ? 'apartment' : frontage.form === 'shop' || zone.kind === 'historic' && lotRandom() < .45 ? 'shop' : 'house'
+        const stockProfile = form === 'workshop' ? 'lowrise' : frontage.stockProfile
+        const contextualForm = form !== 'house' && form === frontage.form || stockProfile !== 'lowrise'
+        const initialYear = Math.max(1650, road.builtYear ?? 1650, zone.builtYear, contextualForm ? frontage.formAvailableYear : 1650)
+        if (initialYear > endYear) continue
         const attachment = (u: number) => {
           const target = world(u, 0)
           return road.points.slice(1).map((p, i) => projectPoint(target, road.points[i]!, p)).sort((a, b) => distance(target, a) - distance(target, b))[0]!
         }
-        const base = { road, zone, origin, tangent, normal, initialYear, form }
+        const base = { road, zone, origin, tangent, normal, initialYear, form, stockProfile, formAvailableYear: frontage.formAvailableYear, minimumFloors: form === 'workshop' ? 1 : frontage.minimumFloors, maximumFloors: form === 'workshop' ? 2 : frontage.maximumFloors }
         const id = `${road.id}-${serial}-${side > 0 ? 'left' : 'right'}`
         let placed = false
         if (form === 'house' && depth >= 46 && width >= 15) {
@@ -261,8 +281,8 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
           const entrance = world(0, v0), holding: Holding = { polygon: rectangleAt(world, u0, u1, v0, v0 + d), entrance, access: [attachment(0), entrance], body: [u0, u1, v0, v0 + d], rear: false }
           if (accept({ ...base, ...holding, id: `layout-parcel-${id}` })) break
         }
+        chainage += width / 2 + .45; serial++
       }
-      chainage += width / 2 + .45; serial++
     }
   }
   metrics.developedFraction = metrics.zoneArea > 0 ? metrics.titleArea / metrics.zoneArea : 0
