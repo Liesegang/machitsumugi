@@ -8,6 +8,7 @@ import { sliceCityAtYear } from './timeline'
 import { parseProject } from './project'
 import { controlledRoad, extractStreetBlocks, materializeRoadJunctions } from './road-graph'
 import { featureHistory } from '../map/inspect'
+import { certifyLayoutAccess } from './layout-first-access'
 
 /** An explicit surveyed synthetic plain/coast. Engineering and composition are
  * production modules; only geological erosion is replaced by this known DEM. */
@@ -34,6 +35,19 @@ let inland: CityMap, coast: CityMap
 let inlandSourceCalls = 0, coastSourceCalls = 0
 const inlandSource = (input: TerrainModelInput) => { inlandSourceCalls++; return surveyedTerrain(input) }
 const coastSource = (input: TerrainModelInput) => { coastSourceCalls++; return surveyedTerrain(input, true) }
+const coastalConfig: CityConfig = { ...config, seed: 'layout-coastal-civics-physical', type: 'port', terrain: 'coast', railway: true, facilities: ['port', 'school', 'hospital', 'shrine', 'park', 'shop'] }
+
+function generateIntegrationFixture(label: string, fixtureConfig: CityConfig, source: (input: TerrainModelInput) => TerrainModel) {
+  const started = performance.now()
+  let previous = started
+  const map = generateLayoutCity(fixtureConfig, phase => {
+    const now = performance.now()
+    console.info(`[layout integration ${label}] ${((now - started) / 1000).toFixed(2)}s (+${((now - previous) / 1000).toFixed(2)}s): ${phase}`)
+    previous = now
+  }, undefined, source)
+  console.info(`[layout integration ${label}] complete in ${((performance.now() - started) / 1000).toFixed(2)}s`)
+  return map
+}
 
 it('rejects a requested port on an entirely dry inland survey instead of reporting partial civic success', () => {
   let sourceCalls = 0
@@ -65,8 +79,11 @@ function physicalRoadComponents(roads: Road[]) {
 }
 
 describe('layout-first composed city integration on a known surveyed DEM', () => {
-  beforeAll(() => { inland = generateLayoutCity(config, undefined, undefined, inlandSource) }, 25000)
-  beforeAll(() => { coast = generateLayoutCity({ ...config, seed: 'layout-coastal-civics-physical', type: 'port', terrain: 'coast', railway: true, facilities: ['port', 'school', 'hospital', 'shrine', 'park', 'shop'] }, undefined, undefined, coastSource) }, 25000)
+  // Measured without native contention: inland51.39s, coast55.22s (roads and
+  // land composition dominate). Keep the bounded60s per-fixture allowance
+  // and stage timings; neither global limits nor feature checks are relaxed.
+  beforeAll(() => { inland = generateIntegrationFixture('inland', config, inlandSource) }, 60000)
+  beforeAll(() => { coast = generateIntegrationFixture('coast', coastalConfig, coastSource) }, 60000)
 
   it('reserves every requested civic programme before household titles and retains a street of separate shop buildings', () => {
     expect(inland.unplacedFacilities, JSON.stringify(inland.unplacedFacilities)).toEqual([])
@@ -95,9 +112,28 @@ describe('layout-first composed city integration on a known surveyed DEM', () =>
       // report retains the actual faces supplied to land composition.
       expect(report.composition.streetBlocks).toBeGreaterThan(30)
       expect(report.composition.streetBlocks).toBe(extractStreetBlocks(map.roads).length)
-      expect(map.generatorVersion).toBe('2.6.0-layout.4')
+      expect(map.generatorVersion).toBe(LAYOUT_GENERATOR_VERSION)
       expect(map.areas.some(area => area.id.startsWith('layout-station-zone-'))).toBe(false)
     }
+  })
+  it('keeps both coastal station gates exactly on the dated public network and facing the town', () => {
+    // Consolidates the former rail-test4×3km road fixture: same seed,2m dry
+    // land, y2350 shore, density70, forest60,2stations and civic programme.
+    // The city name and explicit UI defaults differ only in labels/options;
+    // forest is excluded from the rail planning water/civic-area environment.
+    expect([coast.width, coast.height]).toEqual([4000, 3000])
+    expect(coast.stations).toHaveLength(2)
+    const briefCenter = layoutGenerationReport(coast)!.planningZones.find(zone => zone.id === 'layout-zone-1')!.center
+    const targets: { id: string; point: Point; builtYear: number }[] = []
+    for (const station of coast.stations) {
+      expect((station.entrance!.x - station.point.x) * (briefCenter.x - station.point.x) + (station.entrance!.y - station.point.y) * (briefCenter.y - station.point.y)).toBeGreaterThan(0)
+      expect(station.builtYear).toBe(1900)
+      const approach = coast.roads.find(road => road.id === station.id.replace('station-', 'station-access-'))!
+      expect(approach, `${station.id}: actual station entrance path`).toBeTruthy()
+      expect(approach.builtYear).toBe(station.builtYear)
+      targets.push({ id: `${station.id}-public-gate`, point: approach.points[0]!, builtYear: station.builtYear! }, { id: `${station.id}-door`, point: station.entrance!, builtYear: station.builtYear! })
+    }
+    expect(certifyLayoutAccess({ width: coast.width, height: coast.height, roads: coast.roads, targets })).toEqual({ unserved: [], certified: 4 })
   })
   it('places a genuine dry coastal port and station grounds while keeping all ordinary buildings off water, civic reserves and railway corridors', () => {
     expect(coast.unplacedFacilities, JSON.stringify(coast.unplacedFacilities)).toEqual([])

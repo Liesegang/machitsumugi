@@ -2,11 +2,6 @@ import { describe, expect, it } from 'vitest'
 import { distance, distanceToSegment, pointInPolygon, polygonOverlapsRegion, rectangle } from './geometry'
 import { surveyLayoutFirstRail, surveyLayoutStationApproaches } from './layout-first-rail'
 import type { LayoutFirstRailInput } from './layout-first-rail'
-import { planLayoutFirstStationZones, planLayoutFirstZones } from './layout-first-zones'
-import { reserveLayoutFirstCivics } from './layout-first-civic'
-import { buildLayoutFirstRoads } from './layout-first-roads'
-import { materializeRoadJunctions } from './road-graph'
-import { certifyLayoutAccess } from './layout-first-access'
 
 function fixture(): LayoutFirstRailInput {
   return { config: { name: '試験市', seed: 'layout-rail-fixture', type: 'post', terrain: 'plain', density: 65, forest: 0, railway: true, stations: 2, arterial: true, facilities: [] },
@@ -98,25 +93,7 @@ describe('layout-first regional railway', () => {
     expect(result.stationGrounds.every(ground => ground.polygon.every(p => !input.terrain.waterAt(p)))).toBe(true)
   }, 15_000)
 
-  it('connects coastal station public gates exactly to the dated external street network', () => {
-    const base = fixture(), width = 4000, height = 3000
-    const config = { ...base.config, seed: 'layout-coastal-civics-physical', type: 'port' as const, terrain: 'coast' as const, density: 70, forest: 60, settlement: 'regional-city' as const, facilities: ['port', 'school', 'hospital', 'shrine', 'park', 'shop'] as const }
-    const waterAt = (p: { x: number; y: number }) => p.y >= 2350
-    const elevation = (p: { x: number; y: number }) => waterAt(p) ? 0 : 2, slope = () => 0
-    const terrain = { areas: [{ id: 'sea', kind: 'water' as const, polygon: rectangle(0, 2350, width, 650) }], elevation, slope, waterAt, channelAt: () => null, bridgeSites: [], cityOrigin: { x: 2000, y: 1200 },
-      continuationTerrain: { bounds: { minX: -500, minY: -500, maxX: 4500, maxY: 3500 }, contains: (p: { x: number; y: number }) => p.x >= -500 && p.y >= -500 && p.x <= 4500 && p.y <= 3500, elevation, slope, waterAt, seaAt: waterAt } }
-    const input = { config: { ...config, facilities: [...config.facilities] }, width, height, terrain }
-    const brief = planLayoutFirstZones(input), civic = reserveLayoutFirstCivics({ ...input, ...brief })
-    const planningAreas = [...terrain.areas, ...civic.areas], planningTerrain = { ...terrain, areas: planningAreas }
-    const rail = surveyLayoutFirstRail({ ...input, terrain: planningTerrain, ...brief, reserves: civic.reserves })
-    expect(rail.stations).toHaveLength(2)
-    for (const station of rail.stations) expect((station.entrance!.x - station.point.x) * (brief.center.x - station.point.x) + (station.entrance!.y - station.point.y) * (brief.center.y - station.point.y)).toBeGreaterThan(0)
-    const reserves = [...civic.reserves, ...rail.stationGrounds]
-    const stationZones = planLayoutFirstStationZones({ ...input, ...brief, stations: rail.stations, gates: rail.accessTargets })
-    const transport = buildLayoutFirstRoads({ seed: config.seed, center: brief.center, settlement: config.settlement, density: config.density, arterial: true, zones: [...brief.zones, ...stationZones], railways: rail.railways, reservedRegions: reserves, accessTargets: [...civic.accessTargets, ...rail.accessTargets],
-      environment: { width, height, core: null, areas: planningAreas, terrain: planningTerrain, bridgeSites: [], exactLandCost: true, landCost: p => reserves.some(region => pointInPolygon(p, region.polygon)) ? Infinity : 0 } })
-    const roads = materializeRoadJunctions([...transport.roads, ...rail.stationPaths])
-    const access = certifyLayoutAccess({ width, height, roads, targets: rail.accessTargets })
-    expect(access.unserved).toEqual([])
-  }, 20_000)
+  // Coastal station facing/exact dated public-gate checks share the existing
+  // full coastal city fixture in layout-first-generator.test.ts. Rail-only
+  // engineering/forecourt/water/bridge assertions above remain independent.
 })
