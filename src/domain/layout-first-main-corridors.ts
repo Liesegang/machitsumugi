@@ -1,6 +1,6 @@
 import type { Point, Railway } from './types'
 import type { LayoutFirstZone } from './layout-first-types'
-import type { PlannedRoute, PlanningEnvironment } from './road-planner'
+import type { PlannedRoute, PlanningEnvironment, PlanningOptions } from './road-planner'
 import { RegionalRoadPlanner } from './regional-road-planner'
 import { alignmentDiagnostics } from './road-alignment'
 import { distance, distanceToSegment } from './geometry'
@@ -17,6 +17,41 @@ export interface LayoutMainCorridorInput {
   zones: readonly LayoutFirstZone[]
   railways: Railway[]
   signal?: AbortSignal
+}
+type MainAlignmentPlanner = Pick<RegionalRoadPlanner, 'plan' | 'validate'>
+
+const angleDifference = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle))
+
+/** Both halves receive a common centre tangent before either is surveyed.
+ * A cheapest western approach cannot impose an impossible eastern departure. */
+export function layoutMainCorridorTangents(start: Point, center: Point, goal: Point): number[] {
+  const incoming = Math.atan2(center.y - start.y, center.x - start.x), outgoing = Math.atan2(goal.y - center.y, goal.x - center.x)
+  const bearing = incoming + angleDifference(outgoing - incoming) / 2
+  return [0, -Math.PI / 6, Math.PI / 6].map(offset => angleDifference(bearing + offset))
+}
+
+/** Joint tangent proposals are finite. Every leg uses the ordinary physical
+ * planner, and the full assembled pavement must retain its highway radius. */
+export function planLayoutMainCorridorAlignment(planner: MainAlignmentPlanner, start: Point, center: Point, goal: Point, width: number): PlannedRoute | null {
+  const leg = (a: Point, b: Point, heading: Pick<PlanningOptions, 'startHeading' | 'endHeading'>) => {
+    const options: PlanningOptions = { role: 'highway', width, allowBridge: true, maximumGrade: .09, maxNodes: 16000, ...heading }
+    // Geographic distance can understate a necessary tributary detour. The
+    // single retry raises only the finite search allowance, never a guard.
+    return planner.plan(a, b, { ...options, maxNodesPerKm: 1800 }) ?? planner.plan(a, b, options)
+  }
+  for (const tangent of layoutMainCorridorTangents(start, center, goal)) {
+    const first = leg(start, center, { endHeading: tangent })
+    if (!first) continue
+    const second = leg(center, goal, { startHeading: tangent })
+    if (!second || distance(first.points.at(-1)!, center) > 1e-7 || distance(second.points[0]!, center) > 1e-7) continue
+    const points = [...first.points, ...second.points.slice(1)], bridgeLength = first.bridgeLength + second.bridgeLength
+    if (first.length + second.length > distance(start, goal) * 1.8 || alignmentDiagnostics(points).minimumRadius < 85 || !planner.validate(points, width, bridgeLength > 0)) continue
+    const surveyedBridgeSpans = [...(first.surveyedBridgeSpans ?? []), ...(second.surveyedBridgeSpans ?? [])]
+    // Preserve actual surveyed bridge costs/decks rather than re-costing their
+    // joined samples as an ordinary dry route or charging the crossings twice.
+    return { points, length: first.length + second.length, cost: first.cost + second.cost, bridgeLength, method: bridgeLength > 0 ? 'bridge-project' : 'heading-search', ...(surveyedBridgeSpans.length ? { surveyedBridgeSpans } : {}) }
+  }
+  return null
 }
 
 /** Nearby tributaries are different water barriers. Deduplicate alternatives
@@ -69,12 +104,8 @@ export function surveyLayoutMainCorridors(input: LayoutMainCorridorInput, adopt:
     const to = planner.boundaryPortals(center, { width: roadWidth, preferred: last, maxCandidates: 2 })
     const pairs = from.flatMap(start => to.map(goal => ({ start, goal, distance: distance(start, center) + distance(center, goal) }))).sort((a, b) => a.distance - b.distance).slice(0, 2)
     for (const { start, goal } of pairs) {
-        const options = { role: 'highway' as const, width: roadWidth, through: center, allowBridge: true, maximumGrade: .09, maxNodes: 16000 }
-        // A short geographic leg may still need a long dry detour around a
-        // tributary. Retry the same alignment once at the finite ceiling;
-        // neither the available land nor any physical guard changes.
-        const route = planner.plan(start, goal, { ...options, maxNodesPerKm: 1800 }) ?? planner.plan(start, goal, options)
-        if (!route || route.length > distance(start, goal) * 1.8 || alignmentDiagnostics(route.points).minimumRadius < 75 || !planner.validate(route.points, roadWidth, route.bridgeLength > 0)) continue
+        const route = planLayoutMainCorridorAlignment(planner, start, center, goal, roadWidth)
+        if (!route) continue
         const proposal = { id: `layout-main-corridor-${index + 1}`, route, width: roadWidth, builtYear: 1650 }
         if (!adopt(proposal)) continue
         result.push(proposal); break
