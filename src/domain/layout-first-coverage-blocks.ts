@@ -3,6 +3,8 @@ import type { MultiPolygon } from 'polygon-clipping'
 import type { Point, Road } from './types'
 import type { PolygonRegion } from './geometry'
 import { boundsOf, corridorPolygon, distance, distanceToSegment, overlaps, pointInRegion, polygonArea, polygonOverlapsRegion, projectPoint, regionArea } from './geometry'
+import { buildLayoutCoveragePriority } from './layout-first-coverage-priority'
+import type { LayoutCoveragePrioritySite } from './layout-first-coverage-priority'
 
 export interface LayoutCoverageMask { regions: PolygonRegion[]; area: number; excludedRegions?: PolygonRegion[] }
 export interface LayoutCoverageAnchor { point: Point; roadId: string; builtYear: number }
@@ -78,11 +80,12 @@ export function proposeLayoutCoverageBlocks(input: {
   maximumFieldCells?: number
   maximumProposals?: number
   maximumFaceArea?: number
+  prioritySites?: readonly LayoutCoveragePrioritySite[]
 }) {
   const coverage = measureLayoutStreetCoverage(input), proposals: LayoutCoverageProposal[] = []
   const maximumProposals = Math.min(16, Math.max(0, Math.floor(input.maximumProposals ?? 8)))
   const maximumCells = Math.min(20000, Math.max(16, Math.floor(input.maximumFieldCells ?? 12000)))
-  const diagnostics = { fieldCellSize: 0, fieldCells: 0, gaps: coverage.uncoveredRegions.length, inspectedGaps: 0, candidatePairs: 0, uncoveredArea: coverage.uncoveredArea }
+  const diagnostics = { fieldCellSize: 0, fieldCells: 0, gaps: coverage.uncoveredRegions.length, inspectedGaps: 0, candidatePairs: 0, uncoveredArea: coverage.uncoveredArea, activePrioritySites: 0, priorityGaps: 0 }
   if (!coverage.uncoveredRegions.length || !maximumProposals) return { proposals, diagnostics }
   const publicRoads = input.roads.filter(road => !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && (road.level ?? 0) === 0 && road.width >= 4.6 && road.points.length >= 2 && (road.builtYear ?? 1650) <= input.builtYear)
   const segments: StreetSegment[] = [], bins = new Map<string, StreetSegment[]>()
@@ -116,7 +119,15 @@ export function proposeLayoutCoverageBlocks(input: {
   let step = Math.max(50, input.cellSize ?? 100), columns = Math.max(1, Math.ceil(spanX / step)), rows = Math.max(1, Math.ceil(spanY / step))
   while (columns * rows > maximumCells) { step *= Math.sqrt(columns * rows / maximumCells) * 1.001; columns = Math.max(1, Math.ceil(spanX / step)); rows = Math.max(1, Math.ceil(spanY / step)) }
   diagnostics.fieldCellSize = step; diagnostics.fieldCells = columns * rows
-  const gaps = coverage.uncoveredRegions.slice().sort((a, b) => regionArea(b) - regionArea(a)).slice(0, Math.min(4, maximumProposals))
+  const priority = buildLayoutCoveragePriority({ roads: publicRoads, sites: input.prioritySites ?? [], builtYear: input.builtYear, excluded: input.mask.excludedRegions ?? [] })
+  const byArea = coverage.uncoveredRegions.slice().sort((a, b) => regionArea(b) - regionArea(a))
+  const siteDistance = (region: PolygonRegion) => Math.min(Infinity, ...priority.sites.map(site => pointInRegion(site.point, region) ? 0 : Math.min(...[region.polygon, ...region.holes ?? []].flatMap(ring => ring.map((a, i) => distanceToSegment(site.point, a, ring[(i + 1) % ring.length]!))))))
+  const siteDistances = new Map(priority.sites.length ? byArea.map(region => [region, siteDistance(region)]) : [])
+  // Prioritize real acquired centres and station gates, while retaining one
+  // largest remaining fringe gap. This field still grants no street or lot.
+  const nearby = priority.sites.length ? byArea.filter(region => siteDistances.get(region)! <= 900).sort((a, b) => siteDistances.get(a)! - siteDistances.get(b)! || regionArea(b) - regionArea(a)).slice(0, 3) : []
+  diagnostics.activePrioritySites = priority.sites.length; diagnostics.priorityGaps = nearby.length
+  const gaps = [...nearby, ...byArea.filter(region => !nearby.includes(region))].slice(0, Math.min(4, maximumProposals))
   const gapBounds = gaps.map(region => boundsOf(region.polygon)), choices = gaps.map(() => [] as { point: Point; distance: number }[])
   for (let row = 0; row < rows; row++) for (let column = 0; column < columns; column++) {
     const point = { x: bounds.minX + (column + .5) * spanX / columns, y: bounds.minY + (row + .5) * spanY / rows }
@@ -130,11 +141,12 @@ export function proposeLayoutCoverageBlocks(input: {
   }
   for (let gap = 0; gap < gaps.length && proposals.length < maximumProposals; gap++) {
     diagnostics.inspectedGaps++
-    const ranked = choices[gap]!.sort((a, b) => b.distance - a.distance), best = ranked[0]
+    const urgent = priority.sites.length ? choices[gap]!.map(item => ({ ...item, walk: priority.distanceAt(item.point) })).filter(item => item.walk <= 900).sort((a, b) => b.distance / (1 + b.walk / 900) - a.distance / (1 + a.walk / 900)) : []
+    const ranked = urgent.length ? urgent : choices[gap]!.sort((a, b) => b.distance - a.distance), best = ranked[0]
     if (!best) continue
     const core = ranked.filter(item => item.distance >= best.distance * .9).slice(0, 7)
     const average = core.reduce((sum, item) => ({ x: sum.x + item.point.x / core.length, y: sum.y + item.point.y / core.length }), { x: 0, y: 0 })
-    const through = pointInRegion(average, gaps[gap]!) ? average : best.point
+    const through = pointInRegion(average, gaps[gap]!) && (!urgent.length || priority.distanceAt(average) <= 900) ? average : best.point
     const barriers = [...(input.mask.excludedRegions ?? []), ...(gaps[gap]!.holes ?? []).map(polygon => ({ polygon }))].map(region => ({ region, bounds: boundsOf(region.polygon) }))
     const clearGuide = (point: Point) => {
       const bounds = boundsOf([point, through]), corridor = corridorPolygon(point, through, .01)

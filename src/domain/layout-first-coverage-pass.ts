@@ -1,6 +1,7 @@
 import type { Point, Road } from './types'
 import type { LayoutCoverageMask, LayoutCoverageProposal } from './layout-first-coverage-blocks'
 import { measureLayoutStreetCoverage, proposeLayoutCoverageBlocks } from './layout-first-coverage-blocks'
+import type { LayoutCoveragePrioritySite } from './layout-first-coverage-priority'
 
 export interface LayoutCoveragePassNetwork { roads: readonly Road[]; faces: readonly Point[][] }
 export interface LayoutCoveragePassInput {
@@ -9,6 +10,7 @@ export interface LayoutCoveragePassInput {
   phase: 'before-fallback' | 'after-fallback'
   maximumAttempts: number
   cellSize: number
+  prioritySites?: readonly LayoutCoveragePrioritySite[]
   readNetwork: () => LayoutCoveragePassNetwork
   canAnchor: (point: Point) => boolean
   /** The integration owns the physical survey and atomic graph fork. It must
@@ -43,11 +45,13 @@ const gapRoundRobin = (proposals: LayoutCoverageProposal[]) => {
 export function runLayoutCoveragePass(input: LayoutCoveragePassInput) {
   const maximumAttempts = Math.max(0, Math.min(8, Math.floor(input.maximumAttempts)))
   let network = input.readNetwork(), coverage = measureLayoutStreetCoverage({ faces: network.faces, mask: input.mask })
-  const record = { builtYear: input.builtYear, phase: input.phase, before: coverage.coveredArea, after: coverage.coveredArea, attempted: 0, accepted: 0, proposalRounds: 0, coveredGain: 0, enclosedGain: 0 }
+  const record = { builtYear: input.builtYear, phase: input.phase, before: coverage.coveredArea, after: coverage.coveredArea, attempted: 0, accepted: 0, proposalRounds: 0, coveredGain: 0, enclosedGain: 0, prioritySites: 0, priorityGaps: 0 }
   const attempted = new Set<string>()
   while (record.attempted < maximumAttempts) {
-    const candidates = proposeLayoutCoverageBlocks({ roads: network.roads, faces: network.faces, mask: input.mask, builtYear: input.builtYear, canAnchor: input.canAnchor, cellSize: input.cellSize, maximumProposals: 8 })
+    const candidates = proposeLayoutCoverageBlocks({ roads: network.roads, faces: network.faces, mask: input.mask, builtYear: input.builtYear, canAnchor: input.canAnchor, cellSize: input.cellSize, maximumProposals: 8, prioritySites: input.prioritySites })
     record.proposalRounds++
+    record.prioritySites = Math.max(record.prioritySites, candidates.diagnostics.activePrioritySites)
+    record.priorityGaps = Math.max(record.priorityGaps, candidates.diagnostics.priorityGaps)
     let changed = false
     // Spend the small budget on one candidate in each gap before trying the
     // second pair in the same gap. One awkward largest gap cannot consume the

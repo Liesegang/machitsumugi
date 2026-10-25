@@ -12,6 +12,8 @@ import { RailwayRoadConstraints } from './railway-road-constraints'
 import { alignmentDiagnostics, tangentAlignment } from './road-alignment'
 import { adoptLayoutInfillZones, layoutStreetFaceCenter } from './layout-first-street-blocks'
 import { planLayoutStreetFabricSplit } from './layout-first-street-fabric'
+import { planLayoutRailServiceCut, splitLayoutRailServiceFace } from './layout-first-rail-service-cut'
+import type { RailServiceCut } from './layout-first-rail-service-cut'
 import { surveyLayoutMainCorridors } from './layout-first-main-corridors'
 import { layoutFrontageLoop } from './layout-first-frontage-loops'
 import { layoutNeighborhoodHasStreetFace, proposeLayoutNeighborhoodLinks } from './layout-first-neighborhood-links'
@@ -30,7 +32,8 @@ export interface LayoutRoadDiagnostics {
   surveyedBridges?: (SurveyedBridgeSpan & { roadId: string })[]
   boundaryAttempts?: { start: Point; portal: Point; route: boolean; finiteCost: boolean; reservations: boolean; railWidth: boolean; cost?: number; length?: number; milliseconds?: number; phase?: 'mesh-exit' }[]
   accessAttempts?: { id: string; start: Point; target: Point; route: boolean; reservations: boolean; railWidth: boolean }[]
-  coverage?: { builtYear: number; phase?: 'before-fallback' | 'after-fallback'; before: number; after: number; enclosedGain: number; coveredGain: number; streetLength: number; attempted: number; accepted: number; routeFailures: number; guardFailures: number; unchangedFaces: number; proposalRounds?: number; surveyAttempts?: { from: Point; to: Point; through: Point; attempts: LayoutCoverageSurveyAttempt[]; rejectedInput?: string }[] }[]
+  coverage?: { builtYear: number; phase?: 'before-fallback' | 'after-fallback'; before: number; after: number; enclosedGain: number; coveredGain: number; streetLength: number; attempted: number; accepted: number; routeFailures: number; guardFailures: number; unchangedFaces: number; proposalRounds?: number; prioritySites?: number; priorityGaps?: number; surveyAttempts?: { from: Point; to: Point; through: Point; attempts: LayoutCoverageSurveyAttempt[]; rejectedInput?: string }[] }[]
+  railServiceCuts?: { attempted: number; accepted: number; streetLength: number; trials: { center: Point; area: number; builtYear: number; adopted: boolean; postSurvey?: string; attempts: { railwayId: string; side: -1 | 1; offset: number; reason: string }[] }[] }
 }
 export interface LayoutRoadInput {
   environment: PlanningEnvironment; seed: string; center: Point
@@ -493,6 +496,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
   const coverageMasks = new Map(coverageYears.map(year => [year, createLayoutCoverageMask({ demandRegions: urban.filter(zone => zone.builtYear <= year), suitableRegions, excludedRegions })]))
   const coverageRecords: NonNullable<LayoutRoadDiagnostics['coverage']> = []
   diagnostics.coverage = coverageRecords
+  const coveragePrioritySites = [{ id: 'acquired-old-center', point: center, builtYear: 1650 }, ...accessTargets.filter(target => target.id.startsWith('station-access-'))]
   const runCoveragePhase = (phase: 'before-fallback' | 'after-fallback', maximumAttempts: number) => {
     for (const year of coverageYears) {
       check()
@@ -500,7 +504,7 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
       if (mask.area < 10000) continue
       const extra = { streetLength: 0, routeFailures: 0, guardFailures: 0, unchangedFaces: 0, surveyAttempts: [] as { from: Point; to: Point; through: Point; attempts: LayoutCoverageSurveyAttempt[]; rejectedInput?: string }[] }
       const isPublicContact = (anchor: LayoutCoverageAnchor, atYear: number) => graph.roads.some(road => road.id === anchor.roadId && road.builtYear <= atYear && road.width >= 4.6 && (road.level ?? 0) === 0 && !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && road.points.slice(1).some((point, i) => distance(anchor.point, projectOnRoadSegment(anchor.point, road.points[i]!, point).point) < 1e-7))
-      const pass = runLayoutCoveragePass({ builtYear: year, mask, phase, maximumAttempts, cellSize: fieldSize,
+      const pass = runLayoutCoveragePass({ builtYear: year, mask, phase, maximumAttempts, cellSize: fieldSize, prioritySites: coveragePrioritySites,
         readNetwork: () => { const roads = graph.roads.filter(road => road.builtYear <= year); return { roads, faces: extractStreetBlocks(roads) } },
         canAnchor: point => landAvailable(point) && planner.suitable(point, 8),
         tryAdoptWithFaceGain: (proposal, beforeFaces) => {
@@ -571,7 +575,8 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
   connectNeighbourhoodStreets()
   // Accepted fallback reaches now provide real contacts that the early survey
   // did not have. Recompute remaining dry demand after each adopted closure.
-  runCoveragePhase('after-fallback', 4)
+  const largeDenseCity = (input.settlement === 'metropolis' || input.settlement === 'regional-city') && (input.density ?? 65) >= 80 && width * height >= 60000000
+  runCoveragePhase('after-fallback', largeDenseCity ? 6 : 4)
 
   const radii = active.map(item => item.zone.radius).sort((a, b) => a - b)
   const corridorSpacing = Math.max(380, Math.min(900, (radii[Math.floor(radii.length / 2)] ?? 600) * .9))
@@ -607,18 +612,23 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
   // Subdivide the faces of accepted pavement, rather than drawing a second
   // theoretical parcel grid. Every new local street has TWO real perimeter
   // junctions. Failed surveys leave the original face intact, never a stub.
-  const pendingFaces = coarseFaces.map(polygon => ({ polygon, depth: 0 }))
+  // Descendants share the parent's service inventory: at most one accepted
+  // fallback on each real rail side, with ordinary mixed fabric tried first.
+  const serviceDiagnostics: NonNullable<LayoutRoadDiagnostics['railServiceCuts']> = { attempted: 0, accepted: 0, streetLength: 0, trials: [] }
+  diagnostics.railServiceCuts = serviceDiagnostics
+  const pendingFaces = coarseFaces.map(polygon => ({ polygon, depth: 0, serviceState: { usedSides: [] as Pick<RailServiceCut, 'railwayId' | 'side'>[] } }))
   for (let cursor = 0; cursor < pendingFaces.length; cursor++) {
     check()
-    const { polygon, depth } = pendingFaces[cursor]!
+    const { polygon, depth, serviceState } = pendingFaces[cursor]!
     if (depth >= 12) continue
     const middle = layoutStreetFaceCenter(polygon)
     const zone = closestZone(middle)
     if (!zone || !zones.some(candidate => pointInRegion(middle, candidate))) continue
     const frontages = polygon.flatMap((a, index) => {
       const b = polygon[(index + 1) % polygon.length]!, hit = graph.nearest(lerp(a, b, .5), .15)
-      return hit ? [{ a, b, roadId: hit.road.id, width: hit.road.width, builtYear: hit.road.builtYear }] : []
+      return hit ? [{ a, b, roadId: hit.road.id, width: hit.road.width, builtYear: hit.road.builtYear, role: hit.road.role, controlledAccess: hit.road.controlledAccess, level: hit.road.level }] : []
     })
+    let subdivided = false
     for (let attempt = 0; attempt < 4; attempt++) {
       const split = planLayoutStreetFabricSplit({ polygon, zone, seed: `${input.seed}:face:${cursor}:${attempt}`, depth, frontages, terrain: environment.terrain })
       if (!split) break
@@ -634,9 +644,36 @@ export function buildLayoutFirstRoads(input: LayoutRoadInput): LayoutRoadResult 
       if (!added) continue
       // Survey can insert extra junctions, but it cannot move the accepted
       // straight chord. Its exact two child faces remain the next briefs.
-      pendingFaces.push(...split.polygons.map(child => ({ polygon: child, depth: depth + 1 })))
+      pendingFaces.push(...split.polygons.map(child => ({ polygon: child, depth: depth + 1, serviceState })))
+      subdivided = true
       break
     }
+    if (subdivided || zone.kind === 'rural' || polygonArea(polygon) < 50000 || !railways.some(railway => railway.mode !== 'subway')) continue
+    const year = Math.max(zone.builtYear, ...frontages.map(frontage => frontage.builtYear)), serviceWidth = zone.kind === 'industrial' ? 7 : zone.kind === 'historic' ? 4.8 : 5.6
+    const service = planLayoutRailServiceCut({ polygon, frontages, railways, builtYear: year, width: serviceWidth, usedSides: serviceState.usedSides, planner,
+      rowAllows: avoidsReservations, elevation: environment.terrain?.elevation ?? (() => 0), canonicalize: points => canonicalSurvey(planner.cost(points, 'lane'), false) })
+    if (!service.attempts.length) continue
+    serviceDiagnostics.attempted += service.attempts.length; diagnostics.attempted += service.attempts.length
+    diagnostics.rejected += service.attempts.filter(attempt => attempt.reason !== 'accepted').length
+    const trial: NonNullable<LayoutRoadDiagnostics['railServiceCuts']>['trials'][number] = { center: middle, area: polygonArea(polygon), builtYear: year, adopted: false, attempts: service.attempts }
+    serviceDiagnostics.trials.push(trial)
+    const cut = service.cut
+    if (!cut) continue
+    const sameEraContact = (id: string, point: Point) => graph.roads.some(road => road.id === id && road.builtYear <= year && !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && (road.level ?? 0) === 0 && road.points.slice(1).some((b, i) => distance(projectOnRoadSegment(point, road.points[i]!, b).point, point) < 1e-7))
+    if (!sameEraContact(cut.fromRoadId, cut.points[0]!) || !sameEraContact(cut.toRoadId, cut.points.at(-1)!)) { trial.postSurvey = 'contact'; diagnostics.rejected++; continue }
+    // Stage normalization without extracting every graph face after each cut.
+    // Its exact final path must partition the current parent before commit.
+    const staged = graph.fork(), proposed = staged.add(cut.points, { id: 'rail-service-trial', kind: 'local', role: 'lane', width: cut.width, builtYear: year, phase: 'spatial-layout', reason: 'rail-side service trial', constructionCost: 0 })
+    const children = proposed && splitLayoutRailServiceFace(polygon, proposed.points)
+    if (!proposed || !children) { trial.postSurvey = 'partition'; diagnostics.rejected++; continue }
+    if (!planner.validate(proposed.points, cut.width) || !avoidsReservations(proposed.points, cut.width) || !planner.railwayWidthAllows(proposed.points, .01, cut.width, 'lane') || alignmentDiagnostics(proposed.points).minimumRadius < 50 - 1e-6 || environment.terrain && !surveyedRoadGradeAllowed({ points: proposed.points }, .13, environment.terrain.elevation)) { trial.postSurvey = 'guard'; diagnostics.rejected++; continue }
+    const added = accept(planner.cost(proposed.points, 'lane'), 'lane', cut.width, year, '実線路から離して周囲の公道二端を結ぶ生活道路')
+    if (!added) { trial.postSurvey = 'accept'; continue }
+    const actualChildren = splitLayoutRailServiceFace(polygon, added.points)
+    if (!actualChildren) throw new Error(`Layout rail-side street partition failed: ${added.id}`)
+    trial.adopted = true; serviceDiagnostics.accepted++; serviceDiagnostics.streetLength += roadLength(added.points)
+    serviceState.usedSides.push({ railwayId: cut.railwayId, side: cut.side })
+    pendingFaces.push(...actualChildren.map(child => ({ polygon: child, depth: depth + 1, serviceState })))
   }
 
   // A same-era town street can provide a better, shorter approach around a

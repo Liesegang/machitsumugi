@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RoadPlanner } from './road-planner'
 import type { Area, Point } from './types'
-import { alignmentDiagnostics } from './road-alignment'
+import { alignmentDiagnostics, splineAlignment } from './road-alignment'
 import { PlanarRoadGraph } from './road-graph'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { layoutMainRoadEfficiency } from './layout-first-main-corridors'
@@ -10,6 +10,26 @@ const water: Area = { id: 'river', kind: 'water', polygon: [{ x: 480, y: 0 }, { 
 const river = (p: Point) => p.x >= 480 && p.x <= 520
 
 describe('terrain route planning', () => {
+  it('lets a physically valid broad corridor survive an illegal shallow railway connector', () => {
+    const start = { x: 100, y: 700 }, goal = { x: 3000, y: 700 }, planner = new RoadPlanner({ width: 3200, height: 1400, core: null, areas: [] })
+    planner.setRailwayCorridors([{ id: 'diagonal-rail', points: [{ x: 300, y: 450 }, { x: 2900, y: 950 }] }])
+    const points = splineAlignment([start, { x: 600, y: 700 }, { x: 1100, y: 1050 }, { x: 1600, y: 1000 }, { x: 2100, y: 450 }, { x: 2700, y: 700 }, goal], 5)
+    const broader = planner.cost(points, 'highway')
+    expect(Number.isFinite(planner.cost([start, goal], 'highway').cost)).toBe(false)
+    expect(Number.isFinite(broader.cost)).toBe(true)
+    expect(planner.validate(points, 12)).toBe(true)
+    expect(planner.railwayWidthAllows(points, .01, 12, 'highway')).toBe(true)
+    expect(alignmentDiagnostics(points).minimumRadius).toBeGreaterThanOrEqual(85)
+    // Isolate candidate selection from the geographic search. The fallback
+    // itself is real sampled pavement and passes the physical railway gates.
+    const corridor = vi.spyOn(planner as unknown as { corridor: () => typeof broader }, 'corridor').mockReturnValue(broader)
+    try {
+      const result = planner.plan(start, goal, { role: 'highway', width: 12, alignment: 'planned', startHeading: 0, endHeading: 0 })
+      expect(result).not.toBeNull()
+      expect(result!.points).toEqual(points)
+      expect(corridor).toHaveBeenCalledOnce()
+    } finally { corridor.mockRestore() }
+  })
   it('designs a broad efficient highway instead of following a cheap wavy field', () => {
     const start = { x: 100, y: 700 }, goal = { x: 3000, y: 700 }
     // This mock isolates alignment intent; it is not the native city's field.

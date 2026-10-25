@@ -410,6 +410,7 @@ export class RoadPlanner {
       if (diagnostics.minimumRadius < radius || diagnostics.length > direct * 2.1 || !this.validate(points, options.width)) continue
       if (!this.gradeAllowed(points, maximumGrade)) continue
       const route = this.cost(points, options.role)
+      if (!Number.isFinite(route.cost)) continue
       if (!plannedHighway && route.cost < straightCost * 1.08) return route
       if (!best || (plannedHighway ? route.length < best.length : route.cost < best.cost)) best = route
     }
@@ -607,7 +608,8 @@ export class RoadPlanner {
       const n = Math.ceil(direct.length / 12); direct.points = Array.from({ length: n + 1 }, (_, i) => lerp(start, goal, i / n)); direct.method = 'direct'; return direct
     }
     if (['highway', 'collector', 'expressway', 'ramp'].includes(options.role) || distance(start, goal) > 180) {
-      const connector = this.endpointConnector(start, goal, options)
+      const proposedConnector = this.endpointConnector(start, goal, options)
+      const connector = proposedConnector && Number.isFinite(proposedConnector.cost) ? proposedConnector : null
       if (options.role === 'highway' && options.alignment === 'planned' && connector) return connector
       // A physically simple junction connector may beat geographic search, but
       // expensive land still gets the chance to choose a cheaper outer corridor.
