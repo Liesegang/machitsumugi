@@ -14,7 +14,7 @@ import { isConstructionYear, simulationEndYear, simulationYears } from './simula
 import { advanceBuildingLife, buildingReplacementInvoice, fundBuildingReplacement, newBuildingLifeAccount } from './building-lifecycle'
 import type { BuildingLifeAccount } from './building-lifecycle'
 
-export const GENERATOR_VERSION = '2.5.0'
+export const GENERATOR_VERSION = '2.5.1'
 export { EPOCH_YEAR } from './simulation-calendar'
 
 interface Candidate {

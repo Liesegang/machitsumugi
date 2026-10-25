@@ -3,6 +3,7 @@ import { pointInRegion } from './geometry'
 import { renewExistingRoad } from './road-renewal'
 import { assignRoadTraffic } from './road-traffic'
 import { surveyedProjectCost } from './surveyed-project-cost'
+import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { frontageCapacity } from './frontage-supply'
 import { prospectiveRoadDistance, PROSPECTIVE_ROAD_REACH } from './prospective-road-access'
 import { PlanarRoadGraph, extractStreetBlocks, projectOnRoadSegment, roadLength, roadTravelSpeed } from './road-graph'
@@ -11,7 +12,7 @@ import { RoadPlanner } from './road-planner'
 import type { PlannedRoute, PlanningTerrain } from './road-planner'
 import { createLandholdingCost } from './road-alignment'
 import { diverseOpportunityBatches, sampleLandOpportunities } from './land-opportunities'
-import { planHousingCollectorBridge, transportProjects } from './transport-investment'
+import { planHousingCollectorBridge, planHousingFrontierBridge, transportProjects } from './transport-investment'
 import { valleySettlementCandidates } from './valley-settlements'
 import { RegionalRoadPlanner, regionalRoadKind } from './regional-road-planner'
 import { planModernTransport } from './modern-transport'
@@ -135,7 +136,7 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
   const acceptedCosts = new WeakMap<PlannedRoute, number>()
   const charged = (route: PlannedRoute | null | undefined) => route ? acceptedCosts.get(route) ?? 0 : 0
   const nextId = (phase: string, year: number) => { const key = `${phase}-${year}`, n = ids.get(key) ?? 0; ids.set(key, n + 1); return `${key}-${n}` }
-  const addProject = (route: PlannedRoute, phase: string, year: number, role: RoadRole, reason: string, width: number, requireConnection = true, preserveEndpoint = false, maximumCost = Infinity) => {
+  const addProject = (route: PlannedRoute, phase: string, year: number, role: RoadRole, reason: string, width: number, requireConnection = true, preserveEndpoint = false, maximumCost = Infinity, accesses: { route: PlannedRoute; role: 'access'; width: number }[] = []) => {
     const validator = route.boundaryContinuation && regionalPlanner ? regionalPlanner : planner
     if ((!preserveEndpoint && route.length < 20) || !validator.validate(route.points, width, route.bridgeLength > 0) || !validator.railwayAllows(route.points, role)) return 0
     // Bridge decks are explicit pieces, rather than labeling a complete cross-country route a bridge.
@@ -158,9 +159,15 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     // section must never leave a newly constructed road ending at the river.
     const beforeCount = graph.roads.length
     const pricing = surveyedProjectCost({ route, role, chunks: projects.map((project, i) => ({ path: project.points, bridge: chunks[i]!.bridge, reused: !!graph.reusableRoad(project.points, project.metadata) })), surveyCost: (path, role, bridge) => validator.cost(path, role, bridge) })
-    const newCost = pricing.newTotal
+    let newCost = pricing.newTotal
+    for (const access of accesses) {
+      if (access.route.bridgeLength || !planner.validate(access.route.points, access.width) || !planner.railwayWidthAllows(access.route.points, .01, access.width, access.role) || input.terrainModel && !surveyedRoadGradeAllowed(access.route, .08, input.terrainModel.elevation)) return 0
+      const accessPricing = surveyedProjectCost({ route: access.route, role: access.role, chunks: [{ path: access.route.points, bridge: false, reused: !!graph.reusableRoad(access.route.points, { role: access.role, width: access.width }) }], surveyCost: (path, role) => planner.cost(path, role, false) })
+      newCost += accessPricing.newTotal
+      projects.push({ points: access.route.points, metadata: { id: nextId(phase, year), builtYear: year, phase, role: access.role, reason, width: access.width, kind: 'local', constructionCost: accessPricing.newTotal, preserveEndpoint: true }, requireConnection: true })
+    }
     if (!Number.isFinite(newCost) || newCost > maximumCost + 1e-7) return 0
-    for (const [i, project] of projects.entries()) project.metadata.constructionCost = pricing.costs[i]!
+    for (const [i, project] of projects.slice(0, chunks.length).entries()) project.metadata.constructionCost = pricing.costs[i]!
     const committed = projects.length === 1 ? !!graph.add(projects[0]!.points, projects[0]!.metadata, projects[0]!.requireConnection) : !!graph.addBatch(projects)
     const added = committed ? graph.roads.length - beforeCount : 0
     if (added) acceptedCosts.set(route, newCost)
@@ -564,6 +571,13 @@ export function simulateUrbanGrowth(input: UrbanGrowthInput): UrbanGrowthResult 
     }
     if (estateChanged) { existing(year); occupy(target.households, year) }
     if (unmet > 0 && density > 0 && expansionAllowed) {
+      // New bridgeheads enter the ten-year transport programme; ordinary
+      // already-served street extensions retain their five-year growth rounds.
+      const frontier = year % 10 === 0 ? planHousingFrontierBridge({ graph, planner, cells, year, settlement, funds: budget, unmet: target.households - allocated, cache: housingBridgeCache }) : null
+      if (frontier && addProject(frontier.route, phase, year, frontier.role, `既存市街から未接続の対岸宅地を結ぶ橋と接道（実測した追加供給${Math.round(frontier.capacity)}世帯相当）`, frontier.width, true, false, budget, frontier.accesses)) {
+        budget -= charged(frontier.route); expenditure += charged(frontier.route)
+        existing(year); occupy(target.households, year)
+      }
       let projects = 0
       const remainingCells = cells.filter(c => c.households < c.capacity && c.roadDistance >= c.frontageDepth + 2).length
       // Each success services new land; each geometric failure is permanently
