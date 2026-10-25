@@ -1,6 +1,6 @@
 import type { Point } from './types'
 import type { PolygonRegion } from './geometry'
-export const LAYOUT_GENERATOR_VERSION = '2.6.0-layout.1'
+export const LAYOUT_GENERATOR_VERSION = '2.6.0-layout.2'
 
 /** A spatial brief; dates describe coherent development phases, not a growth loop. */
 export interface LayoutFirstZone extends PolygonRegion {

@@ -69,6 +69,34 @@ function zoneScore(zone: LayoutFirstZone, point: Point) {
   return proximity + (zone.kind === 'station' ? -.16 : zone.kind === 'industrial' ? -.08 : 0)
 }
 
+/** Local surveyed title coordinates. Ordinary stock uses readable building bars;
+ * a generous title is not itself evidence of a courtyard/campus programme. */
+export function layoutFirstBuildingFootprint(input: { body: readonly [number, number, number, number]; form: 'house' | 'apartment' | 'shop' | 'workshop'; rear: boolean; year: number; random: () => number }): Point[] {
+  const { body: [u0, u1, v0, v1], form, rear: rearTitle, year, random } = input
+  const apartment = form === 'apartment' && year >= 1955, width = u1 - u0, depth = v1 - v0
+  const side = form === 'shop' ? .7 : apartment ? 2.5 : 1.1 + random() * .9
+  let left = u0 + side, right = u1 - side
+  const front = v0 + (rearTitle ? 4.4 + random() * 1.2 : form === 'shop' ? 1.8 : 2.8 + random() * 1.8)
+  const depthDraw = random()
+  const houseDepth = Math.min(depth - 6, form === 'workshop' ? 17 + depthDraw * 12 : form === 'shop' ? 12 + depthDraw * 10 : 10 + depthDraw * 6)
+  let rear = front + houseDepth
+  if (apartment) {
+    // A normal apartment bar is a few rooms deep, with open yard behind it.
+    // Keep its full width inside this actual title instead of a plot-sized U.
+    const barWidth = Math.min(45, right - left)
+    left = (u0 + u1 - barWidth) / 2; right = left + barWidth
+    rear = Math.min(v1 - 3, front + 12 + depthDraw * 4)
+  }
+  // Retain the established small-stock texture and its exact random sequence;
+  // only oversized apartment compounds are replaced by restrained bars.
+  if (apartment && width > 29 && depth > 30) { if (random() < .7) random() }
+  else if (!apartment && width > 13 && random() < .28) {
+    const inset = Math.min(3.5, (right - left) * .22), offset = Math.min(4, (rear - front) * .3)
+    return [{ x: left + inset, y: front }, { x: right, y: front }, { x: right, y: rear }, { x: left, y: rear }, { x: left, y: front + offset }, { x: left + inset, y: front + offset }]
+  }
+  return [{ x: left, y: front }, { x: right, y: front }, { x: right, y: rear }, { x: left, y: rear }]
+}
+
 /**
  * Spatial composition, not a population/finance simulation. Survey complete road
  * blocks once, then give their holdings a finite sequence of physical frames.
@@ -101,25 +129,11 @@ export function developLayoutFirstLand(input: LayoutFirstLandInput) {
     return true
   }
   const footprintFor = (lot: Lot, year: number, serial: number) => {
-    const random = seededRandom(`${config.seed}:${lot.id}:frame:${year}:${serial}`), [u0, u1, v0, v1] = lot.body
+    const random = seededRandom(`${config.seed}:${lot.id}:frame:${year}:${serial}`), [u0, u1] = lot.body
     const world = (u: number, v: number) => localPoint(lot.origin, lot.tangent, lot.normal, u, v)
     const modern = year >= 1955, apartment = lot.form === 'apartment' && modern
-    const side = lot.form === 'shop' ? .7 : apartment ? 2.5 : 1.1 + random() * .9
-    const width = u1 - u0, depth = v1 - v0
-    const left = u0 + side, right = u1 - side
-    const front = v0 + (lot.rear ? 4.4 + random() * 1.2 : lot.form === 'shop' ? 1.8 : 2.8 + random() * 1.8)
-    const houseDepth = Math.min(depth - 6, lot.form === 'workshop' ? 17 + random() * 12 : lot.form === 'shop' ? 12 + random() * 10 : 10 + random() * 6)
-    const rear = apartment ? v1 - 3 : front + houseDepth
-    let polygon: Point[]
-    if (apartment && width > 29 && depth > 30 && random() < .7) {
-      const arm = Math.min(11, (right - left) * .33), cross = Math.min(12, (rear - front) * .35)
-      polygon = random() < .45
-        ? [world(left, front), world(right, front), world(right, rear), world(right - arm, rear), world(right - arm, front + cross), world(left + arm, front + cross), world(left + arm, rear), world(left, rear)]
-        : [world(left, front), world(left + arm, front), world(left + arm, rear - cross), world(right, rear - cross), world(right, rear), world(left, rear)]
-    } else if (!apartment && width > 13 && random() < .28) {
-      const inset = Math.min(3.5, (right - left) * .22), offset = Math.min(4, (rear - front) * .3)
-      polygon = [world(left + inset, front), world(right, front), world(right, rear), world(left, rear), world(left, front + offset), world(left + inset, front + offset)]
-    } else polygon = rectangleAt(world, left, right, front, rear)
+    const local = layoutFirstBuildingFootprint({ body: lot.body, form: lot.form, rear: lot.rear, year, random })
+    const polygon = local.map(point => world(point.x, point.y)), front = local[0]!.y, rear = local[2]!.y
     if (polygonArea(polygon) < 25 || !insideRegion(polygon, { polygon: lot.polygon }) || !input.canPlace(polygon)) return null
     const survey = surveyDevelopmentSite({ slope: input.slope, elevation: input.elevation }, world((u0 + u1) / 2, (front + rear) / 2), polygon)
     if (!survey.viable) return null

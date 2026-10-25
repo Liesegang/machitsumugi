@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { developLayoutFirstLand } from './layout-first-land'
+import { developLayoutFirstLand, layoutFirstBuildingFootprint } from './layout-first-land'
 import type { LayoutFirstZone } from './layout-first-types'
 import type { CityConfig, Point, Road } from './types'
 import { buildingServiceYears } from './building-lifecycle'
-import { corridorPolygon, distanceToSegment, pointInPolygon, polygonArea, polygonsOverlap, rectangle } from './geometry'
+import { corridorPolygon, distance, distanceToSegment, pointInPolygon, polygonArea, polygonsOverlap, rectangle, seededRandom } from './geometry'
 
 const config: CityConfig = { name: '試験町', seed: 'layout-physical-frames', type: 'post', terrain: 'plain', density: 75, forest: 0, railway: false, stations: 0, arterial: false, facilities: [], targetYear: 2025, settlement: 'regional-city' }
 const zone: LayoutFirstZone = { id: 'district', center: { x: 220, y: 180 }, radius: 500, polygon: rectangle(0, 0, 440, 360), kind: 'historic', builtYear: 1770, density: 1, maximumFloors: 4 }
@@ -16,7 +16,8 @@ describe('layout-first land composition', () => {
     expect(result.buildings.length).toBeGreaterThan(150)
     expect(result.metrics.titleArea / (440 * 330), JSON.stringify(result.metrics)).toBeGreaterThan(.48)
     expect(new Set(result.buildings.map(b => Math.round(polygonArea(b.polygon)))) .size).toBeGreaterThan(40)
-    expect(result.buildings.some(b => b.polygon.length > 4)).toBe(true)
+    expect(result.buildings.every(b => b.polygon.length === 4 || b.polygon.length === 6)).toBe(true)
+    expect(result.buildings.some(b => b.polygon.length === 6)).toBe(true)
     const center = rectangle(145, 145, 40, 40)
     expect(result.parcels.some(p => polygonsOverlap(p.polygon, center))).toBe(true)
     for (const parcel of result.parcels) {
@@ -61,11 +62,39 @@ describe('layout-first land composition', () => {
     const elevated = run({ roads: [{ ...road, id: 'viaduct', level: 1 }, { ...road, id: 'motorway', controlledAccess: true }] })
     expect(elevated.buildings).toEqual([])
   })
-  it('uses diverse large footprints in station districts and keeps them within each acquired holding', () => {
+  it('uses legible apartment bars in station districts and keeps their depth and length within the actual holding', () => {
     const result = run({ zones: [{ ...zone, kind: 'station', builtYear: 1900, maximumFloors: 10 }] })
-    expect(result.buildings.some(b => b.height >= 5 && b.polygon.length >= 6)).toBe(true)
+    const apartments = result.buildings.filter(b => b.height >= 5)
+    expect(apartments.length).toBeGreaterThan(5)
+    for (const building of apartments) {
+      expect(building.polygon).toHaveLength(4)
+      expect(distance(building.polygon[0]!, building.polygon[1]!)).toBeLessThanOrEqual(45 + 1e-7)
+      expect(distance(building.polygon[1]!, building.polygon[2]!)).toBeGreaterThanOrEqual(12 - 1e-7)
+      expect(distance(building.polygon[1]!, building.polygon[2]!)).toBeLessThanOrEqual(16 + 1e-7)
+    }
     expect(result.metrics.grossFloorArea).toBeGreaterThan(result.metrics.footprintArea * 3)
     for (const building of result.buildings) expect(building.polygon.every(point => pointInPolygon(point, result.parcels.find(p => p.id === building.parcelId)!.polygon))).toBe(true)
+  })
+  it('retains shallow recesses on small ordinary stock while bounding apartment mass on deep plots', () => {
+    let recessed = 0
+    for (const form of ['house', 'shop', 'workshop', 'apartment'] as const) for (let i = 0; i < 30; i++) {
+      const footprint = layoutFirstBuildingFootprint({ body: [0, 80, 0, 80], form, rear: false, year: 1995, random: seededRandom(`footprint-${form}-${i}`) })
+      expect(footprint.every(point => point.x > 0 && point.x < 80 && point.y > 0 && point.y < 80)).toBe(true)
+      if (form === 'apartment') {
+        expect(footprint).toHaveLength(4)
+        expect(distance(footprint[0]!, footprint[1]!)).toBe(45)
+        expect(distance(footprint[1]!, footprint[2]!)).toBeGreaterThanOrEqual(12)
+        expect(distance(footprint[1]!, footprint[2]!)).toBeLessThanOrEqual(16)
+      } else {
+        expect([4, 6]).toContain(footprint.length)
+        if (footprint.length === 6) {
+          recessed++
+          expect(footprint[0]!.x - footprint[4]!.x).toBeLessThanOrEqual(3.5 + 1e-7)
+          expect(footprint[4]!.y - footprint[0]!.y).toBeLessThanOrEqual(4 + 1e-7)
+        }
+      }
+    }
+    expect(recessed).toBeGreaterThan(10)
   })
   it('surveys rear-title access at full width for every physical building version', () => {
     const result = run()
