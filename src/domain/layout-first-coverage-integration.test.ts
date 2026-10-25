@@ -12,6 +12,8 @@ it('commits coverage collectors only with real closed-face gain and same-era pub
   ]
   const result = buildLayoutFirstRoads({ environment: { width: 2400, height: 1800, core: null, areas: [], terrain: { waterAt, elevation, slope, bridgeSites: [], continuationTerrain: { waterAt, elevation, slope } } }, zones, center: zones[0]!.center, seed: 'coverage-contacts', settlement: 'regional-city', density: 90 })
   const records = result.diagnostics.coverage ?? [], collectors = result.roads.filter(road => road.reason === '未被覆の都市需要地を通り実公道へ戻る大街区の集散道路')
+  expect(new Set(records.map(record => record.phase))).toEqual(new Set(['before-fallback', 'after-fallback']))
+  for (const record of records) expect(record.attempted).toBeLessThanOrEqual(record.phase === 'before-fallback' ? 2 : 4)
   expect(collectors.length).toBeGreaterThan(0)
   expect(records.reduce((sum, record) => sum + record.accepted, 0)).toBe(collectors.length)
   expect(records.reduce((sum, record) => sum + record.coveredGain, 0)).toBeGreaterThan(10000)
