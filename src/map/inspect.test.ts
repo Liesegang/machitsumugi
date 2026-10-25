@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 import type { CityMap } from '../domain/types'
 import { createMapInspector, featureHistory, featureSummary } from './inspect'
+import { createCityTimeline, sliceCityAtYear } from '../domain/timeline'
 
 const map = {
   width: 100, height: 100, description: '履歴と地物選択の検証', areas: [], stations: [],
@@ -29,6 +30,29 @@ it('shows recorded parcel rebuild history without inventing or including unrelat
   const history = featureHistory(map, { type: 'building', item: map.buildings[0]! })
   expect(history.map(e => [e.year, e.reason])).toEqual([[1850, '最初の家'], [2020, '建替え'], [2020, '新しい共同住宅']])
   expect(featureHistory(map, { type: 'area', item: { id: 'forest', kind: 'forest', polygon: [] } })).toEqual([])
+})
+it('finds replaced layout buildings by their saved parcel identity and hides future work in past views', () => {
+  const parcelId = 'layout-parcel-14'
+  const first = { ...map.buildings[0]!, id: 'layout-building-layout-parcel-14-1800-0', parcelId, builtYear: 1800 }
+  const second = { ...first, id: 'layout-building-layout-parcel-14-1880-1', builtYear: 1880 }
+  const current = { ...first, id: 'layout-building-layout-parcel-14-1970-2', builtYear: 1970 }
+  const other = { ...first, id: 'layout-building-layout-parcel-14-1850-other', parcelId: 'other-parcel', builtYear: 1850 }
+  const layout: CityMap = { ...map, buildings: [current], parcels: [{ ...map.parcels![0]!, id: parcelId }], year: 2025, events: [
+    { id: 'a-first', entityId: first.id, year: 1800, kind: 'construction', reason: '最初の建物' },
+    { id: 'b-retire', entityId: first.id, year: 1880, kind: 'acquisition', reason: '初代を解体' },
+    { id: 'c-second', entityId: second.id, year: 1880, kind: 'construction', reason: '二代目を建築' },
+    { id: 'd-retire', entityId: second.id, year: 1970, kind: 'acquisition', reason: '二代目を解体' },
+    { id: 'e-current', entityId: current.id, year: 1970, kind: 'construction', reason: '現存建物を建築' },
+    { id: 'other', entityId: other.id, year: 1850, kind: 'construction', reason: '似たIDの別敷地' },
+  ] }
+  layout.timeline = createCityTimeline(layout, { buildings: [
+    { from: 1800, to: 1880, value: first }, { from: 1880, to: 1970, value: second }, { from: 1970, value: current }, { from: 1850, value: other },
+  ] })
+  const savedHistory = JSON.stringify(layout.timeline)
+  expect(featureHistory(layout, { type: 'building', item: current }).map(event => event.id)).toEqual(['a-first', 'b-retire', 'c-second', 'd-retire', 'e-current'])
+  const past = sliceCityAtYear(layout, 1850)
+  expect(featureHistory(past, { type: 'building', item: past.buildings.find(building => building.parcelId === parcelId)! }).map(event => event.id)).toEqual(['a-first'])
+  expect(JSON.stringify(layout.timeline)).toBe(savedHistory)
 })
 it('includes dated civic relocation history when its label is clicked', () => {
   const civic: CityMap = { ...map, events: [

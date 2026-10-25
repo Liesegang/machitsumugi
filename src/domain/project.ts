@@ -81,6 +81,7 @@ function configFrom(value: unknown): CityConfig {
     arterial: boolean(input.arterial, '幹線道路'), facilities,
   }
   if (input.era !== undefined) config.era = choice(input.era, ['historic', 'railway', 'present'] as const, '発展段階')
+  if (input.cityEngine !== undefined) config.cityEngine = choice(input.cityEngine, ['history', 'layout'] as const, '生成方式')
   if (input.targetYear !== undefined) config.targetYear = number(input.targetYear, '表示年代', 1650, 2025, true)
   if (input.settlement !== undefined) config.settlement = choice(input.settlement, ['village', 'rural-town', 'regional-city', 'metropolis'] as const, '地域の規模')
   if (input.populationTrend !== undefined) config.populationTrend = choice(input.populationTrend, ['declining', 'stable', 'growing'] as const, '人口推移')
@@ -199,7 +200,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     if (retiredYear !== undefined && retiredYear < createdYear) throw new Error('敷地の廃止年が成立年より前になっています。')
     return { id, polygon: points(p.polygon, '敷地の形', true), entrance: point(p.entrance, '敷地の入口'), ...(p.access === undefined ? {} : { access: points(p.access, '敷地の通路', false) }), roadId: string(p.roadId, '接道先のID', 128), createdYear, ...(developedYear === undefined ? {} : { developedYear }), ...(retiredYear === undefined ? {} : { retiredYear }), use: choice(p.use, ['residential', 'commercial', 'industrial'] as const, '敷地の用途') }
   }
-  const readEvent = (e: Record<string, unknown>, id: string) => ({ id, year: year(e.year, '履歴の年'), kind: choice(e.kind, ['road', 'construction', 'acquisition', 'railway'] as const, '履歴の種類'), entityId: string(e.entityId, '履歴の対象ID', 128), reason: string(e.reason, '履歴の理由', 2000, true) })
+  const readEvent = (e: Record<string, unknown>, id: string) => ({ id, year: year(e.year, '履歴の年'), kind: choice(e.kind, ['road', 'construction', 'demolition', 'acquisition', 'railway'] as const, '履歴の種類'), entityId: string(e.entityId, '履歴の対象ID', 128), reason: string(e.reason, '履歴の理由', 2000, true) })
   const readSurface = (value: unknown): TerrainSurface => {
     const surface = object(value, '地形の標高')
     const columns = number(surface.columns, '標高の列数', 2, 2001, true), rows = number(surface.rows, '標高の行数', 2, 2001, true)

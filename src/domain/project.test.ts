@@ -35,6 +35,16 @@ const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
+  it('persists the selected generation engine without migrating older projects', () => {
+    const project = withSnapshot()
+    project.config.cityEngine = 'layout'
+    project.snapshot!.config.cityEngine = 'layout'
+    const restored = parseProject(JSON.stringify(project))
+    expect(restored.config.cityEngine).toBe('layout')
+    expect(restored.snapshot).toEqual(project.snapshot)
+    expect(parseProject(JSON.stringify(sample())).config.cityEngine).toBeUndefined()
+    expect(() => parseProject(JSON.stringify({ ...sample(), config: { ...sample().config, cityEngine: 'unknown' } }))).toThrow('生成方式')
+  })
   it('retains the same terrain, regional crop, lake water level and physical volume audit', () => {
     const project = withSnapshot(), map = project.snapshot!
     map.terrainSurface = { columns: 5, rows: 4, cellSize: 1000, elevations: Array.from({ length: 20 }, (_, i) => 40 + i) }

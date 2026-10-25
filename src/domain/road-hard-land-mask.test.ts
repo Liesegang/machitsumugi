@@ -15,4 +15,14 @@ describe('exact hard site masks in a cached terrain planner', () => {
     const planner = new RoadPlanner({ width: 600, height: 600, areas: [], core: null, exactLandCost: true, landCost: p => p.x > 270 && p.x < 330 ? Infinity : 0 })
     expect(planner.plan({ x: 150, y: 300 }, { x: 450, y: 300 }, { role: 'access', width: 2.8, alignment: 'planned', maxNodes: 1800 })).toBeNull()
   })
+  it('routes a collector around a complete reserved compound instead of discovering the infinity cost only at the end', () => {
+    const reserved = (p: { x: number; y: number }) => p.x > 350 && p.x < 650 && p.y > 250 && p.y < 550
+    const planner = new RoadPlanner({ width: 1000, height: 800, areas: [], core: null, exactLandCost: true, landCost: p => reserved(p) ? Infinity : 0 })
+    const route = planner.plan({ x: 100, y: 400 }, { x: 900, y: 400 }, { role: 'collector', width: 9, maxNodes: 2200 })
+    expect(route).not.toBeNull()
+    expect(route!.points.every(p => !reserved(p))).toBe(true)
+    expect(route!.points.some(p => p.y < 245 || p.y > 555)).toBe(true)
+    expect(planner.validate(route!.points, 9)).toBe(true)
+  })
+
 })

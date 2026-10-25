@@ -49,6 +49,7 @@ export class RegionalRoadPlanner {
       waterGeometryBounds: { minX: padding, minY: padding, maxX: environment.width + padding, maxY: environment.height + padding },
       core: environment.core?.map(move) ?? null,
       areas: environment.areas.map(area => ({ ...area, polygon: area.polygon.map(move), ...(area.holes ? { holes: area.holes.map(hole => hole.map(move)) } : {}) })),
+      exactLandCost: environment.exactLandCost,
       landCost: environment.landCost ? p => environment.landCost!(local(p)) : undefined,
       terrain: {
         elevation: p => continuation.elevation(local(p)), slope: p => continuation.slope(local(p)), waterAt: p => continuation.waterAt(local(p)),

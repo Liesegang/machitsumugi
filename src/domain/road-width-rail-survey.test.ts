@@ -43,4 +43,16 @@ describe('running-track clearance during inherited-road widening', () => {
     result.setRailwayCorridors([])
     expect(result.railwayWidthAllows(parallel, 4, 13, 'collector')).toBe(true)
   })
+  it('uses the real curved crossing footprint for perpendicular and oblique approaches', () => {
+    const curved: Railway = { ...rail, points: Array.from({ length: 201 }, (_, i) => { const x = 100 + i * 5; return { x, y: 500 + (x - 500) ** 2 / 600 } }) }
+    const result = planner(curved)
+    for (const points of [[{ x: 500, y: 200 }, { x: 500, y: 800 }], [{ x: 380, y: 200 }, { x: 620, y: 800 }]]) {
+      expect(result.railwayAllows(points, 'collector')).toBe(true)
+      expect(result.railwayWidthAllows(points, 4, 13, 'collector')).toBe(true)
+    }
+    // A nearby parallel carriageway still occupies the running track's strip;
+    // a valid curved gate elsewhere does not grant that longitudinal ground.
+    const alongTrack = curved.points.filter(p => p.x >= 400 && p.x <= 600).map(p => ({ x: p.x, y: p.y + 5 }))
+    expect(result.railwayWidthAllows(alongTrack, 4, 13, 'collector')).toBe(false)
+  })
 })

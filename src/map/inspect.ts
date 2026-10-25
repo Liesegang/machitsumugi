@@ -41,6 +41,7 @@ export function featureHistory(map: CityMap, feature: MapFeature): GrowthEvent[]
   if (feature.type === 'building' && feature.item.parcelId) {
     const parcel = map.parcels?.find(p => p.id === feature.item.parcelId)
     ids.add(feature.item.parcelId)
+    for (const version of map.timeline?.buildings ?? []) if (version.value.parcelId === feature.item.parcelId) ids.add(version.value.id)
     if (parcel) {
       ids.add(`building-${parcel.id}`)
       const previousIds = new RegExp(`^building-${parcel.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[0-9]+$`)

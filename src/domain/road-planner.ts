@@ -108,10 +108,8 @@ export class RoadPlanner {
     if (newWidth <= oldWidth || !this.widthRailBuckets.size) return true
     if (!this.railwayAllows(path, role)) return false
     const clearance = 3, half = newWidth / 2 + clearance, windows = new Map<string, [number, number][]>()
-    for (const hit of this.railwayConstraints?.crossings(path) ?? []) {
-      const reach = half / Math.max(.5, Math.sin(hit.angle)), list = windows.get(hit.railwayId) ?? []
-      list.push([hit.chainage - reach, hit.chainage + reach]); windows.set(hit.railwayId, list)
-    }
+    const crossingHits = this.railwayConstraints?.crossings(path) ?? []
+    const contacts: { segment: WidthRailSegment; from: number; to: number; crossable: boolean }[] = []
     for (let i = 1; i < path.length; i++) {
       const a = path[i - 1]!, b = path[i]!, length = distance(a, b)
       if (length < .001) continue
@@ -125,7 +123,28 @@ export class RoadPlanner {
           else { const p = (lower! - v!) / d!, q = (upper! - v!) / d!; lo = Math.max(lo, Math.min(p, q)); hi = Math.min(hi, Math.max(p, q)) }
         }
         if (hi - lo < 1e-8) continue
-        const from = segment.along + lo * segment.length, to = segment.along + hi * segment.length, allowed = [...windows.get(segment.id) ?? []]
+        const from = segment.along + lo * segment.length, to = segment.along + hi * segment.length
+        const cosine = Math.abs((ux * (segment.b.x - segment.a.x) + uy * (segment.b.y - segment.a.y)) / segment.length)
+        contacts.push({ segment, from, to, crossable: cosine <= Math.cos(Math.PI / 6) + 1e-9 })
+      }
+    }
+    // Compute the actual curved-pavement/track intersection, rather than the
+    // half/sin(angle) aperture of two infinite straight lines. That scalar
+    // aperture missed real curved crossings by1–30mm and rejected every road.
+    // Only a connected footprint containing a certified centreline crossing is
+    // a legal gate. Shallow/parallel occupations never join these apertures.
+    for (const id of new Set(crossingHits.map(hit => hit.railwayId))) {
+      const intervals = contacts.filter(contact => contact.segment.id === id && contact.crossable).map(contact => [contact.from, contact.to] as [number, number]).sort((a, b) => a[0] - b[0])
+      const merged: [number, number][] = []
+      for (const interval of intervals) {
+        const last = merged.at(-1)
+        if (last && interval[0] <= last[1] + 1e-6) last[1] = Math.max(last[1], interval[1])
+        else merged.push([...interval])
+      }
+      windows.set(id, merged.filter(([from, to]) => crossingHits.some(hit => hit.railwayId === id && hit.chainage >= from - 1e-6 && hit.chainage <= to + 1e-6)))
+    }
+    for (const { segment, from, to, crossable } of contacts) {
+        const allowed = crossable ? [...windows.get(segment.id) ?? []] : []
         if (segment.levels && segment.levels.every(Number.isFinite) && this.environment.terrain) for (const bridge of segment.bridges) {
           const low = Math.max(from, bridge[0]), high = Math.min(to, bridge[1])
           if (high <= low) continue
@@ -140,7 +159,6 @@ export class RoadPlanner {
         let covered = from
         for (const [low, high] of allowed.sort((x, y) => x[0] - y[0])) { if (low > covered + 1e-6) break; covered = Math.max(covered, high); if (covered >= to - 1e-6) break }
         if (covered < to - 1e-6) return false
-      }
     }
     return true
   }
@@ -202,7 +220,7 @@ export class RoadPlanner {
   suitable(p: Point, width = 6) {
     if (p.x < width || p.y < width || p.x > this.environment.width - width || p.y > this.environment.height - width) return false
     const f = this.field(p)
-    return !f.water && f.grade < .20 && f.coreDistance > width / 2 + 4
+    return !f.water && Number.isFinite(f.cost) && f.grade < .20 && f.coreDistance > width / 2 + 4
   }
   private crossesWater(a: Point, b: Point) {
     if (this.waterAt(a) || this.waterAt(b)) return true
@@ -237,7 +255,7 @@ export class RoadPlanner {
         const q = { x: p.x - Math.sin(angle) * width / 2 * side, y: p.y + Math.cos(angle) * width / 2 * side }
         if (q.x < 2 || q.y < 2 || q.x > this.environment.width - 2 || q.y > this.environment.height - 2) return false
         const f = this.field(q)
-        if (f.sea || f.coreDistance < 3 || (!bridge && (f.water || f.grade > .23))) return false
+        if (f.sea || !Number.isFinite(f.cost) || f.coreDistance < 3 || (!bridge && (f.water || f.grade > .23))) return false
       }
     }
     return true

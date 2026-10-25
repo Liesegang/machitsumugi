@@ -50,7 +50,10 @@ function sessionDraft(fallback: CityConfig): CityConfig {
   } catch { return fallback }
 }
 const normalizeConfig = (config: CityConfig): CityConfig => ({ ...config, era: config.era ?? 'present', relief: config.relief ?? 'hills', terrain: (config.type === 'port' || config.facilities.includes('port')) && config.terrain === 'plain' ? 'coast' : config.terrain })
-const newProject = (): Project => ({ version: 2, config: livePreview ? sessionDraft(DEFAULT_CONFIG) : DEFAULT_CONFIG, layers: DEFAULT_LAYERS, annotations: [], style: 'standard' })
+const newProject = (): Project => {
+  const config: CityConfig = { ...DEFAULT_CONFIG, cityEngine: 'layout' }
+  return { version: 2, config: livePreview ? sessionDraft(config) : config, layers: DEFAULT_LAYERS, annotations: [], style: 'standard' }
+}
 const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', facilities: '施設', grid: '100 m グリッド' }
 // A disposable development preview must never replace a saved TRPG world.
 const livePreview = import.meta.env.DEV && new URLSearchParams(location.search).get('preview') === 'latest'
@@ -433,7 +436,7 @@ function App() {
         {viewMode === 'contour' && displayedMap && !displayedMap.terrainSurface && <div className="mode-notice" role="note">この保存地図には標高データがありません。</div>}
         {(restoring || generating) && <div className={`generation-overlay ${displayedMap ? 'regenerating' : ''}`} role="status"><LoaderCircle className="spin" size={25} /><span>{restoring ? '保存済みの地図を読み込み中…' : generationLabel}</span>{generating && !restoring && <button className="text-button" onClick={cancelGeneration}>中止</button>}</div>}
         {feature && displayedMap && <FeatureDetails map={displayedMap} feature={feature.feature} point={feature.point} onClose={() => setFeature(null)} onPin={addPin} />}
-      </div><footer className="map-status"><span className="map-stock">{previewMap ? previewStockLabel(previewMap) : displayedMap ? `建物 ${displayedMap.buildings.length.toLocaleString()}棟` : '生成中'}</span>{project.snapshot && !generating && <button className="map-report-button" onClick={() => setDialog('report')}>生成結果</button>}<BuildIdentity mapVersion={displayedMap?.generatorVersion} preview={!!previewMap} /></footer></main>
+      </div><footer className="map-status"><span className="map-stock">{previewMap ? previewStockLabel(previewMap) : displayedMap ? `建物 ${displayedMap.buildings.length.toLocaleString()}棟` : '生成中'}</span>{project.snapshot && !generating && <button className="map-report-button" onClick={() => setDialog('report')}>生成結果</button>}<BuildIdentity mapVersion={displayedMap?.generatorVersion} preview={!!previewMap} engine={displayedMap?.config.cityEngine ?? project.config.cityEngine} /></footer></main>
     </div>
     <input ref={importRef} type="file" accept="application/json,.json" hidden onChange={event => void importFile(event.target.files?.[0])} />
     {toast && <div className="toast" role="status">{toast}</div>}

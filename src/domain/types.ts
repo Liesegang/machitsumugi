@@ -5,6 +5,8 @@ export type CityType = 'castle' | 'temple' | 'port' | 'newtown' | 'post' | 'onse
 export type Terrain = 'river' | 'plain' | 'coast';
 export type FacilityKind = 'shrine' | 'school' | 'university' | 'hospital' | 'police' | 'shop' | 'park' | 'castle' | 'port' | 'onsen';
 export interface CityConfig {
+  /** Missing on older projects: their history engine and saved geometry stay intact. */
+  cityEngine?: 'history' | 'layout';
   name: string; seed: string; type: CityType; terrain: Terrain; density: number; forest: number;
   railway: boolean; stations: number; arterial: boolean; facilities: FacilityKind[];
   era?: 'historic' | 'railway' | 'present';
@@ -26,7 +28,7 @@ export interface Station { id: string; point: Point; name: string; railwayId?: s
 export interface Facility { id: string; point: Point; name: string; kind: FacilityKind }
 export interface District { id: string; point: Point; name: string; kind?: 'town' | 'ward'; parentId?: string; regions?: { polygon: Point[]; holes?: Point[][] }[]; foundedYear?: number; nameOrigin?: string; namingSource?: 'provisional' | 'llm' | 'edited' }
 export interface Parcel { id: string; polygon: Point[]; entrance: Point; access?: Point[]; roadId: string; createdYear: number; developedYear?: number; retiredYear?: number; use: 'residential' | 'commercial' | 'industrial' }
-export interface GrowthEvent { id: string; year: number; kind: 'road' | 'construction' | 'acquisition' | 'railway'; entityId: string; reason: string }
+export interface GrowthEvent { id: string; year: number; kind: 'road' | 'construction' | 'demolition' | 'acquisition' | 'railway'; entityId: string; reason: string }
 export interface SimulationSnapshot { year: number; households: number; capacity: number; vacant: number; unmet: number; roads: number; buildings: number }
 /** Actual versions are valid on [from,to); geometry is stored only when it changes. */
 export interface TimelineVersion<T> { from: number; to?: number; value: T }

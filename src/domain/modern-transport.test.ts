@@ -32,4 +32,13 @@ describe('regional modern transport programme', () => {
     expect(planModernTransport({ ...input, kind: 'expressway', households: 80, jobs: 30, funds: 2000 })).toBeNull()
     expect(planModernTransport({ ...input, kind: 'bypass', households: 30000, jobs: 15000, funds: 0 })).toBeNull()
   })
+  it('can bound proposal surveys while retaining complete engineering checks', () => {
+    const input = fixture()
+    expect(planModernTransport({ ...input, kind: 'expressway', households: 30000, jobs: 15000, funds: 1e7, planningLimits: { maxPairs: 0 } })).toBeNull()
+    const project = planModernTransport({ ...input, kind: 'expressway', households: 30000, jobs: 15000, funds: 1e7, planningLimits: { maxPairs: 2, maxAnchors: 3, maxDeltas: 3, maxNodes: 2400 } })
+    expect(project).not.toBeNull()
+    expect(project!.accesses.filter(access => access.role === 'ramp')).toHaveLength(4)
+    expect(alignmentDiagnostics(project!.mainline.points).minimumRadius).toBeGreaterThan(239)
+    expect(project!.benefit).toBeGreaterThan(project!.cost)
+  })
 })

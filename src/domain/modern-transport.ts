@@ -9,9 +9,14 @@ export interface ModernTransportProject {
   accesses: { route: PlannedRoute; role: 'collector' | 'ramp'; width: number; level: number; controlledAccess: boolean }[]
   role: 'highway' | 'expressway'; width: number; cost: number; benefit: number; trips: number; minutesSaved: number
 }
+export interface ModernTransportPlanningLimits {
+  maxPairs?: number; maxAnchors?: number; maxDeltas?: number; maxNodes?: number
+}
 interface Input {
   graph: PlanarRoadGraph; planner: RoadPlanner; regionalPlanner: RegionalRoadPlanner
   width: number; height: number; households: number; jobs: number; funds: number; kind: 'bypass' | 'expressway'; year?: number
+  /** Bound candidate work without relaxing engineering/benefit acceptance. */
+  planningLimits?: ModernTransportPlanningLimits
 }
 const distance = (a: Point, b: Point) => Math.hypot(b.x - a.x, b.y - a.y)
 const lerp = (a: Point, b: Point, t: number): Point => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
@@ -39,12 +44,15 @@ export function planModernTransport(input: Input): ModernTransportProject | null
   }
   const expressway = input.kind === 'expressway', role = expressway ? 'expressway' : 'highway', carriageway = expressway ? 22 : 16
   const trips = input.households * (expressway ? 1.8 : 1.1) + input.jobs * (expressway ? .8 : .5)
+  const limit = (value: number | undefined, fallback: number) => value !== undefined && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : fallback
+  const maxPairs = limit(input.planningLimits?.maxPairs, Infinity), maxAnchors = limit(input.planningLimits?.maxAnchors, 8), maxDeltas = limit(input.planningLimits?.maxDeltas, 5)
+  const mainlineNodes = limit(input.planningLimits?.maxNodes, 20000), accessNodes = limit(input.planningLimits?.maxNodes, 9000)
   const pairs = portals.flatMap((a, i) => portals.slice(i + 1).map(b => ({ a, b, oldTime: graph.travelTime(a, b) })))
     .filter(pair => distance(pair.a, pair.b) > Math.min(width, height) * .6 && Number.isFinite(pair.oldTime))
     .sort((a, b) => b.oldTime - a.oldTime)
   let best: ModernTransportProject | null = null
-  for (const pair of pairs) {
-    const mainline = regionalPlanner.plan(pair.a, pair.b, { role, width: carriageway, allowBridge: true, maxNodes: 20000 })
+  for (const pair of pairs.slice(0, maxPairs)) {
+    const mainline = regionalPlanner.plan(pair.a, pair.b, { role, width: carriageway, allowBridge: true, maxNodes: mainlineNodes })
     if (!mainline || mainline.cost > input.funds || (!expressway && graph.hasAcuteMajorCrossing(mainline.points))) continue
     const accesses: ModernTransportProject['accesses'] = []
     if (expressway) {
@@ -53,21 +61,21 @@ export function planModernTransport(input: Input): ModernTransportProject | null
       // new controlled corridor can produce any local travel-time benefit.
       for (const fraction of [.28, .72]) {
         let found = false
-        for (const delta of [0, -180, 180, -360, 360]) {
+        for (const delta of [0, -180, 180, -360, 360].slice(0, maxDeltas)) {
           const centerChainage = Math.max(430, Math.min(length - 430, length * fraction + delta)), center = along(mainline.points, centerChainage)
           if (center.point.x < 200 || center.point.y < 200 || center.point.x > width - 200 || center.point.y > height - 200 || interchanges.some(p => distance(p, center.point) < 700)) continue
           siteSearch: for (const side of [-1, 1]) for (const offset of [210, 300]) {
             const normal = center.heading + Math.PI / 2 * side, forecourt = { x: center.point.x + Math.cos(normal) * offset, y: center.point.y + Math.sin(normal) * offset }
             if (!planner.suitable(forecourt, 10)) continue
-            const anchors = graph.projections(forecourt, 650, 8).filter(anchor => anchor.road.role !== 'farm' && distance(anchor.point, forecourt) > 60)
+            const anchors = graph.projections(forecourt, 650, maxAnchors).filter(anchor => anchor.road.role !== 'farm' && distance(anchor.point, forecourt) > 60)
             for (const anchor of anchors) {
               const startHeading = graph.junctionHeading(anchor.point, forecourt)
               if (startHeading === null) continue
-              const service = planner.plan(anchor.point, forecourt, { role: 'collector', width: 9, startHeading, endHeading: normal + Math.PI, maxNodes: 9000 })
+              const service = planner.plan(anchor.point, forecourt, { role: 'collector', width: 9, startHeading, endHeading: normal + Math.PI, maxNodes: accessNodes })
               if (!service || graph.hasAcuteMajorCrossing(service.points)) continue
               const rampA = along(mainline.points, centerChainage - 320), rampB = along(mainline.points, centerChainage + 320)
-              const first = planner.plan(forecourt, rampA.point, { role: 'ramp', width: 7, startHeading: center.heading + Math.PI, endHeading: rampA.heading + Math.PI, maxNodes: 9000 })
-              const second = planner.plan(forecourt, rampB.point, { role: 'ramp', width: 7, startHeading: center.heading, endHeading: rampB.heading, maxNodes: 9000 })
+              const first = planner.plan(forecourt, rampA.point, { role: 'ramp', width: 7, startHeading: center.heading + Math.PI, endHeading: rampA.heading + Math.PI, maxNodes: accessNodes })
+              const second = planner.plan(forecourt, rampB.point, { role: 'ramp', width: 7, startHeading: center.heading, endHeading: rampB.heading, maxNodes: accessNodes })
               if (!first || !second) continue
               accesses.push({ route: service, role: 'collector', width: 9, level: 0, controlledAccess: false }, { route: first, role: 'ramp', width: 7, level: 1, controlledAccess: true }, { route: second, role: 'ramp', width: 7, level: 1, controlledAccess: true })
               interchanges.push(center.point); found = true; break

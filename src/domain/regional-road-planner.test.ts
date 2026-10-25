@@ -45,4 +45,15 @@ describe('roads continuing beyond the displayed map', () => {
     expect(planner.boundaryPortals({ x: 700, y: 400 }, { width: 9, preferred: { x: 28, y: 400 } })).toEqual([])
     expect(planner.boundaryPortals({ x: 700, y: 400 }, { width: 9, direction: { x: 0, y: 1 } }).every(point => point.y > 400)).toBe(true)
   })
+  it('keeps an exact campus boundary exact when translating the regional frame', () => {
+    const planner = new RegionalRoadPlanner({ width: 1000, height: 800, areas: [], core: null, exactLandCost: true,
+      landCost: p => p.x >= 350 && p.x < 511 && p.y > 300 && p.y < 500 ? Infinity : 0,
+      terrain: { ...flat, bridgeSites: [], continuationTerrain: flat } })
+    // This3m route is dry and wholly outside the campus. Rounding its ownership
+    // sample to the translated24m earthwork grid wrongly samples x=510 inside.
+    const route = planner.plan({ x: 513, y: 400 }, { x: 950, y: 400 }, { role: 'access', width: 3, alignment: 'planned' })
+    expect(route).not.toBeNull()
+    expect(route!.points.every(p => p.x >= 513)).toBe(true)
+    expect(planner.validate(route!.points, 3)).toBe(true)
+  })
 })

@@ -1,4 +1,5 @@
 import { generateCity, terrainGenerationPreview } from '../domain/generator'
+import { generateLayoutCity, layoutGenerationReport } from '../domain/layout-first-generator'
 import { resolveGenerationConfig } from '../domain/generation-config'
 import type { GenerationTerrainSource } from '../domain/generation-terrain-cache'
 import type { TerrainModel } from '../domain/terrain'
@@ -53,8 +54,8 @@ export async function runAcceleratedGeneration(input: CityConfig, terrainSource:
   const indexes = await pending
   const indexedAt = performance.now()
   const accelerated: TerrainModel = indexes.water ? { ...terrain, waterAt: indexes.water.query } : terrain
-  onProgress('街道・建物の変遷を2025年まで一度だけ計算中…')
-  const complete = generateCity(fullInput, onProgress, onPreview, () => accelerated)
+  onProgress(input.cityEngine === 'layout' ? '施設用地・街路・街区を設計中…' : '街道・建物の変遷を2025年まで一度だけ計算中…')
+  const complete = (input.cityEngine === 'layout' ? generateLayoutCity : generateCity)(fullInput, onProgress, onPreview, () => accelerated)
   const map = sliceCityAtYear(complete, requestedYear)
   return { map, acceleration: {
     terrainBackend: wasm ? 'wasm' : 'javascript', wasm: terrainWasmStatus(),
@@ -63,5 +64,6 @@ export async function runAcceleratedGeneration(input: CityConfig, terrainSource:
     initializationMilliseconds: preparedAt - started, terrainMilliseconds: terrainAt - preparedAt,
     indexMilliseconds: indexedAt - terrainAt, cityMilliseconds: performance.now() - indexedAt,
     totalMilliseconds: performance.now() - started,
+    ...(input.cityEngine === 'layout' ? { layout: layoutGenerationReport(complete) } : {}),
   } }
 }
