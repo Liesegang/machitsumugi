@@ -57,7 +57,18 @@ export async function runAcceleratedGeneration(input: CityConfig, terrainSource:
   const accelerated: TerrainModel = indexes.water ? { ...terrain, waterAt: indexes.water.query } : terrain
   onProgress(input.cityEngine === 'continuous' ? '連続した街路網と、街区全体の土地割を設計中…' : input.cityEngine === 'layout' ? '施設用地・街路・街区を設計中…' : '街道・建物の変遷を2025年まで一度だけ計算中…')
   const generate = input.cityEngine === 'continuous' ? generateContinuousCity : input.cityEngine === 'layout' ? generateLayoutCity : generateCity
-  const complete = generate(fullInput, onProgress, onPreview, () => accelerated)
+  let previousCityLabel = ''
+  const cityProgress = (label: string) => {
+    let display = label
+    if (input.cityEngine === 'continuous' && label.startsWith('土地被覆:')) {
+      const fraction = label.match(/(\d+)\/(\d+)/)
+      const percent = fraction && Number(fraction[2]) > 0 ? Math.floor(Number(fraction[1]) / Number(fraction[2]) * 20) * 5 : undefined
+      display = label.includes('農地区') ? '農地のまとまりを整備中…' : /森林|斜面|自然被覆/.test(label) ? '林と緑地を整理中…' : '土地の用途を整理中…'
+      if (percent !== undefined) display += ` ${percent}%`
+    }
+    if (display !== previousCityLabel) { previousCityLabel = display; onProgress(display) }
+  }
+  const complete = generate(fullInput, cityProgress, onPreview, () => accelerated)
   const map = sliceCityAtYear(complete, requestedYear)
   return { map, acceleration: {
     terrainBackend: wasm ? 'wasm' : 'javascript', wasm: terrainWasmStatus(),

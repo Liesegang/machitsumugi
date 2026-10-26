@@ -1,9 +1,9 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
+import { CONTINUOUS_PROJECT_POINT_LIMIT, LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
 import type { Project } from './project'
 import type { CityMap } from './types'
 import { createCityTimeline } from './timeline'
-import { portableProject } from './project'
+import { portableProject, serializeProject } from './project'
 
 const sample = (): Project => ({
   version: 2,
@@ -37,6 +37,34 @@ const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
+  it('restores compact continuous maps with complete dated geometry and still validates decoded coordinates', () => {
+    const project = withSnapshot(), map = project.snapshot!
+    project.config.cityEngine = 'continuous'; map.config.cityEngine = 'continuous'
+    map.timeline = createCityTimeline(map)
+    const text = serializeProject(project)
+    expect(JSON.parse(text)).toMatchObject({ version: 3, format: 'city-project-compact-v1' })
+    expect(parseProject(text)).toEqual(parseProject(JSON.stringify(portableProject(project))))
+    expect(map.roads).toHaveLength(1)
+    map.timeline.roads[0]!.value.points[0]!.x = -1_000_000
+    expect(() => parseProject(serializeProject(project))).toThrow('横位置')
+  })
+  it('keeps the existing JSON wire form for saved historical and layout engines', () => {
+    for (const engine of [undefined, 'history', 'layout'] as const) {
+      const project = withSnapshot()
+      project.config.cityEngine = engine; project.snapshot!.config.cityEngine = engine
+      expect(serializeProject(project)).toBe(JSON.stringify(portableProject(project)))
+    }
+  })
+  it.each(['history', 'continuous'] as const)('retains and validates surveyed bridge banks across dated %s road versions', engine => {
+    const project = withSnapshot(), map = project.snapshot!
+    project.config.cityEngine = engine; map.config.cityEngine = engine
+    map.roads[0]!.surveyedBridgeSpans = [{ bankA: { x: 20, y: 50 }, bankB: { x: 80, y: 50 }, riverId: 'river-1', candidateId: 'bridge-1' }]
+    map.timeline = createCityTimeline(map)
+    const restored = parseProject(serializeProject(project))
+    expect(restored.snapshot!.timeline!.roads[0]!.value.surveyedBridgeSpans).toEqual(map.roads[0]!.surveyedBridgeSpans)
+    map.timeline.roads[0]!.value.surveyedBridgeSpans![0]!.bankB.x = 1_000_000
+    expect(() => parseProject(serializeProject(project))).toThrow('横位置')
+  })
   it('persists the selected generation engine without migrating older projects', () => {
     const project = withSnapshot()
     project.config.cityEngine = 'layout'
@@ -321,10 +349,11 @@ describe('saved projects', () => {
     expect(() => validateProject(input)).toThrow('道路の形')
   })
 
-  it('bounds the combined vertex count even when every individual road is within its limit', () => {
+  it.each([{ engine: undefined, limit: PROJECT_GEOMETRY_LIMITS.points }, { engine: 'continuous' as const, limit: CONTINUOUS_PROJECT_POINT_LIMIT }])('bounds combined vertices for $engine even when every individual road is within its limit', ({ engine, limit }) => {
     const input = withSnapshot()
+    input.config.cityEngine = engine; input.snapshot!.config.cityEngine = engine
     const points = Array.from({ length: 20_000 }, (_, i) => ({ x: i % 2, y: 50 }))
-    input.snapshot!.roads = Array.from({ length: Math.floor(PROJECT_GEOMETRY_LIMITS.points / points.length) + 1 }, (_, i) => ({ ...input.snapshot!.roads[0], id: `road-${i}`, points }))
+    input.snapshot!.roads = Array.from({ length: Math.floor(limit / points.length) + 1 }, (_, i) => ({ ...input.snapshot!.roads[0], id: `road-${i}`, points }))
     expect(() => validateProject(input)).toThrow('頂点数')
   })
 

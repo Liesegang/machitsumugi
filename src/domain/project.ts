@@ -2,6 +2,7 @@ import type { CityConfig, CityMap, Point, TerrainSurface, TimelineVersion } from
 import { sliceCityAtYear } from './timeline'
 import { readableProvisionalNames } from './place-names'
 import { validateMapEdits } from './map-edits'
+import { encodeCompactProject, decodeCompactProject } from './project-compact'
 import type { MapEdit } from './map-edits'
 import type { Annotation, LayerSettings, MapStyle } from '../map/render'
 
@@ -25,6 +26,10 @@ export const LEGACY_STORAGE_KEY = 'machitsumugi.project.v1'
 export const MAX_PROJECT_FILE_BYTES = 256_000_000
 export const MAX_PROJECT_JSON_LENGTH = 192_000_000
 export const PROJECT_GEOMETRY_LIMITS = { points: 4_000_000, areaRingPoints: 32_768, entities: 750_000, roads: 100_000, buildings: 200_000, areas: 100_000, blocks: 160_000, parcels: 250_000, events: 300_000 } as const
+// The continuous engine's completed12×9km project contains4.78M point
+// occurrences across its entire history. Keep a finite budget for that engine;
+// historical/layout projects retain4M and every other validation limit remains.
+export const CONTINUOUS_PROJECT_POINT_LIMIT = 5_000_000
 export const MAX_LOCAL_STORAGE_LENGTH = 2_000_000
 export const ARCHIVE_DATABASE = 'machitsumugi.archive.v1'
 const ARCHIVE_STORE = 'projects'
@@ -106,11 +111,12 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
   const height = number(input.height, '地図の高さ', 100, 50_000)
   const snapshotConfig = configFrom(input.config)
   if (!sameConfig(config, snapshotConfig)) throw new Error('街の設定と保存済み地図の設定が一致しません。')
+  const pointLimit = config.cityEngine === 'continuous' ? CONTINUOUS_PROJECT_POINT_LIMIT : PROJECT_GEOMETRY_LIMITS.points
   let pointCount = 0
   let entityCount = 0
   const margin = Math.max(width, height) / 4
   function point(value: unknown, label: string): Point {
-    if (++pointCount > PROJECT_GEOMETRY_LIMITS.points) throw new Error('保存済み地図の頂点数が上限を超えています。')
+    if (++pointCount > pointLimit) throw new Error('保存済み地図の頂点数が上限を超えています。')
     const p = object(value, label)
     // Polygons and routes may cross the map boundary; the renderer clips them.
     return { x: number(p.x, `${label}の横位置`, -margin, width + margin), y: number(p.y, `${label}の縦位置`, -margin, height + margin) }
@@ -148,6 +154,10 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       ...(r.throughRouteId === undefined ? {} : { throughRouteId: string(r.throughRouteId, '連続幹線の計画ID', 128) }),
       ...(r.reason === undefined ? {} : { reason: string(r.reason, '道路の建設理由', 2000, true) }),
       ...(r.bridge === undefined ? {} : { bridge: boolean(r.bridge, '橋の指定') }),
+      ...(r.surveyedBridgeSpans === undefined ? {} : { surveyedBridgeSpans: array(r.surveyedBridgeSpans, '測量済みの橋', 2000).map(value => {
+        const span = object(value, '測量済みの橋')
+        return { bankA: point(span.bankA, '橋の片岸'), bankB: point(span.bankB, '橋の対岸'), ...(span.riverId === undefined ? {} : { riverId: string(span.riverId, '河川のID', 128) }), ...(span.candidateId === undefined ? {} : { candidateId: string(span.candidateId, '架橋候補のID', 128) }) }
+      }) }),
       ...(r.phase === undefined ? {} : { phase: string(r.phase, '道路の成立段階', 128) }),
       ...(r.constructionCost === undefined ? {} : { constructionCost: number(r.constructionCost, '道路の建設費', 0, 1e15) }),
     })
@@ -327,10 +337,11 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
   return readableProvisionalNames(map)
 }
 
-/** Reconstruct known fields, migrating v1 settings while retaining v2 geometry. */
+/** Reconstruct known fields, retaining authoritative geometry in every wire form. */
 export function validateProject(data: unknown): Project {
+  if (data && typeof data === 'object' && (data as { version?: unknown }).version === 3) data = decodeCompactProject(data)
   const input = object(data, 'プロジェクト')
-  if (input.version !== 1 && input.version !== 2) throw new Error('このプロジェクトの保存形式には対応していません。バージョン1または2のJSONを選んでください。')
+  if (input.version !== 1 && input.version !== 2) throw new Error('このプロジェクトの保存形式には対応していません。設定を保存して書き出したJSONを選んでください。')
   const config = configFrom(input.config)
   const snapshot = input.version === 2 && input.snapshot !== undefined ? snapshotFrom(input.snapshot, config) : undefined
   const usedIds = new Set<string>()
@@ -460,9 +471,17 @@ export function portableProject(project: Project): Project {
   return snapshot?.timeline ? { ...project, snapshot: { ...snapshot, roads: [], buildings: [], areas: [], railways: [], stations: [], facilities: [], districts: [], parcels: undefined, blocks: undefined, terrainSurface: undefined, events: undefined, snapshots: undefined, growthLog: undefined } } : project
 }
 
-export function downloadProject(project: Project): void {
-  const validated = validateProject(portableProject(project)), text = JSON.stringify(portableProject(validated))
+/** Compact wire storage changes representation only. The normal validator
+ * still checks every decoded entity, point and date, with the existing caps. */
+export function serializeProject(project: Project): string {
+  const value = portableProject(project)
+  const text = JSON.stringify(project.config.cityEngine === 'continuous' ? encodeCompactProject(value) : value)
   if (text.length > MAX_PROJECT_JSON_LENGTH) throw new Error('保存できるプロジェクトの大きさを超えています。')
+  return text
+}
+
+export function downloadProject(project: Project): void {
+  const validated = validateProject(portableProject(project)), text = serializeProject(validated)
   const blob = new Blob([text], { type: 'application/json;charset=utf-8' })
   if (blob.size > MAX_PROJECT_FILE_BYTES) throw new Error('保存できるプロジェクトの大きさを超えています。')
   const url = URL.createObjectURL(blob), link = document.createElement('a')
