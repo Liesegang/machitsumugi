@@ -89,7 +89,7 @@ describe('continuous city whole-block cadastre', () => {
   })
 
   it('acquires contiguous mixed corners and small apartments near the real network instead of painting every collector title commercial', () => {
-    const source = run().input, roads = source.roads.map(road => road.id === 'north' ? { ...road, width: 9, kind: 'arterial' as const, role: 'collector' as const } : road)
+    const source = run().input, roads = source.roads.map(road => road.id === 'north' ? { ...road, width: 9, kind: 'arterial' as const, role: 'collector' as const } : { ...road, width: 4.8, role: 'lane' as const })
     const core = run({ roads, demand: { ...source.demand, center: { x: 80, y: 20 }, at: () => .9 } }).result
     expect(core.metrics.stock.mixed!.count).toBeGreaterThan(0)
     expect(core.metrics.stock.walkup!.count).toBeGreaterThan(0)

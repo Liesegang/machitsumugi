@@ -5,6 +5,7 @@ import { boundsOf, corridorPolygon, distance, distanceToSegment, intersectRegion
 import { buildingServiceYears } from './building-lifecycle'
 import { MinHeap } from './road-graph'
 import { indexedPolygonOverlap } from './indexed-polygon-overlap'
+import { subtractContinuousCover } from './continuous-city-cover'
 
 interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds }
 interface Frontage { a: Point; b: Point; segment: Segment; length: number }
@@ -284,7 +285,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     const result: FrontageProgramme[] = fronts.map(front => ({ front, stock: ordinary, from: 0, to: front.length, route: network(front) }))
     const core = (programme: FrontageProgramme) => programme.route.distance < (programme.route.source === 'station' ? 680 : 880)
     const wide = result.filter(programme => (programme.front.segment.road.width >= 8 || programme.front.segment.road.role === 'collector' || programme.route.source === 'station' && programme.route.distance < 300 && programme.front.segment.road.width >= 6) && core(programme) && intensity >= .58).sort((a, b) => a.route.distance - b.route.distance || b.front.segment.road.width - a.front.segment.road.width)[0]
-    const local = result.filter(programme => programme.front.segment.road.id !== wide?.front.segment.road.id && programme.front.segment.road.width >= 5 && result.filter(other => other.front.segment.road.id === programme.front.segment.road.id).reduce((sum, other) => sum + other.front.length, 0) >= 25 && core(programme) && intensity >= .68).sort((a, b) => a.front.length - b.front.length || a.route.distance - b.route.distance)[0]
+    const local = result.filter(programme => programme.front.segment.road.id !== wide?.front.segment.road.id && programme.front.segment.road.width >= 4.6 && result.filter(other => other.front.segment.road.id === programme.front.segment.road.id).reduce((sum, other) => sum + other.front.length, 0) >= 25 && core(programme) && intensity >= .68).sort((a, b) => a.front.length - b.front.length || a.route.distance - b.route.distance)[0]
     // A mixed-use corner or a small apartment acquisition is a contiguous
     // frontage programme, never a fresh apartment/commercial coin per title.
     for (const [programme, stock] of [[wide, 'mixed'], [local, 'walkup']] as const) {
@@ -405,7 +406,10 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     }
     const cropped = intersectRegions(block, { polygon: rectangle(0, 0, input.width, input.height) })
     const bounds = boundsOf(block.polygon), roads = roadIndex.query(bounds).map(segment => ({ polygon: segment.polygon }))
-    let regions = cropped.flatMap(part => subtractRegions(part, [...obstacles(part), ...roads]))
+    // Open fringe can span the city and intersect thousands of ROW strips.
+    // Reuse the bounded fixed-grid difference there; ordinary block-sized
+    // inputs keep the same small-component kernel through this wrapper.
+    let regions = cropped.flatMap(part => subtractContinuousCover(part, [...obstacles(part), ...roads]))
     const initialArea = sumArea(regions); metrics.buildableArea += initialArea
     const beforeLots = metrics.parcelArea, beforeOpen = metrics.openSpaceArea, beforeUnassigned = metrics.unassignedArea
     const inDemand: PolygonRegion[] = []

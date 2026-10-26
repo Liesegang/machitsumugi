@@ -48,7 +48,7 @@ function renewCivics(buildings:Building[],seed:string):TimelineVersion<Building>
 /** Fresh final-form algorithm: a continuous land market → shared street fabric
  * → complete block cadastre → simple, contained building footprints.
  * It never consumes a previous city's roads, parcels, buildings or zones. */
-export function generateContinuousCity(input:CityConfig,onProgress?:(label:string)=>void,onPreview?:(map:CityMap)=>void,terrainSource:GenerationTerrainSource=createTerrainModel,observer?:{coverGeometry?:(stage:string,parts:readonly PolygonRegion[])=>void}):CityMap {
+export function generateContinuousCity(input:CityConfig,onProgress?:(label:string)=>void,onPreview?:(map:CityMap)=>void,terrainSource:GenerationTerrainSource=createTerrainModel,observer?:{coverGeometry?:(stage:string,parts:readonly PolygonRegion[])=>void;landComplete?:(land:ReturnType<typeof developContinuousCityLand>,roads:Road[])=>void}):CityMap {
   const start=performance.now(),resolved=resolveGenerationConfig(input),requestedYear=resolved.year
   const phases:{phase:string;milliseconds:number}[]=[]
   let lastPhase='地形の読込',lastStarted=start
@@ -114,6 +114,7 @@ export function generateContinuousCity(input:CityConfig,onProgress?:(label:strin
   const landDomains=buildContinuousCityLandDomains({demandRegions:demand.regions,streetBlocks})
   const land=developContinuousCityLand({config,width,height,roads,blocks:landDomains.domains,demand,stations:rail.stations,centerAccess,reserves:[...reserves,...railMasks],terrain})
   roads=materializeRoadJunctions([...roads,...land.accessRoads])
+  observer?.landComplete?.(land,roads)
   phase('まとまった農地・林・公園を割り当て中…')
   const coverTerrain={...terrain,areas:natural}
   const cover=buildContinuousCityCover({config,width,height,terrain:coverTerrain,demand,roads,parcels:land.parcels,reserves:[...reserves,...railMasks,...land.openSpaces],urbanBlocks:streetBlocks,onProgress:phase,onGeometry:observer?.coverGeometry})
