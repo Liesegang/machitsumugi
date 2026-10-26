@@ -6,6 +6,43 @@ const metadata = (id: string): RoadMetadata => ({ id, builtYear: 1700, phase: 'o
 const point = (x: number, y: number) => ({ x, y })
 
 describe('incremental planar road graph', () => {
+  it('prunes reuse by endpoints while retaining raw-append fallback across graph rebuild APIs', () => {
+    const graph = new PlanarRoadGraph()
+    graph.add([point(0, 0), point(100, 0)], metadata('near'), false)
+    graph.add([point(10000, 0), point(10100, 0)], metadata('far'), false)
+    const expectIndexed = (value: PlanarRoadGraph) => {
+      const far = value.roads.find(road => road.id === 'far')!, descriptor = Object.getOwnPropertyDescriptor(far, 'width')!, read = vi.fn(() => 6)
+      Object.defineProperty(far, 'width', { configurable: true, enumerable: true, get: read })
+      try {
+        expect(value.reusableRoad([point(0, 0), point(100, 5)], metadata('new-path'))).toBeNull()
+        expect(read).not.toHaveBeenCalled()
+      } finally { Object.defineProperty(far, 'width', descriptor) }
+    }
+    expectIndexed(graph)
+    const raw = { ...metadata('raw'), points: [point(400, 0), point(500, 0)] }
+    graph.roads.push(raw)
+    expect(graph.reusableRoad([...raw.points].reverse(), metadata('raw-reverse'))).toBe(raw)
+    graph.add([point(1000, 0), point(1100, 0)], metadata('indexed-after-raw'), false)
+    expect(graph.reusableRoad(raw.points, metadata('still-raw'))).toBe(raw)
+    expectIndexed(graph.fork())
+    expect(graph.modify('near', 1800, { width: 8, reason: 'widen with complete index rebuild', constructionCost: 1 })).not.toBeNull()
+    expectIndexed(graph)
+    const appended = { ...metadata('raw-before-batch'), points: [point(600, 0), point(700, 0)] }
+    graph.roads.push(appended)
+    expect(graph.addBatch([{ points: [point(700, 0), point(700, 100)], metadata: metadata('batch-link') }])).not.toBeNull()
+    expectIndexed(graph)
+    expect(graph.reusableRoad(appended.points, metadata('batch-rebuilt-raw'))?.id).toBe('raw-before-batch')
+  })
+
+  it('keeps original first-match order when equivalent reuse endpoints span neighbouring index buckets', () => {
+    const raw = new PlanarRoadGraph(), first = { ...metadata('first'), points: [point(100.01, 0), point(200.01, 0)] }, second = { ...metadata('second'), points: [point(99.99, 0), point(199.99, 0)] }
+    raw.roads.push(first, second)
+    const graph = raw.fork(), path = [point(100, 0), point(200, 0)]
+    expect(graph.reusableRoad(path, metadata('proposal'))?.id).toBe('first')
+    expect(graph.reusableRoad([...path].reverse(), metadata('reverse'))?.id).toBe('first')
+    expect(graph.reusableRoad(path, { ...metadata('too-wide'), width: 6.1 })).toBeNull()
+  })
+
   it('removes complete T/Y dead-end excursions without changing the actual closed perimeter', () => {
     const graph = new PlanarRoadGraph(), ring = [point(0, 0), point(400, 0), point(400, 300), point(0, 300), point(0, 0)]
     graph.add(ring, metadata('perimeter'), false)

@@ -98,6 +98,9 @@ export class PlanarRoadGraph {
   get roadHistory(): TimelineVersion<SimulatedRoad>[] {
     return [...this.retiredVersions, ...this.roads.map(road => ({ from: this.versionStart.get(road.id) ?? road.builtYear, value: { ...road, points: road.points.map(p => ({ ...p })) } }))]
   }
+  // Raw appends require fallback until rebuilding the index. Direct same-length
+  // array replacement is unsupported, as with the graph's other spatial queries.
+  private indexedRoadCount = 0
   private segments: Segment[] = []
   private buckets = new Map<string, Segment[]>()
   private revision = 0
@@ -253,7 +256,10 @@ export class PlanarRoadGraph {
     if (path.length < 2) return null
     const first = path[0]!, last = path.at(-1)!, proposal = { ...metadata, points: path }
     const covered = (points: Point[], route: Point[]) => points.every(point => route.slice(1).some((end, i) => dist(projectOnRoadSegment(point, route[i]!, end).point, point) <= .04))
-    for (const road of this.roads) {
+    const candidates = this.indexedRoadCount === this.roads.length
+      ? [...new Set([...this.nearby(first, first, .04)].map(segment => segment.road))].sort((a, b) => this.roads.indexOf(a) - this.roads.indexOf(b))
+      : this.roads
+    for (const road of candidates) {
       if (road.width + 1e-7 < metadata.width || controlledRoad(road) !== controlledRoad(metadata) || !!(road.bridge || road.role === 'bridge') !== !!(metadata.bridge || metadata.role === 'bridge')) continue
       const sameEnds = dist(first, road.points[0]!) < .04 && dist(last, road.points.at(-1)!) < .04
       const reversedEnds = dist(first, road.points.at(-1)!) < .04 && dist(last, road.points[0]!) < .04
@@ -313,6 +319,7 @@ export class PlanarRoadGraph {
       this.segments.push(segment)
       for (const k of this.keys(segment.a, segment.b)) { const bucket = this.buckets.get(k) ?? []; bucket.push(segment); this.buckets.set(k, bucket) }
     }
+    this.indexedRoadCount++
     this.revision++
     return road
   }
@@ -329,6 +336,7 @@ export class PlanarRoadGraph {
       staged.segments.push(segment)
       for (const k of staged.keys(segment.a, segment.b)) { const bucket = staged.buckets.get(k) ?? []; bucket.push(segment); staged.buckets.set(k, bucket) }
     }
+    staged.indexedRoadCount = staged.roads.length
     return staged
   }
   /** Infrastructure with several mandatory accesses is committed atomically.
@@ -346,6 +354,7 @@ export class PlanarRoadGraph {
     }
     this.roads.splice(0, this.roads.length, ...staged.roads)
     this.retiredVersions = staged.retiredVersions; this.versionStart = staged.versionStart
+    this.indexedRoadCount = staged.indexedRoadCount
     this.segments = staged.segments; this.buckets = staged.buckets; this.revision++; this.routing = null
     return added
   }
@@ -370,6 +379,7 @@ export class PlanarRoadGraph {
       this.segments.push(segment)
       for (const k of this.keys(segment.a, segment.b)) { const bucket = this.buckets.get(k) ?? []; bucket.push(segment); this.buckets.set(k, bucket) }
     }
+    this.indexedRoadCount = this.roads.length
     this.revision++
     return updated
   }
