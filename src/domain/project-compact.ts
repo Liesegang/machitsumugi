@@ -11,16 +11,18 @@ export interface CompactProjectEnvelope {
 export type EncodedValue = number | boolean | null | [2, string] | EncodedValue[]
 
 export const COMPACT_PROJECT_LIMITS = {
-  // The validated native v4 portable project contains 20,152,895 JSON nodes.
+  // The completed dense native portable project contains35,027,127 JSON nodes.
   // This finite traversal guard has headroom for that project; the existing
   // project validator still enforces every entity, point and file-size cap.
-  nodes: 24_000_000,
+  nodes: 40_000_000,
   depth: 128,
   schemas: 2048,
   keysPerSchema: 256,
   keyLength: 1024,
   schemaCharacters: 1_000_000,
-  strings: 1_000_000,
+  // The dense native land checkpoint alone has1,030,495 distinct strings.
+  // Domain/entity/geometry budgets still apply after lossless decoding.
+  strings: 1_250_000,
   stringLength: 2_000_000,
   stringCharacters: 128_000_000,
   arrayItems: 1_000_000,

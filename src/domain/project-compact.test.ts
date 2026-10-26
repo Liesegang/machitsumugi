@@ -55,6 +55,13 @@ describe('lossless compact project wire format', () => {
     for (let i = 0; i <= COMPACT_PROJECT_LIMITS.depth; i++) encoded = [0, encoded]
     expect(() => decodeCompactProject({ ...valid, data: [-1, encoded] })).toThrow(/深さ/)
   })
+  it('retains a finite dictionary budget above the measured dense native checkpoint', () => {
+    const value = wire({ version: 2 }), strings = Array.from({ length: 1_000_001 }, (_, i) => `id-${i}`)
+    expect(decodeCompactProject({ ...value, strings })).toEqual({ version: 2 })
+    expect(COMPACT_PROJECT_LIMITS.strings).toBe(1_250_000)
+    expect(() => decodeCompactProject({ ...value, strings: new Array(COMPACT_PROJECT_LIMITS.strings + 1) })).toThrow(/辞書/)
+    expect(COMPACT_PROJECT_LIMITS.nodes).toBe(40_000_000)
+  })
   it('packs only strictly smaller finite x/y leaves, keeping short and equal-length coordinates numeric', () => {
     const short = { x: 1234.5678, y: 2045.6789 }, tied = { x: 123456789012, y: 123456789012 }, longer = { x: 1234567890123, y: 123456789012 }
     const extended = { x: longX, y: Number('2345.2345678901234'), z: undefined }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { CONTINUOUS_PROJECT_POINT_LIMIT, LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
+import { CONTINUOUS_PROJECT_ENTITY_LIMITS, CONTINUOUS_PROJECT_POINT_LIMIT, LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
 import type { Project } from './project'
 import type { CityMap } from './types'
 import { createCityTimeline } from './timeline'
@@ -37,6 +37,43 @@ const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
+  it('keeps dense continuous table capacity finite without expanding saved legacy engine budgets', () => {
+    const reached = new Error('record reader reached'), deferred = <T,>(length: number): T[] => {
+      const values = new Array<T>(length)
+      Object.defineProperty(values, 0, { get() { throw reached } })
+      return values
+    }
+    const cases = [
+      { table: 'buildings', historic: PROJECT_GEOMETRY_LIMITS.buildings, continuous: CONTINUOUS_PROJECT_ENTITY_LIMITS.buildings, archived: false },
+      { table: 'buildings', historic: PROJECT_GEOMETRY_LIMITS.buildings, continuous: CONTINUOUS_PROJECT_ENTITY_LIMITS.buildingVersions, archived: true },
+      { table: 'areas', historic: PROJECT_GEOMETRY_LIMITS.areas, continuous: CONTINUOUS_PROJECT_ENTITY_LIMITS.areaVersions, archived: true },
+      { table: 'events', historic: PROJECT_GEOMETRY_LIMITS.events, continuous: CONTINUOUS_PROJECT_ENTITY_LIMITS.events, archived: false },
+      { table: 'events', historic: PROJECT_GEOMETRY_LIMITS.events, continuous: CONTINUOUS_PROJECT_ENTITY_LIMITS.events, archived: true },
+    ] as const
+    for (const entry of cases) for (const engine of [undefined, 'history', 'layout', 'continuous'] as const) {
+      const input = withSnapshot(), map = input.snapshot!
+      input.config.cityEngine = engine; map.config.cityEngine = engine; map.year = 2025
+      if (entry.archived) map.timeline = createCityTimeline(map)
+      const destination = (entry.archived ? map.timeline : map) as unknown as Record<string, unknown>
+      // The first-record sentinel proves that the array-size guard accepted
+      // the new engine's capacity before allocating hundreds of thousands of
+      // decoded geometries. Legacy arrays fail before reading any record.
+      destination[entry.table] = deferred(entry.historic + 1)
+      if (engine === 'continuous') expect(() => validateProject(input)).toThrow(reached)
+      else expect(() => validateProject(input)).toThrow(`${entry.historic.toLocaleString()}件以内`)
+      if (engine === 'continuous') {
+        destination[entry.table] = deferred(entry.continuous + 1)
+        expect(() => validateProject(input)).toThrow(`${entry.continuous.toLocaleString()}件以内`)
+      }
+    }
+    expect(PROJECT_GEOMETRY_LIMITS.entities).toBe(750000)
+    expect(CONTINUOUS_PROJECT_ENTITY_LIMITS.entities).toBe(1250000)
+    expect(CONTINUOUS_PROJECT_POINT_LIMIT).toBe(9000000)
+    const input = withSnapshot()
+    input.config.cityEngine = 'continuous'; input.snapshot!.config.cityEngine = 'continuous'
+    input.snapshot!.areas = deferred(PROJECT_GEOMETRY_LIMITS.areas + 1)
+    expect(() => validateProject(input)).toThrow(`${PROJECT_GEOMETRY_LIMITS.areas.toLocaleString()}件以内`)
+  })
   it('restores compact continuous maps with complete dated geometry and still validates decoded coordinates', () => {
     const project = withSnapshot(), map = project.snapshot!
     project.config.cityEngine = 'continuous'; map.config.cityEngine = 'continuous'

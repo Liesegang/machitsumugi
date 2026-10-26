@@ -23,13 +23,20 @@ export const LEGACY_STORAGE_KEY = 'machitsumugi.project.v1'
 // The 12 × 9 km preset covers nine small maps. Farmland and the full development
 // history must survive export too; these limits bound imports without truncating
 // that geometry. The combined budgets still apply across all individual arrays.
-export const MAX_PROJECT_FILE_BYTES = 256_000_000
-export const MAX_PROJECT_JSON_LENGTH = 192_000_000
+// The completed dense native12×9km compact-v2 wire is321,162,824 UTF8 bytes
+// and321,158,394 characters. Retain finite transport headroom without dropping
+// dated geometry; per-engine domain and individual geometry budgets follow.
+export const MAX_PROJECT_FILE_BYTES = 384_000_000
+export const MAX_PROJECT_JSON_LENGTH = 360_000_000
 export const PROJECT_GEOMETRY_LIMITS = { points: 4_000_000, areaRingPoints: 32_768, entities: 750_000, roads: 100_000, buildings: 200_000, areas: 100_000, blocks: 160_000, parcels: 250_000, events: 300_000 } as const
-// The continuous engine's completed12×9km project contains4.78M point
+// The dense continuous engine's completed12×9km project contains8,213,550 point
 // occurrences across its entire history. Keep a finite budget for that engine;
-// historical/layout projects retain4M and every other validation limit remains.
-export const CONTINUOUS_PROJECT_POINT_LIMIT = 5_000_000
+// historical/layout projects retain4M.
+export const CONTINUOUS_PROJECT_POINT_LIMIT = 9_000_000
+// The dense12×9km land checkpoint already contains220,894 current buildings,
+// 326,935 building versions and433,882 events: over1.03M portable entities
+// before cover history. Keep finite measured headroom for this engine only.
+export const CONTINUOUS_PROJECT_ENTITY_LIMITS = { entities: 1_250_000, buildings: 250_000, buildingVersions: 400_000, areaVersions: 200_000, events: 500_000 } as const
 export const MAX_LOCAL_STORAGE_LENGTH = 2_000_000
 export const ARCHIVE_DATABASE = 'machitsumugi.archive.v1'
 const ARCHIVE_STORE = 'projects'
@@ -112,6 +119,12 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
   const snapshotConfig = configFrom(input.config)
   if (!sameConfig(config, snapshotConfig)) throw new Error('街の設定と保存済み地図の設定が一致しません。')
   const pointLimit = config.cityEngine === 'continuous' ? CONTINUOUS_PROJECT_POINT_LIMIT : PROJECT_GEOMETRY_LIMITS.points
+  const continuous = config.cityEngine === 'continuous'
+  const entityLimit = continuous ? CONTINUOUS_PROJECT_ENTITY_LIMITS.entities : PROJECT_GEOMETRY_LIMITS.entities
+  const buildingLimit = continuous ? CONTINUOUS_PROJECT_ENTITY_LIMITS.buildings : PROJECT_GEOMETRY_LIMITS.buildings
+  const buildingVersionLimit = continuous ? CONTINUOUS_PROJECT_ENTITY_LIMITS.buildingVersions : PROJECT_GEOMETRY_LIMITS.buildings
+  const areaVersionLimit = continuous ? CONTINUOUS_PROJECT_ENTITY_LIMITS.areaVersions : PROJECT_GEOMETRY_LIMITS.areas
+  const eventLimit = continuous ? CONTINUOUS_PROJECT_ENTITY_LIMITS.events : PROJECT_GEOMETRY_LIMITS.events
   let pointCount = 0
   let entityCount = 0
   const margin = Math.max(width, height) / 4
@@ -135,7 +148,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
   function entities<T>(value: unknown, label: string, limit: number, read: (input: Record<string, unknown>, id: string) => T): T[] {
     const ids = new Set<string>()
     return array(value, label, limit).map(item => {
-      if (++entityCount > PROJECT_GEOMETRY_LIMITS.entities) throw new Error('保存済み地図の要素数が上限を超えています。')
+      if (++entityCount > entityLimit) throw new Error('保存済み地図の要素数が上限を超えています。')
       const input = object(item, label), id = string(input.id, `${label}のID`, 128)
       if (ids.has(id)) throw new Error(`${label}のIDに重複があります。`)
       ids.add(id)
@@ -225,7 +238,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     width, height, config: snapshotConfig,
     description: string(input.description, '地図の説明', 5000, true),
     roads: entities(input.roads, '道路', PROJECT_GEOMETRY_LIMITS.roads, readRoad),
-    buildings: entities(input.buildings, '建物', PROJECT_GEOMETRY_LIMITS.buildings, readBuilding),
+    buildings: entities(input.buildings, '建物', buildingLimit, readBuilding),
     areas: entities(input.areas, '土地', PROJECT_GEOMETRY_LIMITS.areas, readArea),
     railways: entities(input.railways, '線路', 100, readRailway),
     stations: entities(input.stations, '駅', 100, readStation),
@@ -268,7 +281,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     }
   })
   if (input.parcels !== undefined) map.parcels = entities(input.parcels, '敷地', PROJECT_GEOMETRY_LIMITS.parcels, readParcel)
-  if (input.events !== undefined) map.events = entities(input.events, '都市の履歴', PROJECT_GEOMETRY_LIMITS.events, readEvent)
+  if (input.events !== undefined) map.events = entities(input.events, '都市の履歴', eventLimit, readEvent)
   if (input.snapshots !== undefined) map.snapshots = array(input.snapshots, '人口と開発の記録', 1000).map(item => {
     const s = object(item, '人口と開発の記録'), count = (key: string) => number(s[key], `記録「${key}」`, 0, 100_000_000, true)
     return { year: year(s.year, '記録の年'), households: count('households'), capacity: count('capacity'), vacant: count('vacant'), unmet: count('unmet'), roads: count('roads'), buildings: count('buildings') }
@@ -294,7 +307,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       return records
     }
     const roads = versions(archive.roads, '道路履歴', PROJECT_GEOMETRY_LIMITS.roads, readRoad)
-    const buildings = versions(archive.buildings, '建物履歴', PROJECT_GEOMETRY_LIMITS.buildings, readBuilding)
+    const buildings = versions(archive.buildings, '建物履歴', buildingVersionLimit, readBuilding)
     const parcels = versions(archive.parcels, '敷地履歴', PROJECT_GEOMETRY_LIMITS.parcels, readParcel)
     const buildingIds = new Set(buildings.map(v => v.value.id)), roadIds = new Set(roads.map(v => v.value.id)), parcelIds = new Set(parcels.map(v => v.value.id))
     if (parcels.some(v => !roadIds.has(v.value.roadId)) || buildings.some(v => v.value.parcelId !== undefined && !parcelIds.has(v.value.parcelId))) throw new Error('年代履歴の敷地・接道の参照先がありません。')
@@ -302,7 +315,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     for (const version of buildings) { const records = buildingIntervals.get(version.value.id) ?? []; records.push(version); buildingIntervals.set(version.value.id, records) }
     const states = new Set<string>()
     const buildingStates = array(archive.buildingStates, '利用状況履歴', PROJECT_GEOMETRY_LIMITS.events).map(item => {
-      if (++entityCount > PROJECT_GEOMETRY_LIMITS.entities) throw new Error('保存済み地図の要素数が上限を超えています。')
+      if (++entityCount > entityLimit) throw new Error('保存済み地図の要素数が上限を超えています。')
       const state = object(item, '利用状況履歴'), id = string(state.id, '建物履歴ID', 128), from = number(state.from, '利用状況の年', fromYear, throughYear, true), key = `${id}:${from}`
       if (!buildingIds.has(id) || !buildingIntervals.get(id)?.some(version => version.from <= from && (version.to === undefined || from < version.to)) || states.has(key)) throw new Error('利用状況履歴の参照先または年代が正しくありません。')
       states.add(key)
@@ -318,10 +331,10 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     if (terrainSurfaces.some((v, i) => i > 0 && (terrainSurfaces[i - 1]!.to ?? throughYear + 1) > v.from)) throw new Error('標高履歴の有効期間が重複しています。')
     const readSnapshot = (value: unknown) => { const s = object(value, '人口記録'), count = (key: string) => number(s[key], `記録${key}`, 0, 100_000_000, true); return { year: number(s.year, '記録の年', fromYear, throughYear, true), households: count('households'), capacity: count('capacity'), vacant: count('vacant'), unmet: count('unmet'), roads: count('roads'), buildings: count('buildings') } }
     map.timeline = { version: 1, fromYear, throughYear, roads, buildings, parcels, buildingStates, terrainSurfaces,
-      areas: versions(archive.areas, '土地履歴', PROJECT_GEOMETRY_LIMITS.areas, readArea),
+      areas: versions(archive.areas, '土地履歴', areaVersionLimit, readArea),
       railways: versions(archive.railways, '線路履歴', 300, readRailway), stations: versions(archive.stations, '駅履歴', 300, readStation),
       facilities: versions(archive.facilities, '施設履歴', 6000, readFacility), districts: versions(archive.districts, '地区履歴', 10_000, readDistrict),
-      events: archive.events === undefined ? [] : entities(archive.events, '都市履歴', PROJECT_GEOMETRY_LIMITS.events, readEvent),
+      events: archive.events === undefined ? [] : entities(archive.events, '都市履歴', eventLimit, readEvent),
       snapshots: archive.snapshots === undefined ? [] : array(archive.snapshots, '人口履歴', 1000).map(readSnapshot),
       growthLog: archive.growthLog === undefined ? [] : array(archive.growthLog, '発展履歴', 1000).map(item => { const log = object(item, '発展履歴'); return { phase: string(log.phase, '段階', 128), roadsAdded: number(log.roadsAdded, '道路数', 0, PROJECT_GEOMETRY_LIMITS.roads, true), ...(log.year === undefined ? {} : { year: number(log.year, '発展年', fromYear, throughYear, true) }), ...(log.reason === undefined ? {} : { reason: string(log.reason, '発展理由', 2000, true) }), ...(log.households === undefined ? {} : { households: number(log.households, '発展世帯数', 0, 100_000_000, true) }), ...(log.unmetHouseholds === undefined ? {} : { unmetHouseholds: number(log.unmetHouseholds, '未充足世帯数', 0, 100_000_000, true) }), ...(log.constructionCost === undefined ? {} : { constructionCost: number(log.constructionCost, '発展建設費', 0, 1e15) }) } }),
     }
