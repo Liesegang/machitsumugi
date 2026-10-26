@@ -1,8 +1,17 @@
-import { describe, expect, it } from 'vitest'
-import { buildDistricts } from './districts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import * as polygonClipping from 'polygon-clipping'
+import ClipperLib from 'clipper-lib'
+import { buildDistricts, districtMergeDiagnostics, mergeDistrictRegions } from './districts'
 import type { DistrictInput } from './districts'
 import type { Parcel, Road } from './types'
-import { intersectRegions, pointInRegion, rectangle, regionArea } from './geometry'
+import type { PolygonRegion } from './geometry'
+import { intersectRegions, pointInRegion, polygonArea, rectangle, regionArea, subtractRegions } from './geometry'
+
+vi.mock('polygon-clipping', async importOriginal => {
+  const actual = await importOriginal<typeof import('polygon-clipping')>()
+  const library = ('default' in actual ? actual.default : actual) as typeof actual
+  return { ...actual, ...library, union: vi.fn(library.union) }
+})
 
 const config: DistrictInput['config'] = { name: '試験市', seed: 'districts', type: 'castle', terrain: 'river', density: 65, forest: 30, railway: false, stations: 0, arterial: true, facilities: [], settlement: 'regional-city' }
 const parcel = (id: string, x: number, y: number, roadId: string, year = 1900): Parcel => ({ id, polygon: rectangle(x, y, 20, 30), entrance: { x, y: y + 15 }, roadId, createdYear: year, developedYear: year + 5, use: 'residential' })
@@ -20,6 +29,80 @@ function grid(columns = 4, rows = 4): DistrictInput {
 }
 
 describe('street- and parcel-derived district territories', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    const actual = await vi.importActual<typeof import('polygon-clipping')>('polygon-clipping')
+    const library = ('default' in actual ? actual.default : actual) as typeof actual
+    vi.mocked(polygonClipping.union).mockReset().mockImplementation(library.union)
+  })
+
+  it('keeps successful floating unions unchanged, including coordinates finer than the fallback grid', () => {
+    const value = 123.123456789, before = districtMergeDiagnostics.integerFallbacks
+    const result = mergeDistrictRegions([{ polygon: rectangle(value, 10, 10, 10) }, { polygon: rectangle(value + 5, 10, 10, 10) }])
+    expect(result.some(region => region.polygon.some(point => point.x === value))).toBe(true)
+    expect(districtMergeDiagnostics.integerFallbacks).toBe(before)
+  })
+
+  it('retains holes, nested islands and disconnected fill when floating union cannot complete a ring', () => {
+    const x = 6000.1234567, y = 4000.7654321, regions: PolygonRegion[] = [
+      { polygon: rectangle(x, y, 100, 100), holes: [rectangle(x + 20, y + 20, 20, 20).reverse()] },
+      { polygon: rectangle(x + 90, y, 50, 100).reverse() },
+      { polygon: rectangle(x + 25, y + 25, 5, 5) },
+      { polygon: rectangle(x + 200, y + 50, 10, 10) },
+    ]
+    const expected = mergeDistrictRegions(regions), before = JSON.stringify(regions), failed = vi.fn()
+    for (const region of regions) for (const ring of [region.polygon, ...(region.holes ?? [])]) { ring.forEach(Object.freeze); Object.freeze(ring) }
+    vi.mocked(polygonClipping.union).mockImplementationOnce(() => { throw new Error('Unable to complete output ring starting at native-like contact') })
+    const result = mergeDistrictRegions(regions, failed)
+    expect(failed).toHaveBeenCalledWith(regions, expect.any(Error))
+    expect(JSON.stringify(regions)).toBe(before)
+    expect(result.reduce((sum, region) => sum + regionArea(region), 0)).toBeCloseTo(13725, 4)
+    for (const [point, covered] of [[{ x: x + 10, y: y + 10 }, true], [{ x: x + 22, y: y + 22 }, false], [{ x: x + 27, y: y + 27 }, true], [{ x: x + 205, y: y + 55 }, true], [{ x: x + 170, y: y + 55 }, false]] as const) expect(result.some(region => pointInRegion(point, region))).toBe(covered)
+    for (const [subjects, cuts] of [[result, expected], [expected, result]]) expect(subjects.reduce((sum, region) => sum + subtractRegions(region, cuts).reduce((area, part) => area + regionArea(part), 0), 0)).toBeLessThan(.001)
+  })
+
+  it('normalizes exact zero-fill backtracking while preserving both genuine figure-eight lobes', () => {
+    const a = { x: .00000123, y: .00000234 }, b = { x: 1.234567, y: .345678 }, c = { x: 1234.567, y: 3456.78 }, backtrack = [a, b, c, b]
+    expect(polygonArea(backtrack)).toBeGreaterThan(0) // Floating cancellation noise, not fill.
+    const regions = [{ polygon: backtrack }, { polygon: [{ x: 0, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }, { x: 10, y: 0 }] }, { polygon: rectangle(20, 0, 5, 5) }], before = JSON.stringify(regions), normalized = districtMergeDiagnostics.normalizedEmptyRings
+    vi.mocked(polygonClipping.union).mockImplementationOnce(() => { throw new Error('float ring failure') })
+    const result = mergeDistrictRegions(regions)
+    expect(result.reduce((sum, region) => sum + regionArea(region), 0)).toBeCloseTo(75, 6)
+    expect(districtMergeDiagnostics.normalizedEmptyRings).toBeGreaterThan(normalized)
+    expect(result.some(region => pointInRegion({ x: 2, y: 1 }, region))).toBe(true)
+    expect(result.some(region => pointInRegion({ x: 2, y: 9 }, region))).toBe(true)
+    expect(result.some(region => pointInRegion({ x: .5, y: 5 }, region))).toBe(false)
+    expect(JSON.stringify(regions)).toBe(before)
+  })
+
+  it('retains every exact source component and hole if the integer backend also fails', () => {
+    const regions = [{ polygon: rectangle(0, 0, 50, 50), holes: [rectangle(10, 10, 10, 10)] }, { polygon: rectangle(100, 0, 20, 20) }], before = JSON.stringify(regions), fallbacks = districtMergeDiagnostics.exactSourceFallbacks
+    vi.mocked(polygonClipping.union).mockImplementationOnce(() => { throw new Error('floating backend failed') })
+    vi.spyOn(ClipperLib.Clipper.prototype, 'Execute').mockReturnValueOnce(false)
+    expect(mergeDistrictRegions(regions)).toBe(regions)
+    expect(JSON.stringify(regions)).toBe(before)
+    expect(districtMergeDiagnostics.exactSourceFallbacks).toBe(fallbacks + 1)
+    expect(regions.some(region => pointInRegion({ x: 15, y: 15 }, region))).toBe(false)
+    expect(regions.some(region => pointInRegion({ x: 110, y: 10 }, region))).toBe(true)
+  })
+
+  it('keeps a genuinely positive sub-grid hole instead of filling it during fallback conversion', () => {
+    const regions = [{ polygon: rectangle(0, 0, 10, 10), holes: [rectangle(1, 1, 1e-8, 1e-8)] }, { polygon: rectangle(20, 0, 5, 5) }], before = JSON.stringify(regions)
+    vi.mocked(polygonClipping.union).mockImplementationOnce(() => { throw new Error('floating backend failed') })
+    expect(mergeDistrictRegions(regions)).toBe(regions)
+    expect(JSON.stringify(regions)).toBe(before)
+    expect(regions.some(region => pointInRegion({ x: 1 + 5e-9, y: 1 + 5e-9 }, region))).toBe(false)
+  })
+
+  it('keeps all named territories and their complete area when floating district merges fail', () => {
+    const input = grid(), expected = buildDistricts(input)
+    vi.mocked(polygonClipping.union).mockImplementation(() => { throw new Error('floating backend failed') })
+    const result = buildDistricts(input)
+    expect(result.map(d => [d.id, d.name, d.kind, d.foundedYear])).toEqual(expected.map(d => [d.id, d.name, d.kind, d.foundedYear]))
+    expect(result.reduce((sum, d) => sum + d.regions!.reduce((area, r) => area + regionArea(r), 0), 0)).toBe(800 * 720)
+    for (const district of result) expect(contains(district, district.point)).toBe(true)
+  })
+
   it('groups occupied street faces with shared road boundaries, without filling surrounding countryside', () => {
     const input = grid(), districts = buildDistricts(input)
     expect(districts.length).toBeGreaterThan(2)

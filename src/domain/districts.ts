@@ -1,4 +1,6 @@
 import { union } from 'polygon-clipping'
+import ClipperLib from 'clipper-lib'
+import type { Path, PolyNode } from 'clipper-lib'
 import { provisionalPlaceName } from './place-names'
 import type { Area, CityConfig, District, Facility, Parcel, Point, Road, Station } from './types'
 import type { Bounds, PolygonRegion } from './geometry'
@@ -34,10 +36,97 @@ function spatial<T extends { bounds: Bounds }>(items: T[], step = 300) {
     return [...result]
   }
 }
-function merge(regions: PolygonRegion[]): PolygonRegion[] {
+export const districtMergeDiagnostics = { integerFallbacks: 0, normalizedEmptyRings: 0, exactSourceFallbacks: 0 }
+
+/** Independent Vatti fallback, following the channel-footprint kernel. A local
+ * origin and 1µm lattice bound coordinate rounding to 0.5µm. Normal successful
+ * floating unions never enter this conversion. No positive-area cutoff is used. */
+function integerDistrictMerge(regions: PolygonRegion[]): PolygonRegion[] | null {
+  const all = regions.flatMap(region => [region.polygon, ...(region.holes ?? [])]).flat(), bounds = boundsOf(all), origin = { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 }, scale = 1_000_000, paths: Path[] = []
+  const same = (a: Point | undefined, b: Point | undefined) => !!a && !!b && a.x === b.x && a.y === b.y
+  const contours = (tree: PolyNode) => {
+    const result: Path[] = [], visit = (node: PolyNode) => {
+      if (node.Contour().length >= 3) {
+        const contour = node.Contour().map(p => ({ ...p }))
+        let twice = 0n
+        for (let i = 0; i < contour.length; i++) { const a = contour[i]!, b = contour[(i + 1) % contour.length]!; twice += BigInt(a.X) * BigInt(b.Y) - BigInt(b.X) * BigInt(a.Y) }
+        if (twice !== 0n && (twice > 0n) === node.IsHole()) contour.reverse()
+        result.push(contour)
+      }
+      for (const child of node.Childs()) visit(child)
+    }
+    visit(tree); return result
+  }
+  for (const region of regions) {
+    const outer: Path[] = [], holes: Path[] = []
+    for (const [index, source] of [region.polygon, ...(region.holes ?? [])].entries()) {
+    // Exact retraced excursions have zero fill even if an untranslated float
+    // shoelace reports one ULP. A figure-eight is not a retraced excursion.
+    const clean: Point[] = []
+    for (const point of source) { if (same(clean.at(-1), point)) continue; if (same(clean.at(-2), point)) clean.pop(); else clean.push(point) }
+    if (same(clean[0], clean.at(-1))) clean.pop()
+    while (clean.length > 2) {
+      if (same(clean[1], clean.at(-1))) { clean.shift(); clean.pop() }
+      else if (same(clean[0], clean.at(-2))) { clean.pop(); clean.pop() }
+      else break
+    }
+    if (clean.length < 3) { districtMergeDiagnostics.normalizedEmptyRings++; continue }
+    const path = clean.map(p => ({ X: Math.round((p.x - origin.x) * scale), Y: Math.round((p.y - origin.y) * scale) }))
+    if (path.some(p => !Number.isSafeInteger(p.X) || !Number.isSafeInteger(p.Y))) throw new RangeError('District union exceeds precise coordinate range')
+    const ringEngine = new ClipperLib.Clipper(), ringTree = new ClipperLib.PolyTree()
+    ringEngine.StrictlySimple = true
+    ringEngine.AddPath(path, ClipperLib.PolyType.ptSubject, true)
+    if (!ringEngine.Execute(ClipperLib.ClipType.ctUnion, ringTree, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) throw new Error('District ring normalization failed')
+    if (!ringTree.Childs().length) {
+      const a = clean[0]!, b = clean[1]!
+      if (clean.every(p => (b.x - a.x) * (p.y - a.y) === (b.y - a.y) * (p.x - a.x))) { districtMergeDiagnostics.normalizedEmptyRings++; continue }
+      // A genuinely positive sub-lattice ring cannot be removed, especially
+      // when it is a hole. Exact original components still represent the union.
+      return null
+    }
+      ;(index ? holes : outer).push(...contours(ringTree))
+    }
+    if (!outer.length) continue
+    if (!holes.length) { paths.push(...outer); continue }
+    // A polygon's holes are a union of exclusions, not negative subjects
+    // which could cancel one another or create fill outside their own shell.
+    const regionEngine = new ClipperLib.Clipper(), regionTree = new ClipperLib.PolyTree()
+    regionEngine.StrictlySimple = true
+    regionEngine.AddPaths(outer, ClipperLib.PolyType.ptSubject, true)
+    regionEngine.AddPaths(holes, ClipperLib.PolyType.ptClip, true)
+    if (!regionEngine.Execute(ClipperLib.ClipType.ctDifference, regionTree, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) throw new Error('District holes could not be retained')
+    paths.push(...contours(regionTree))
+  }
+  if (!paths.length) return []
+  const engine = new ClipperLib.Clipper(), tree = new ClipperLib.PolyTree()
+  engine.StrictlySimple = true
+  if (!engine.AddPaths(paths, ClipperLib.PolyType.ptSubject, true) || !engine.Execute(ClipperLib.ClipType.ctUnion, tree, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) throw new Error('Precise district union failed')
+  const result: PolygonRegion[] = [], ring = (node: PolyNode) => node.Contour().map(p => ({ x: p.X / scale + origin.x, y: p.Y / scale + origin.y }))
+  const visit = (node: PolyNode) => {
+    if (!node.IsHole() && node.Contour().length >= 3) { const holes = node.Childs().filter(child => child.IsHole()).map(ring); result.push({ polygon: ring(node), ...(holes.length ? { holes } : {}) }) }
+    for (const child of node.Childs()) visit(child)
+  }
+  visit(tree)
+  if (!result.length) throw new Error('Precise district union lost all occupied territory')
+  return result
+}
+
+export function mergeDistrictRegions(regions: PolygonRegion[], onFloatingFailure?: (regions: readonly PolygonRegion[], error: unknown) => void): PolygonRegion[] {
   if (regions.length < 2) return regions
   const input = regions.map(region => [region.polygon, ...region.holes ?? []].map(ring => ring.map(p => [p.x, p.y] as [number, number])))
-  return union(input[0]!, ...input.slice(1)).map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), ...(rings.length > 1 ? { holes: rings.slice(1).map(ring => ring.slice(0, -1).map(([x, y]) => ({ x, y }))) } : {}) }))
+  try { return union(input[0]!, ...input.slice(1)).map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), ...(rings.length > 1 ? { holes: rings.slice(1).map(ring => ring.slice(0, -1).map(([x, y]) => ({ x, y }))) } : {}) })) }
+  catch (floatingError) {
+    onFloatingFailure?.(regions, floatingError)
+    districtMergeDiagnostics.integerFallbacks++
+    try { const result = integerDistrictMerge(regions); if (result) return result; districtMergeDiagnostics.exactSourceFallbacks++; return regions }
+    catch {
+      // Regions already mean a union of filled components. Keep every exact
+      // source shell and hole if the independent kernel also cannot resolve it;
+      // no district, island, or exclusion may disappear with a numeric failure.
+      districtMergeDiagnostics.exactSourceFallbacks++
+      return regions
+    }
+  }
 }
 function hash(text: string) { let value = 2166136261; for (const char of text) value = Math.imul(value ^ char.charCodeAt(0), 16777619); return (value >>> 0).toString(36) }
 
@@ -183,7 +272,7 @@ export function buildDistricts(input: DistrictInput): District[] {
   const history = spatial(input.parcels.filter(p => p.developedYear).map(parcel => ({ parcel, point: center(parcel.polygon), bounds: boundsOf(parcel.polygon) })))
   const usedNames = new Set([input.config.name])
   const towns: District[] = compactGroups.map(members => {
-    const regions = merge(members.flatMap(index => nodes[index]!.regions)), point = anchor(members, regions)
+    const regions = mergeDistrictRegions(members.flatMap(index => nodes[index]!.regions)), point = anchor(members, regions)
     let foundedYear = Math.min(...members.map(index => nodes[index]!.year))
     for (const region of regions) for (const record of history(boundsOf(region.polygon))) if (record.parcel.createdYear < foundedYear && pointInRegion(record.point, region)) foundedYear = record.parcel.createdYear
     const id = `town-${hash(members.map(index => nodes[index]!.id).sort().join('|'))}`
@@ -204,7 +293,7 @@ export function buildDistricts(input: DistrictInput): District[] {
       wardOwner[next] = wards.length; members.push(next); towns[next]!.parentId = id
       pending.push(...[...townGraph[next]!].filter(index => wardOwner[index] === -1).sort((a, b) => distance(towns[a]!.point, towns[seed]!.point) - distance(towns[b]!.point, towns[seed]!.point)))
     }
-    const regions = merge(members.flatMap(i => towns[i]!.regions!)), nodeMembers = members.flatMap(i => compactGroups[i]!)
+    const regions = mergeDistrictRegions(members.flatMap(i => towns[i]!.regions!)), nodeMembers = members.flatMap(i => compactGroups[i]!)
     const name = provisionalPlaceName({ seed: input.config.seed, id, kind: 'ward' }, usedNames)
     usedNames.add(name)
     wards.push({ id, name, kind: 'ward', regions, point: anchor(nodeMembers, regions), foundedYear: Math.min(...members.map(i => towns[i]!.foundedYear!)), namingSource: 'provisional' })
