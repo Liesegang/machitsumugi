@@ -4,6 +4,7 @@ import type { ContinuousCityLandInput } from './continuous-city-types'
 import { boundsOf, corridorPolygon, distance, distanceToSegment, intersectRegions, overlaps, pointInPolygon, pointInRegion, polygonArea, polygonOverlapsRegion, projectPoint, rectangle, regionArea, seededRandom, segmentsCross, subtractRegions } from './geometry'
 import { buildingServiceYears } from './building-lifecycle'
 import { MinHeap } from './road-graph'
+import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 
 interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds }
 interface Frontage { a: Point; b: Point; segment: Segment; length: number }
@@ -85,6 +86,7 @@ function spatialIndex<T extends { bounds: Bounds }>(size = 80) {
 export function developContinuousCityLand(input: ContinuousCityLandInput) {
   const endYear = clamp(Math.round(input.config.targetYear ?? 2025), 1650, 2025)
   const roadIndex = spatialIndex<Segment>(), obstacleIndex = spatialIndex<PolygonRegion & { bounds: Bounds }>(), streetSegments: Segment[] = []
+  const obstacleOverlaps = new WeakMap<PolygonRegion, (polygon: Point[]) => boolean>()
   const addRoad = (road: Road) => {
     if ((road.level ?? 0) !== 0) return
     for (let i = 1; i < road.points.length; i++) {
@@ -97,7 +99,10 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     }
   }
   for (const road of input.roads) addRoad(road)
-  for (const region of [...input.terrain.areas.filter(area => area.kind === 'water'), ...input.reserves]) obstacleIndex.add({ ...region, bounds: boundsOf(region.polygon) })
+  for (const region of [...input.terrain.areas.filter(area => area.kind === 'water'), ...input.reserves]) {
+    const entry = { ...region, bounds: boundsOf(region.polygon) }
+    obstacleIndex.add(entry); obstacleOverlaps.set(entry, indexedPolygonOverlap(entry))
+  }
   const parcels: Parcel[] = [], buildings: Building[] = [], accessRoads: Road[] = [], openSpaces: Area[] = [], unassignedGround: PolygonRegion[] = [], events: GrowthEvent[] = []
   const history = { parcels: [] as TimelineVersion<Parcel>[], buildings: [] as TimelineVersion<Building>[], buildingStates: [] as BuildingState[] }
   const metrics = { blocks: input.blocks.length, buildableArea: 0, parcelArea: 0, accessArea: 0, openSpaceArea: 0, unassignedArea: 0, partitionAreaError: 0, laneAttempts: 0, accessRoads: 0, privateReplacements: 0, lots: 0, oversizedLots: 0, frontageFailures: 0, formationFailures: 0, stock: {} as Record<Stock, { count: number; parcelArea: number; roofArea: number; parking: number }>, openReasons: {} as Record<string, { count: number; area: number }> }
@@ -138,7 +143,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
   }
   const opening = (p: Point) => Math.max(1650, Math.round(input.demand.openingAt(p)))
   const physical = (polygon: Point[], maximumSlope = .16) => {
-    if (polygon.some(p => p.x < 0 || p.y < 0 || p.x > input.width || p.y > input.height) || obstacles({ polygon }).some(region => polygonOverlapsRegion(polygon, region))) return false
+    if (polygon.some(p => p.x < 0 || p.y < 0 || p.x > input.width || p.y > input.height) || obstacles({ polygon }).some(region => obstacleOverlaps.get(region)!(polygon))) return false
     const bounds = boundsOf(polygon), points = samples(polygon)
     for (let x = bounds.minX + 2; x < bounds.maxX; x += 4) for (let y = bounds.minY + 2; y < bounds.maxY; y += 4) if (pointInPolygon({ x, y }, polygon)) points.push({ x, y })
     return points.every(p => !input.terrain.waterAt(p) && Number.isFinite(input.terrain.slope(p)) && input.terrain.slope(p) <= maximumSlope)

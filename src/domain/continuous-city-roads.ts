@@ -12,6 +12,7 @@ import type { PolygonRegion } from './geometry'
 import { alignmentDiagnostics, resampleAlignment } from './road-alignment'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { regionQuery } from './region-query'
+import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { planModernTransport } from './modern-transport'
 import { layoutMainCivilGuides, surveyLayoutMainCivilCrossings } from './layout-first-main-civil-bridges'
 
@@ -121,7 +122,7 @@ class ContinuousRoadDesign {
   readonly environment: PlanningEnvironment
   private serial = 0
   private siteApproaches = new Map<string, SimulatedRoad>()
-  private frontageObstacles: { region: PolygonRegion; bounds: ReturnType<typeof boundsOf> }[]
+  private frontageObstacles: { bounds: ReturnType<typeof boundsOf>; overlaps: (polygon: Point[]) => boolean }[]
   private surfaceRail: RailwayRoadConstraints
   private railCells = new Map<string, { a: Point; b: Point }[]>()
   readonly input: ContinuousCityRoadInput
@@ -133,7 +134,7 @@ class ContinuousRoadDesign {
     // distance/shoreline sampler must not run inside every road-search edge.
     this.environment = { ...base, exactLandCost: true, landCost: p => reserved(p) ? Infinity : base.landCost?.(p) ?? 0 }
     this.reserves = input.reservedRegions.map(region => ({ region, bounds: boundsOf(region.polygon) }))
-    this.frontageObstacles = [...input.reservedRegions, ...base.areas.filter(area => area.kind === 'water')].map(region => ({ region, bounds: boundsOf(region.polygon) }))
+    this.frontageObstacles = [...input.reservedRegions, ...base.areas.filter(area => area.kind === 'water')].map(region => ({ bounds: boundsOf(region.polygon), overlaps: indexedPolygonOverlap(region) }))
     this.surfaceRail = new RailwayRoadConstraints(input.railways)
     for (const railway of input.railways) if (railway.mode !== 'subway') for (let i = 1; i < railway.points.length; i++) {
       const a = railway.points[i - 1]!, b = railway.points[i]!
@@ -511,8 +512,9 @@ class ContinuousRoadDesign {
   private dryAccessClear(a: Point, b: Point) {
     if (distance(a, b) < .1) return true
     if (this.surfaceRail.crossings([a, b]).length) return false
+    if (!this.frontageObstacles.length) return true
     const strip = corridorPolygon(a, b, 1.25), bounds = boundsOf(strip)
-    return !this.frontageObstacles.some(item => overlaps(bounds, item.bounds) && polygonOverlapsRegion(strip, item.region))
+    return !this.frontageObstacles.some(item => overlaps(bounds, item.bounds) && item.overlaps(strip))
   }
   /** Streets grow from acquired public frontages toward actual access deficits.
    * The field chooses a project, never supplies a painted grid/gradient line.
@@ -570,7 +572,7 @@ class ContinuousRoadDesign {
       const neighbours = nearby([{ x: cell.point.x - 1, y: cell.point.y }, { x: cell.point.x + 1, y: cell.point.y }], 75).map(index => cells[index]!).filter(other => !other.served && distance(other.point, cell.point) < 75)
       const weight = neighbours.reduce((sum, other) => sum + 1 + other.intensity, 0), centroid = weight ? neighbours.reduce((sum, other) => ({ x: sum.x + other.point.x * (1 + other.intensity) / weight, y: sum.y + other.point.y * (1 + other.intensity) / weight }), { x: 0, y: 0 }) : cell.point, blended = lerp(cell.point, centroid, .3), goal = usable(blended) ? blended : cell.point
       const anchors = this.graph.projections(goal, 240, 12).filter(anchor => publicRoad(anchor.road))
-      const options = anchors.flatMap(anchor => [anchor, ...[anchor.road.points[0]!, anchor.road.points.at(-1)!].filter(point => distance(point, goal) < 210 && distance(point, anchor.point) > 10).map(point => ({ ...anchor, point, distance: distance(point, goal) }))]).sort((a, b) => a.distance * (this.dryAccessClear(goal, a.point) ? 1 : 2.5) - b.distance * (this.dryAccessClear(goal, b.point) ? 1 : 2.5))
+      const options = anchors.flatMap(anchor => [anchor, ...[anchor.road.points[0]!, anchor.road.points.at(-1)!].filter(point => distance(point, goal) < 210 && distance(point, anchor.point) > 10).map(point => ({ ...anchor, point, distance: distance(point, goal) }))]).map(option => ({ ...option, sortKey: option.distance * (this.dryAccessClear(goal, option.point) ? 1 : 2.5) })).sort((a, b) => a.sortKey - b.sortKey)
       const selected: typeof options = []
       for (const anchor of options) { if (selected.some(other => distance(other.point, anchor.point) < 35)) continue; selected.push(anchor); if (selected.length >= 3) break }
       let accepted = false
