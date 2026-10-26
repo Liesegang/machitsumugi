@@ -42,7 +42,7 @@ describe('saved projects', () => {
     project.config.cityEngine = 'continuous'; map.config.cityEngine = 'continuous'
     map.timeline = createCityTimeline(map)
     const text = serializeProject(project)
-    expect(JSON.parse(text)).toMatchObject({ version: 3, format: 'city-project-compact-v1' })
+    expect(JSON.parse(text)).toMatchObject({ version: 3, format: 'city-project-compact-v2' })
     expect(parseProject(text)).toEqual(parseProject(JSON.stringify(portableProject(project))))
     expect(map.roads).toHaveLength(1)
     map.timeline.roads[0]!.value.points[0]!.x = -1_000_000

@@ -10,14 +10,16 @@ import { CONTINUOUS_GENERATOR_VERSION } from './continuous-city-types'
 import { planContinuousCityDemand } from './continuous-city-demand'
 import { surveyContinuousCityTrunks, buildContinuousCityRoads } from './continuous-city-roads'
 import { developContinuousCityLand } from './continuous-city-land'
+import { buildContinuousCityLandDomains } from './continuous-city-land-domains'
 import { buildContinuousCityCover } from './continuous-city-cover'
-import { buildContinuousCoverHistory } from './continuous-city-cover-history'
+import { buildContinuousCoverHistory, continuousRoadAcquisitions } from './continuous-city-cover-history'
+import { planContinuousCityRuralAccess } from './continuous-city-rural'
 // Engineering components remain shared. They do not design the urban fabric.
 import { reserveLayoutFirstCivics } from './layout-first-civic'
 import { surveyLayoutFirstRail } from './layout-first-rail'
 import { certifyLayoutAccess } from './layout-first-access'
 import { buildLayoutFirstDistricts } from './layout-first-districts'
-import { materializeRoadJunctions } from './road-graph'
+import { materializeRoadJunctions, projectOnRoadSegment } from './road-graph'
 import { createCityTimeline, sliceCityAtYear } from './timeline'
 import { buildingServiceYears } from './building-lifecycle'
 import { shoppingStreetHistory } from './commercial-history'
@@ -77,7 +79,7 @@ export function generateContinuousCity(input:CityConfig,onProgress?:(label:strin
   const roadInput={config,center:demand.center,demand,reservedRegions:civic.reserves,railways:[],environment:{width,height,core:null,areas:planningAreas,terrain,bridgeSites:terrain.bridgeSites,exactLandCost:true,landCost:(p:{x:number;y:number})=>reservedAt(p)?Infinity:0},onProgress:phase}
   phase('外へ続く主要道路を、距離と大きな線形から設計中…')
   const trunks=surveyContinuousCityTrunks(roadInput)
-  onPreview?.(frame({roads:trunks.roads,areas:[...natural,...civic.areas],buildings:civic.buildings,facilities:civic.facilities},'roads'))
+  onPreview?.(frame({roads:trunks.roads,areas:[...natural,...civic.areas],buildings:civic.buildings,facilities:civic.facilities,previewPlanning:{reservedGrounds:civic.reserves}},'roads'))
   phase('主要道路と交差位置を調整し、鉄道と駅を配置中…')
   const rail=surveyLayoutFirstRail({config,width,height,terrain,center:demand.center,zones,reserves:civic.reserves,roads:trunks.roads})
   if(config.railway&&(!rail.railways.length||rail.stations.length<config.stations))throw new Error('指定した本線と駅の敷地を確保できませんでした。',{cause:rail.diagnostics})
@@ -88,12 +90,25 @@ export function generateContinuousCity(input:CityConfig,onProgress?:(label:strin
   phase('連続した街路網を作り、街区の奥まで生活道路を通しています…')
   const transport=buildContinuousCityRoads({...roadInput,environment,reservedRegions:reserves,railways:rail.railways,initialRoads:[...trunks.roads,...civic.roads,...rail.stationPaths],accessTargets:targets})
   let roads=materializeRoadJunctions(transport.roads)
+  phase('市街地の外に続く農道を、既存の道路から整備中…')
+  const rural=planContinuousCityRuralAccess({config,width,height,terrain,demand,roads,railways:rail.railways,reserves})
+  if(rural.roads.length)roads=materializeRoadJunctions([...roads,...rural.roads])
   const access=certifyLayoutAccess({width,height,roads,targets})
-  onPreview?.(frame({roads,railways:rail.railways,stations:rail.stations,areas:[...natural,...civic.areas,...rail.stationGrounds],buildings:civic.buildings,facilities:civic.facilities},'roads'))
   if(access.unserved.length)throw new Error('施設・駅の入口を、開設時の外部道路へ接続できませんでした。',{cause:{access,transport:transport.diagnostics}})
+  onPreview?.(frame({roads,railways:rail.railways,stations:rail.stations,areas:[...natural,...civic.areas,...rail.stationGrounds],buildings:civic.buildings,facilities:civic.facilities,previewPlanning:{reservedGrounds:reserves}},'roads'))
   const railMasks=rail.railways.filter(line=>line.mode!=='subway').flatMap(line=>line.points.slice(1).flatMap((b,i)=>distance(line.points[i]!,b)>.01?[{polygon:corridorPolygon(line.points[i]!,b,7)}]:[]))
+  const centreGateId=({castle:'facility-access-castle',temple:'facility-access-shrine',onsen:'facility-access-onsen',port:'facility-access-port',post:'',newtown:''} as const)[config.type]
+  const centreGate=civic.accessTargets.find(target=>target.id===centreGateId&&target.builtYear<=1850)
+  // The old centre's approach is intentionally on an acquired public road.
+  // It does not assert a pedestrian shortcut from an inaccessible castle core.
+  const oldApproach=trunks.roads.filter(road=>(road.builtYear??1650)<=1850&&!road.controlledAccess).flatMap(road=>road.points.slice(1).map((b,i)=>({point:projectOnRoadSegment(demand.center,road.points[i]!,b).point,builtYear:road.builtYear??1650}))).sort((a,b)=>distance(a.point,demand.center)-distance(b.point,demand.center))[0]
+  const centerAccess=centreGate?{point:centreGate.point,builtYear:centreGate.builtYear}:oldApproach
   phase('街区全体を接道する敷地へ分け、建物と中庭を配置中…')
-  const land=developContinuousCityLand({config,width,height,roads,blocks:transport.blocks,demand,stations:rail.stations,reserves:[...reserves,...railMasks],terrain})
+  // Closed street faces describe the public network. Acquisition can also
+  // follow a real road on its unclosed outer side; this ownership complement
+  // creates no street or frontage along the demand boundary.
+  const landDomains=buildContinuousCityLandDomains({demandRegions:demand.regions,streetBlocks:transport.blocks})
+  const land=developContinuousCityLand({config,width,height,roads,blocks:landDomains.domains,demand,stations:rail.stations,centerAccess,reserves:[...reserves,...railMasks],terrain})
   roads=materializeRoadJunctions([...roads,...land.accessRoads])
   phase('まとまった農地・林・公園を割り当て中…')
   const coverTerrain={...terrain,areas:natural}
@@ -118,13 +133,13 @@ export function generateContinuousCity(input:CityConfig,onProgress?:(label:strin
   const reserveDates=civic.reserves.map(region=>({region,from:openingOfArea(civic.areas.find(area=>area.polygon===region.polygon)??{id:'castle-ground',kind:'field',polygon:region.polygon})}))
   const baseCover=buildContinuousCityCover({config,width,height,terrain:coverTerrain,demand:{...demand,regions:[],at:()=>0},roads:roads.filter(road=>(road.builtYear??1650)<=1650),parcels:[],reserves:reserveDates.filter(v=>v.from<=1650).map(v=>v.region),urbanBlocks:[],onProgress:phase,onGeometry:observer?.coverGeometry})
   phase('土地の取得履歴を整理中…')
-  const acquisitions=[...reserveDates,...railMasks.map(region=>({region,from:1900})),...rail.stationGrounds.map(region=>({region,from:1900})),...land.parcels.map(region=>({region,from:region.createdYear})),...land.openSpaces.map(region=>({region,from:1955})),...roads.flatMap(road=>road.points.slice(1).flatMap((b,i)=>distance(road.points[i]!,b)>.01?[{region:{polygon:corridorPolygon(road.points[i]!,b,road.width/2)},from:road.builtYear??1650}]:[]))]
+  const acquisitions=[...reserveDates,...railMasks.map(region=>({region,from:1900})),...rail.stationGrounds.map(region=>({region,from:1900})),...land.parcels.map(region=>({region,from:region.createdYear})),...land.openSpaces.map(region=>({region,from:1955})),...continuousRoadAcquisitions(roads)]
   const coverHistory=buildContinuousCoverHistory({width,height,baseCover,finalCover:cover,acquisitions})
   phase('年代別の地図を記録中…')
   map.timeline=createCityTimeline(map,{roads:roadHistory,buildings:[...land.history.buildings,...civicHistory],parcels:land.history.parcels,buildingStates:land.history.buildingStates,facilities:[...civic.facilities.map(value=>({from:facilityYears[value.kind],value})),...shopHistory],areas:[...coverHistory,...land.openSpaces.map(value=>({from:1955,value})),...civic.areas.map(value=>({from:openingOfArea(value),value})),...rail.stationGrounds.map(value=>({from:1900,value}))]})
   const result=sliceCityAtYear(map,requestedYear)
   phases.push({phase:lastPhase,milliseconds:performance.now()-lastStarted})
-  reports.set(result,{input:'configuration-and-terrain-only',phases,inheritedRoads:0,inheritedParcels:0,inheritedBuildings:0,demand:demand.metrics,trunks:trunks.diagnostics,transport:transport.diagnostics,land:land.metrics,access,rail:rail.diagnostics,milliseconds:performance.now()-start})
+  reports.set(result,{input:'configuration-and-terrain-only',phases,inheritedRoads:0,inheritedParcels:0,inheritedBuildings:0,demand:{...demand.metrics,center:demand.center},centerAccess,reservedGrounds:reserves,trunks:trunks.diagnostics,transport:transport.diagnostics,rural:rural.diagnostics,landDomains:landDomains.metrics,land:land.metrics,access,rail:rail.diagnostics,milliseconds:performance.now()-start})
   onPreview?.(frame(map,'development'))
   return result
 }

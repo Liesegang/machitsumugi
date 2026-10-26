@@ -6,6 +6,47 @@ const metadata = (id: string): RoadMetadata => ({ id, builtYear: 1700, phase: 'o
 const point = (x: number, y: number) => ({ x, y })
 
 describe('incremental planar road graph', () => {
+  it('removes complete T/Y dead-end excursions without changing the actual closed perimeter', () => {
+    const graph = new PlanarRoadGraph(), ring = [point(0, 0), point(400, 0), point(400, 300), point(0, 300), point(0, 0)]
+    graph.add(ring, metadata('perimeter'), false)
+    graph.add([point(0, 150), point(150, 150)], metadata('stem'))
+    graph.add([point(150, 150), point(220, 220)], metadata('y-north'))
+    graph.add([point(150, 150), point(240, 90)], metadata('y-south'))
+    const faces = extractStreetBlocks(graph.roads)
+    expect(faces).toHaveLength(1)
+    expect(Math.abs(faces[0]!.reduce((sum, p, i, all) => sum + p.x * all[(i + 1) % all.length]!.y - all[(i + 1) % all.length]!.x * p.y, 0)) / 2).toBe(120000)
+    expect(faces[0]!.every(p => p.x === 0 || p.x === 400 || p.y === 0 || p.y === 300)).toBe(true)
+    for (let i = 0; i < faces[0]!.length; i++) expect(faces[0]![i]).not.toEqual(faces[0]![(i + 1) % faces[0]!.length])
+    graph.add([point(150, 150), point(400, 150)], metadata('real-through-connection'))
+    const split = extractStreetBlocks(graph.roads)
+    expect(split).toHaveLength(2)
+    expect(split.reduce((total, face) => total + Math.abs(face.reduce((sum, p, i) => sum + p.x * face[(i + 1) % face.length]!.y - face[(i + 1) % face.length]!.x * p.y, 0)) / 2, 0)).toBe(120000)
+    graph.add([point(0, 20), point(10, 20), point(10, 30), point(0, 30)], metadata('small-traffic-island'), true)
+    const physical = extractStreetBlocks(graph.roads, .001), area = (faces: { x: number; y: number }[][]) => faces.reduce((total, face) => total + Math.abs(face.reduce((sum, p, i) => sum + p.x * face[(i + 1) % face.length]!.y - face[(i + 1) % face.length]!.x * p.y, 0)) / 2, 0)
+    expect(area(physical)).toBe(120000)
+    expect(area(extractStreetBlocks(graph.roads))).toBe(119900)
+  })
+  it('validates the exact normalized insertion before mutating old junctions or any road state', () => {
+    const graph = new PlanarRoadGraph(), old = graph.add([point(0, 0), point(300, 0)], metadata('old'), false)!, proposal = metadata('same-proposal-id')
+    const state = () => JSON.stringify({ roads: graph.roads, history: graph.roadHistory, revision: graph.topologyRevision, metadata: proposal })
+    const before = state(), source = [point(80, .6), point(80, 100), point(230, 100), point(230, -20)], inputBefore = structuredClone(source)
+    let normalized: readonly Readonly<{ x: number; y: number }>[] = []
+    expect(graph.add(source, proposal, true, candidate => { normalized = candidate.points; expect(candidate.points[0]).toEqual(point(80, 0)); expect(candidate.points).toContainEqual(point(230, 0)); return false })).toBeNull()
+    expect(state()).toBe(before); expect(source).toEqual(inputBefore); expect(old.points).toEqual([point(0, 0), point(300, 0)])
+    const accepted = graph.add(source, proposal, true, candidate => { normalized = candidate.points; return true })!
+    expect(accepted.id).toBe('same-proposal-id'); expect(accepted.points).toEqual(normalized)
+    expect(old.points).toContainEqual(point(80, 0)); expect(old.points).toContainEqual(point(230, 0))
+  })
+
+  it('also guards a reused road, and a rejected or throwing guard leaves all state intact', () => {
+    const graph = new PlanarRoadGraph(), road = graph.add([point(0, 0), point(150, 0)], metadata('existing'), false)!, proposal = metadata('unused-id')
+    const before = JSON.stringify({ roads: graph.roads, history: graph.roadHistory, revision: graph.topologyRevision, metadata: proposal })
+    const guard = vi.fn(candidate => { expect(candidate.reusedRoadId).toBe('existing'); return false })
+    expect(graph.add([...road.points].reverse(), proposal, true, guard)).toBeNull(); expect(guard).toHaveBeenCalledOnce()
+    expect(() => graph.add([point(40, .5), point(40, 120)], proposal, true, () => { throw new Error('validator-rejected') })).toThrow('validator-rejected')
+    expect(JSON.stringify({ roads: graph.roads, history: graph.roadHistory, revision: graph.topologyRevision, metadata: proposal })).toBe(before)
+    expect(graph.add([...road.points].reverse(), proposal, true, candidate => candidate.reusedRoadId === 'existing')).toBe(road)
+  })
   it('invalidates exact road and travel queries after a new shortcut, including retained accessors', () => {
     const graph = new PlanarRoadGraph(), source = point(0, 0), destination = point(300, 0), middle = point(150, 0)
     graph.add([source, point(0, 300), point(300, 300), destination], metadata('old-detour'), false)

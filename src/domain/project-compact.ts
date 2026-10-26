@@ -1,13 +1,14 @@
 /** A lossless JSON wire form. Domain validation remains in project.ts after
- * decoding; this layer only removes repeated keys and primitive strings. */
+ * decoding; this layer removes repeated keys/strings and packs long point
+ * leaves as their exact two Float64 values. */
 export interface CompactProjectEnvelope {
   version: 3
-  format: 'city-project-compact-v1'
+  format: 'city-project-compact-v1' | 'city-project-compact-v2'
   schemas: string[][]
   strings: string[]
   data: EncodedValue
 }
-export type EncodedValue = number | boolean | null | EncodedValue[]
+export type EncodedValue = number | boolean | null | [2, string] | EncodedValue[]
 
 export const COMPACT_PROJECT_LIMITS = {
   // The validated native v4 portable project contains 20,152,895 JSON nodes.
@@ -25,6 +26,10 @@ export const COMPACT_PROJECT_LIMITS = {
   arrayItems: 1_000_000,
 } as const
 const forbiddenKeys = new Set(['__proto__', 'prototype', 'constructor'])
+const pointSchema = '["x","y"]', pointWireLength = 30
+// Sixteen bytes encode as twenty-two characters and two padding characters.
+// The last character has four unused zero bits; reject noncanonical aliases.
+const pointBlob = /^[A-Za-z0-9+/]{21}[AQgw]==$/
 const invalid = (message: string): never => { throw new Error(`圧縮プロジェクト: ${message}`) }
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
 const ownValue = (value: Record<string, unknown>, key: string) => {
@@ -44,12 +49,13 @@ const budget = () => {
 export function isCompactProject(value: unknown): value is CompactProjectEnvelope {
   if (!record(value)) return false
   const version = Object.getOwnPropertyDescriptor(value, 'version'), format = Object.getOwnPropertyDescriptor(value, 'format')
-  return !!version && 'value' in version && version.value === 3 && !!format && 'value' in format && format.value === 'city-project-compact-v1'
+  return !!version && 'value' in version && version.value === 3 && !!format && 'value' in format && (format.value === 'city-project-compact-v1' || format.value === 'city-project-compact-v2')
 }
 
 export function encodeCompactProject(value: unknown): CompactProjectEnvelope {
   if (!record(value) || ownValue(value, 'version') !== 2) invalid('version2のプロジェクトが必要です。')
   const schemas: string[][] = [], strings: string[] = [], schemaIds = new Map<string, number>(), stringIds = new Map<string, number>(), ancestors = new WeakSet<object>(), visit = budget()
+  const pointBytes = new Uint8Array(16), pointView = new DataView(pointBytes.buffer)
   let schemaCharacters = 0, stringCharacters = 0
   const encode = (input: unknown, depth: number): EncodedValue => {
     visit(depth)
@@ -79,6 +85,16 @@ export function encodeCompactProject(value: unknown): CompactProjectEnvelope {
       const values: unknown[] = [], presentKeys: string[] = []
       for (const key of keys) { const current = ownValue(input, key); if (current !== undefined) { presentKeys.push(key); values.push(current) } }
       if (presentKeys.length > COMPACT_PROJECT_LIMITS.keysPerSchema) invalid('オブジェクトのキー数が上限を超えています。')
+      if (keys.length === 2 && keys[0] === 'x' && keys[1] === 'y' && Reflect.ownKeys(input).length === 2 && typeof values[0] === 'number' && typeof values[1] === 'number' && Number.isFinite(values[0]) && Number.isFinite(values[1])) {
+        const x = values[0] === 0 ? 0 : values[0], y = values[1] === 0 ? 0 : values[1], schema = schemaIds.get(pointSchema) ?? schemas.length
+        // Compare the complete leaf forms, including the current schema tag.
+        // Short survey-lattice coordinates keep their smaller numeric schema.
+        if (pointWireLength < String(-schema - 1).length + String(x).length + String(y).length + 4) {
+          visit(depth + 1); visit(depth + 1)
+          pointView.setFloat64(0, x, true); pointView.setFloat64(8, y, true)
+          return [2, btoa(String.fromCharCode(...pointBytes))]
+        }
+      }
       const signature = JSON.stringify(presentKeys)
       let schema = schemaIds.get(signature)
       if (schema === undefined) {
@@ -88,11 +104,12 @@ export function encodeCompactProject(value: unknown): CompactProjectEnvelope {
       return [-schema - 1, ...values.map(current => encode(current, depth + 1))]
     } finally { ancestors.delete(input) }
   }
-  return { version: 3, format: 'city-project-compact-v1', schemas, strings, data: encode(value, 0) }
+  return { version: 3, format: 'city-project-compact-v2', schemas, strings, data: encode(value, 0) }
 }
 
 export function decodeCompactProject(value: unknown): unknown {
   if (!isCompactProject(value) || !record(value)) return invalid('保存形式に対応していません。')
+  const supportsPointBlob = ownValue(value, 'format') === 'city-project-compact-v2'
   const envelopeKeys = Object.keys(value).sort()
   if (JSON.stringify(envelopeKeys) !== JSON.stringify(['data', 'format', 'schemas', 'strings', 'version'])) invalid('保存データの項目が不正です。')
   const rawSchemas = ownValue(value, 'schemas'), rawStrings = ownValue(value, 'strings')
@@ -120,6 +137,7 @@ export function decodeCompactProject(value: unknown): unknown {
     knownStrings.add(text)
   }
   const visit = budget(), ancestors = new WeakSet<object>()
+  const pointBytes = new Uint8Array(16), pointView = new DataView(pointBytes.buffer)
   const decode = (input: unknown, depth: number): unknown => {
     visit(depth)
     if (input === null || typeof input === 'boolean') return input
@@ -131,6 +149,17 @@ export function decodeCompactProject(value: unknown): unknown {
     if (tag === 1) {
       if (input.length !== 2 || !Number.isSafeInteger(input[1]) || input[1] < 0 || input[1] >= strings.length) invalid('文字列参照が範囲外です。')
       return strings[input[1]]
+    }
+    if (tag === 2) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, '1'), blob = descriptor && 'value' in descriptor ? descriptor.value as unknown : undefined
+      if (!supportsPointBlob || input.length !== 2 || typeof blob !== 'string' || blob.length !== 24 || !pointBlob.test(blob)) invalid('座標データの形式が不正です。')
+      // A point expands to one object and two numbers, exactly like v1.
+      visit(depth + 1); visit(depth + 1)
+      const bytes = atob(blob as string)
+      for (let i = 0; i < 16; i++) pointBytes[i] = bytes.charCodeAt(i)
+      const x = pointView.getFloat64(0, true), y = pointView.getFloat64(8, true)
+      if (!Number.isFinite(x) || !Number.isFinite(y)) invalid('有限な座標が必要です。')
+      return { x: x === 0 ? 0 : x, y: y === 0 ? 0 : y }
     }
     if (tag > 1 || tag < -schemas.length) invalid('型タグ・キー参照が範囲外です。')
     if (tag === 0 && input.length - 1 > COMPACT_PROJECT_LIMITS.arrayItems) invalid('配列が上限を超えています。')

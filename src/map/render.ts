@@ -5,6 +5,7 @@ import { areaLabelPoint } from './area-labels'
 import { seaDepthRaster, seaDepthRgb } from './bathymetry'
 import { landPaintGroups } from './land-paint'
 import { subwayInk, SUBWAY_DASH, SUBWAY_LINE_WIDTH } from './railway-style'
+import { roadStrokeWidths } from './road-style'
 import { woodlandCrowns, WOODLAND_TEXTURE_MIN_SCALE } from './woodland-texture'
 import { createDrawingSurface } from './drawing-surface'
 import type { DrawingCanvas, DrawingContext } from './drawing-surface'
@@ -274,14 +275,14 @@ export function renderMap(ctx: DrawingContext, map: CityMap, options: RenderOpti
       for (const road of map.roads) {
         if (road.kind !== kind) continue
         tracePath(ctx, road.points)
-        ctx.lineWidth = Math.max(road.width, kind === 'local' ? 1.3 / scale : 3.2 / scale) + 1.3 / scale
+        ctx.lineWidth = roadStrokeWidths(road, scale).outlinedWidth
         ctx.strokeStyle = kind === 'arterial' ? colors.arteryEdge : colors.roadEdge
         ctx.stroke()
       }
       for (const road of map.roads) {
         if (road.kind !== kind) continue
         tracePath(ctx, road.points)
-        ctx.lineWidth = Math.max(road.width, kind === 'local' ? 1.3 / scale : 3.2 / scale)
+        ctx.lineWidth = roadStrokeWidths(road, scale).width
         ctx.strokeStyle = kind === 'arterial' ? colors.artery : colors.road
         ctx.stroke()
       }

@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { buildContinuousCityRoads, continuousCityRoadGradeAllowed, partitionContinuousCityFace, surveyContinuousCityTrunks } from './continuous-city-roads'
+import { buildContinuousCityRoads, continuousCityFaceCoverageQuery, continuousCityRoadGradeAllowed, partitionContinuousCityFace, surveyContinuousCityTrunks } from './continuous-city-roads'
 import type { ContinuousCityRoadInput } from './continuous-city-types'
-import type { Point } from './types'
-import { corridorPolygon, distance, distanceToSegment, pointInPolygon, polygonArea, polygonOverlapsRegion, rectangle } from './geometry'
+import type { Point, Road } from './types'
+import { corridorPolygon, distance, distanceToSegment, intersectRegions, pointInPolygon, pointInRegion, polygonArea, polygonOverlapsRegion, rectangle, regionArea } from './geometry'
+import { buildContinuousCityLandDomains } from './continuous-city-land-domains'
 import { RailwayRoadConstraints } from './railway-road-constraints'
+import { PlanarRoadGraph, projectOnRoadSegment } from './road-graph'
 import { certifyLayoutAccess } from './layout-first-access'
 import { onSurveyedBridge } from './surveyed-road-profile'
 
@@ -16,7 +18,42 @@ function fixture(width = 2000, height = 1600): ContinuousCityRoadInput {
   }
 }
 
+// Independent last-leg measurement: a nearby street across water, a campus,
+// or surface track supplies no frontage. Open T/tree streets count when their
+// actual public pavement provides a clear dry connection.
+function dryPublicDepthProbe(roads: Road[], input: ContinuousCityRoadInput, maximum = 90) {
+  const rail = new RailwayRoadConstraints(input.railways), bins = new Map<string, { a: Point; b: Point }[]>()
+  for (const road of roads) if (road.width >= 4.6 && !road.controlledAccess && (road.level ?? 0) === 0) for (let i = 1; i < road.points.length; i++) {
+    const a = road.points[i - 1]!, b = road.points[i]!
+    for (let x = Math.floor((Math.min(a.x, b.x) - maximum) / 100); x <= Math.floor((Math.max(a.x, b.x) + maximum) / 100); x++) for (let y = Math.floor((Math.min(a.y, b.y) - maximum) / 100); y <= Math.floor((Math.max(a.y, b.y) + maximum) / 100); y++) {
+      const key = `${x},${y}`, list = bins.get(key) ?? []; list.push({ a, b }); bins.set(key, list)
+    }
+  }
+  return (point: Point) => {
+    for (const { a, b } of bins.get(`${Math.floor(point.x / 100)},${Math.floor(point.y / 100)}`) ?? []) {
+    const contact = projectOnRoadSegment(point, a, b).point, length = distance(point, contact)
+    if (length > maximum) continue
+    if (length < .1) return true
+    if (rail.crossings([point, contact]).length || input.reservedRegions.some(region => polygonOverlapsRegion(corridorPolygon(point, contact, 1), region))) continue
+    const count = Math.ceil(length / 4)
+    if (Array.from({ length: count + 1 }, (_, n) => ({ x: point.x + (contact.x - point.x) * n / count, y: point.y + (contact.y - point.y) * n / count })).every(p => !input.environment.terrain?.waterAt(p))) return true
+    }
+    return false
+  }
+}
+
 describe('continuous shared city streets', () => {
+  it('matches exhaustive diagnostic containment at bin boundaries without changing saved geometry', () => {
+    const polygons = [rectangle(-250, -250, 250, 250), rectangle(250, 0, 30, 500), [{ x: 0, y: 0 }, { x: 500, y: 0 }, { x: 500, y: 50 }, { x: 50, y: 50 }, { x: 50, y: 500 }, { x: 0, y: 500 }], []]
+    for (const polygon of polygons) { polygon.forEach(Object.freeze); Object.freeze(polygon) }
+    Object.freeze(polygons)
+    const before = JSON.stringify(polygons), contains = continuousCityFaceCoverageQuery(polygons)
+    const points: Point[] = []
+    for (let y = -260; y <= 510; y += 17) for (let x = -260; x <= 510; x += 13) points.push({ x, y })
+    for (const coordinate of [-250, 0, 250, 500]) for (const offset of [-1.01e-7, -.99e-7, 0, .99e-7, 1.01e-7]) points.push({ x: coordinate + offset, y: 0 }, { x: 0, y: coordinate + offset })
+    for (const point of points) expect(contains(point)).toBe(polygons.some(polygon => pointInPolygon(point, polygon) || polygon.some((a, i) => distanceToSegment(point, a, polygon[(i + 1) % polygon.length]!) < 1e-7)))
+    expect(JSON.stringify(polygons)).toBe(before)
+  })
   it('measures intervening grade on a two-endpoint cut while retaining only registered bridge decks', () => {
     const points = [{ x: 0, y: 0 }, { x: 200, y: 0 }], elevation = (p: { x: number }) => Math.max(0, 10 - Math.abs(p.x - 100) * .2)
     expect(continuousCityRoadGradeAllowed({ points }, .13, elevation)).toBe(false)
@@ -29,9 +66,26 @@ describe('continuous shared city streets', () => {
     expect(children.reduce((sum, polygon) => sum + polygonArea(polygon), 0)).toBeCloseTo(polygonArea(face), 7)
     expect(partitionContinuousCityFace(face, [{ x: 0, y: 90 }, { x: 180, y: -30 }, { x: 400, y: 100 }])).toBeNull()
     expect(partitionContinuousCityFace(face, [{ x: 50, y: 50 }, { x: 400, y: 100 }])).toBeNull()
+    const returning = partitionContinuousCityFace(face, [{ x: 0, y: 70 }, { x: 120, y: 70 }, { x: 120, y: 200 }, { x: 0, y: 200 }])!
+    expect(returning).toHaveLength(2)
+    expect(returning.reduce((sum, polygon) => sum + polygonArea(polygon), 0)).toBeCloseTo(polygonArea(face), 7)
   })
 
-  it('frames almost all flat demand, subdivides real connected faces and serves opening-year gates', () => {
+  it('rejects a normalized cut that loses an essential short bend before touching the actual parent graph', () => {
+    const polygon = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100.01, y: 100.02 }, { x: 100.02, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 200 }, { x: 0, y: 200 }]
+    const path = [{ x: 0, y: 100.01 }, { x: 100, y: 100.01 }, { x: 100.02, y: 100.04 }, { x: 200, y: 100.04 }], graph = new PlanarRoadGraph(), metadata = { id: 'perimeter', builtYear: 1955, role: 'lane' as const, width: 6, kind: 'local' as const, phase: 'test', reason: 'actual parent perimeter', constructionCost: 0 }
+    graph.add([...polygon, polygon[0]!], metadata, false)
+    expect(partitionContinuousCityFace(polygon, path)).not.toBeNull()
+    const before = JSON.stringify({ roads: graph.roads, revision: graph.topologyRevision, history: graph.roadHistory })
+    let normalized: Point[] = []
+    const added = graph.add(path, { ...metadata, id: 'valid-only-before-normalization' }, true, candidate => { normalized = candidate.points.map(point => ({ ...point })); return !!partitionContinuousCityFace(polygon, normalized) })
+    expect(normalized).not.toEqual(path)
+    expect(partitionContinuousCityFace(polygon, normalized)).toBeNull()
+    expect(added).toBeNull()
+    expect(JSON.stringify({ roads: graph.roads, revision: graph.topologyRevision, history: graph.roadHistory })).toBe(before)
+  })
+
+  it('supplies sparse collector reach, actual dry plot frontage and opening-year gates without forcing ownership closure', () => {
     const input = fixture(), trunks = surveyContinuousCityTrunks(input)
     expect(trunks.diagnostics.boundaryConnections).toBeGreaterThanOrEqual(3)
     expect(trunks.roads.some(road => road.points[0]!.x < 0 && road.points.at(-1)!.x > 2000)).toBe(true)
@@ -39,10 +93,41 @@ describe('continuous shared city streets', () => {
     const result = buildContinuousCityRoads({ ...input, initialRoads: trunks.roads, accessTargets: [gate] })
     expect(result.diagnostics.unservedAccessIds).toEqual([])
     expect(certifyLayoutAccess({ width: 2000, height: 1600, roads: result.roads, targets: [gate] }).unserved).toEqual([])
-    expect(result.diagnostics.demandCoverage).toBeGreaterThan(.95)
+    const collectors = result.diagnostics.collectorReachability!
+    expect(collectors.servedAfter / collectors.samples).toBeGreaterThan(.95)
+    expect(collectors.maximumDryDistance).toBeLessThanOrEqual(500)
+    expect(collectors.attempted).toBeLessThanOrEqual(collectors.samples * 6)
     expect(new Set(result.roads.map(road => road.id)).size).toBe(result.roads.length)
-    const living = result.blocks.filter(block => polygonArea(block.polygon) >= 900 && polygonArea(block.polygon) < 15000)
-    expect(living.length).toBeGreaterThan(80)
+    const savedGeometry = JSON.stringify({ roads: result.roads, blocks: result.blocks }), diagnosticSamples: Point[] = [], diagnosticStep = Math.max(120, Math.sqrt(2000 * 1600 / 1600))
+    for (let y = diagnosticStep / 2; y < 1600; y += diagnosticStep) for (let x = diagnosticStep / 2; x < 2000; x += diagnosticStep) diagnosticSamples.push({ x, y })
+    const exhaustiveCount = diagnosticSamples.filter(point => result.blocks.some(block => pointInPolygon(point, block.polygon) || block.polygon.some((a, i) => distanceToSegment(point, a, block.polygon[(i + 1) % block.polygon.length]!) < 1e-7))).length
+    expect(diagnosticSamples.filter(continuousCityFaceCoverageQuery(result.blocks.map(block => block.polygon))).length).toBe(exhaustiveCount)
+    expect(result.diagnostics.framedDemandSamples).toBe(exhaustiveCount)
+    expect(result.diagnostics.demandCoverage).toBe(exhaustiveCount / diagnosticSamples.length)
+    expect(JSON.stringify({ roads: result.roads, blocks: result.blocks })).toBe(savedGeometry)
+    const service = result.diagnostics.localNetwork!
+    expect(service.servedAfter).toBeGreaterThan(service.servedBefore)
+    expect(service.attempted).toBeLessThanOrEqual(service.dryCells * 9)
+    expect(service.connectedEnds).toBeGreaterThan(0)
+    expect(service.deadEnds).toBeGreaterThan(0)
+    // Deliberately offset from the driver's 32m cells. A 64m diagnostic must
+    // not call a 60–100m courtyard served while only its border can hold lots.
+    const supportsPlot = dryPublicDepthProbe(result.roads, input, 30)
+    let probes = 0, usablePlots = 0, openButServed: Point | undefined
+    for (let y = 27; y < 1600; y += 40) for (let x = 13; x < 2000; x += 40) {
+      const point = { x, y }; probes++
+      if (supportsPlot(point)) { usablePlots++; if (!openButServed && !result.blocks.some(block => pointInRegion(point, block))) openButServed = point }
+    }
+    expect(usablePlots / probes).toBeGreaterThan(.95)
+    // Closed-face percentage is no longer an ownership condition: the new
+    // disjoint fringe domains must retain this ACTUALLY served open ground.
+    // Boundaries provide no invented frontage; dry public access was measured
+    // independently above, and the land-domain suite checks actual acquisition.
+    expect(openButServed).toBeDefined()
+    const domains = buildContinuousCityLandDomains({ demandRegions: input.demand.regions, streetBlocks: result.blocks })
+    expect(domains.fringe.some(domain => pointInRegion(openButServed!, domain))).toBe(true)
+    expect(domains.domains.slice(0, result.blocks.length).every((block, i) => block === result.blocks[i])).toBe(true)
+    expect(result.roads.filter(road => road.role === 'lane').every(road => road.points.slice(1).reduce((sum, b, i) => sum + distance(road.points[i]!, b), 0) <= 180.1)).toBe(true)
     const bins = new Map<string, { a: Point; b: Point }[]>(), adjacency = new Map<string, Set<string>>()
     // Same declared 5cm weld precision as the saved half-edge graph. Merely
     // read its vertices: rebuilding a design graph could repair a bad contact.
@@ -58,7 +143,7 @@ describe('continuous shared city streets', () => {
         }
       }
     }
-    for (const block of living) for (let i = 0; i < block.polygon.length; i++) {
+    for (const block of result.blocks) for (let i = 0; i < block.polygon.length; i++) {
       const a = block.polygon[i]!, b = block.polygon[(i + 1) % block.polygon.length]!
       const probe = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
       expect((bins.get(`${Math.floor(probe.x / 100)},${Math.floor(probe.y / 100)}`) ?? []).some(segment => distanceToSegment(probe, segment.a, segment.b) < .06)).toBe(true)
@@ -69,7 +154,7 @@ describe('continuous shared city streets', () => {
     for (let i = 0; i < queue.length; i++) for (const next of adjacency.get(queue[i]!) ?? []) if (!reached.has(next)) { reached.add(next); queue.push(next) }
     expect([...adjacency.keys()].filter(vertex => !reached.has(vertex))).toEqual([])
     expect(result.roads.filter(road => !reached.has(key(road.points[0]!)) || !reached.has(key(road.points.at(-1)!)))).toEqual([])
-    expect(result.diagnostics.attempted).toBeLessThan(result.blocks.length * 6 + 60)
+    expect(result.diagnostics.attempted).toBeLessThan(service.dryCells * 9 + result.diagnostics.demandSamples * 6 + 60)
   }, 15000)
 
   it('retains full compound protection and rail crossing separation while splitting dry parts of shared faces', () => {
@@ -80,8 +165,9 @@ describe('continuous shared city streets', () => {
     const constraints = new RailwayRoadConstraints([railway]), all = result.roads.flatMap(road => constraints.crossings(road.points))
     const sites = all.filter((crossing, i) => !all.slice(0, i).some(other => distance(crossing.point, other.point) < 2))
     for (let i = 0; i < sites.length; i++) for (let j = 0; j < i; j++) expect(Math.abs(sites[i]!.chainage - sites[j]!.chainage)).toBeGreaterThanOrEqual(319.9)
-    expect(result.blocks.some(block => polygonArea(block.polygon) < 12000 && pointInPolygon({ x: 600, y: 600 }, block.polygon))).toBe(true)
-    expect(result.blocks.some(block => polygonArea(block.polygon) < 12000 && pointInPolygon({ x: 1500, y: 1000 }, block.polygon))).toBe(true)
+    const supportsPlot = dryPublicDepthProbe(result.roads, input)
+    expect(supportsPlot({ x: 600, y: 600 })).toBe(true)
+    expect(supportsPlot({ x: 1500, y: 1000 })).toBe(true)
   }, 15000)
 
   it('reports requested modern transport unavailable rather than borrowing future street access', () => {
@@ -91,9 +177,13 @@ describe('continuous shared city streets', () => {
     expect(result.diagnostics.modern.completed).toEqual([])
     expect(result.diagnostics.modern.unavailable.map(item => item.kind)).toEqual(['bypass', 'expressway'])
     expect(result.roads.every(road => (road.builtYear ?? 0) >= 1995)).toBe(true)
-    // Both acquired vertices are outside: chainage sampling, rather than the
-    // source polyline's vertex density, must supply the interior frame anchors.
-    expect(result.diagnostics.demandCoverage).toBeGreaterThan(.90)
+    // Both acquired vertices are outside. Actual segment projections, rather
+    // than source vertex density or closure, must supply interior contacts.
+    expect(result.roads.some(road => road.id !== 'future-only' && road.points.some(point => point.x > 0 && point.x < 900 && Math.abs(point.y - 375) < .05))).toBe(true)
+    const supportsPlot = dryPublicDepthProbe(result.roads, input, 30)
+    let probes = 0, served = 0
+    for (let y = 27; y < 750; y += 40) for (let x = 13; x < 900; x += 40) { probes++; if (supportsPlot({ x, y })) served++ }
+    expect(served / probes).toBeGreaterThan(.95)
   })
 
   it('crosses undemanded countryside and water only on a registered physical bank pair', () => {
@@ -113,7 +203,7 @@ describe('continuous shared city streets', () => {
     for (const span of result.diagnostics.bridgeSpans) expect([span.bankA, span.bankB]).toEqual([bridge.bankA, bridge.bankB])
   })
 
-  it('closes broad shared urban faces independently across several north-south streams, a coast and a railway', () => {
+  it('supplies dry collector reach independently across several north-south streams, a coast and a railway', () => {
     const input = fixture(3600, 2600), channels = [{ x: 900, width: 22 }, { x: 1700, width: 34 }, { x: 2600, width: 22 }]
     const seaAt = (p: { x: number; y: number }) => p.y > 2180 + p.x * .05
     const waterAt = (p: { x: number; y: number }) => seaAt(p) || channels.some(channel => Math.abs(p.x - channel.x) <= channel.width / 2)
@@ -127,9 +217,12 @@ describe('continuous shared city streets', () => {
     input.railways = [{ id: 'surface-line', name: '本線', points: [{ x: 0, y: 1460 }, { x: 3600, y: 1460 }] }]
     input.reservedRegions = [{ polygon: rectangle(1860, 620, 160, 180) }]
     const result = buildContinuousCityRoads(input)
-    expect(result.diagnostics.demandCoverage).toBeGreaterThan(.90)
-    expect(result.diagnostics.coarseFaces).toBeGreaterThan(24)
-    expect(result.diagnostics.sharedExpansion.links).toBeGreaterThan(25)
+    const collectors = result.diagnostics.collectorReachability!
+    expect(collectors.servedAfter / collectors.samples).toBeGreaterThan(.95)
+    expect(collectors.maximumDryDistance).toBeLessThanOrEqual(500)
+    expect(collectors.attempted).toBeLessThanOrEqual(collectors.samples * 6)
+    const actualEnds = result.roads.flatMap(road => [road.points[0]!, road.points.at(-1)!].map((point, end) => ({ id: `${road.id}-${end}`, point, builtYear: road.builtYear ?? 1650 })))
+    expect(certifyLayoutAccess({ width: 3600, height: 2600, roads: result.roads, targets: actualEnds }).unserved).toEqual([])
     for (const road of result.roads) for (const point of road.points) {
       expect(seaAt(point)).toBe(false)
       if (waterAt(point)) expect(onSurveyedBridge(point, road as Parameters<typeof onSurveyedBridge>[1])).toBe(true)
@@ -139,21 +232,53 @@ describe('continuous shared city streets', () => {
     for (let i = 0; i < sites.length; i++) for (let j = 0; j < i; j++) expect(Math.abs(sites[i]!.chainage - sites[j]!.chainage)).toBeGreaterThanOrEqual(319.9)
   }, 30000)
 
-  it('uses a contained detour when all straight partitions hit the central reserved campus', () => {
+  it('provides actual public frontage around a central reserved campus without requiring every street to divide its parent', () => {
     const input = fixture(1600, 1400), perimeter = rectangle(300, 200, 1000, 1000), campus = { polygon: rectangle(630, 500, 340, 400) }
     input.reservedRegions = [campus]
     input.initialRoads = perimeter.map((a, i) => ({ id: `acquired-perimeter-${i}`, points: [a, perimeter[(i + 1) % perimeter.length]!], role: 'collector', kind: 'local', width: 8.5, builtYear: 1955 }))
     const result = buildContinuousCityRoads(input)
-    expect(result.diagnostics.largeFaceDetours.accepted).toBeGreaterThan(0)
-    expect(result.diagnostics.largeFaceDetours.attempted).toBeLessThanOrEqual(2 * result.diagnostics.largeFaceDetours.faces)
+    expect(result.diagnostics.localNetwork!.gainedAreaEstimate).toBeGreaterThan(0)
     const added = result.roads.filter(road => !road.id.startsWith('acquired-perimeter'))
     for (const road of added) for (let i = 1; i < road.points.length; i++) expect(polygonOverlapsRegion(corridorPolygon(road.points[i - 1]!, road.points[i]!, road.width / 2 + .75), campus)).toBe(false)
-    const firstDetour = added.find(road => road.reason?.startsWith('保護敷地・水域・鉄道'))!
-    const children = partitionContinuousCityFace(perimeter, firstDetour.points)!
-    expect(children.reduce((sum, polygon) => sum + polygonArea(polygon), 0)).toBeCloseTo(1_000_000, 6)
     // Final half-edge extraction welds vertices in 5cm bins and removes tiny
     // retraced excursions; require conservation to one square metre per km².
-    expect(Math.abs(result.blocks.reduce((sum, block) => sum + polygonArea(block.polygon), 0) - 1_000_000)).toBeLessThan(1)
-    expect(result.blocks.filter(block => polygonArea(block.polygon) < 25000).length).toBeGreaterThan(30)
+    expect(Math.abs(result.blocks.reduce((sum, block) => sum + intersectRegions(block, { polygon: perimeter }).reduce((area, region) => area + regionArea(region), 0), 0) - 1_000_000)).toBeLessThan(1)
+    let dry = 0, served = 0
+    const supportsPlot = dryPublicDepthProbe(result.roads, input)
+    for (let y = 230; y < 1200; y += 60) for (let x = 330; x < 1300; x += 60) {
+      const point = { x, y }
+      if (pointInPolygon(point, campus.polygon)) continue
+      dry++; if (supportsPlot(point)) served++
+    }
+    expect(served / dry).toBeGreaterThan(.95)
+  }, 15000)
+
+  it('serves the dry components of a large river/rail face without forcing a crossing through its campus', () => {
+    const input = fixture(1600, 1600), perimeter = rectangle(200, 200, 1200, 1200), campus = { polygon: rectangle(370, 400, 260, 260) }, waterAt = (p: Point) => p.x >= 780 && p.x <= 820
+    input.reservedRegions = [campus]
+    input.environment.areas = [{ id: 'river', kind: 'water', polygon: rectangle(780, 0, 40, 1600) }]
+    input.environment.terrain = { ...input.environment.terrain!, waterAt, continuationTerrain: { ...input.environment.terrain!.continuationTerrain!, waterAt } }
+    input.railways = [{ id: 'running-line', name: '本線', points: [{ x: 0, y: 820 }, { x: 1600, y: 820 }] }]
+    input.initialRoads = perimeter.map((a, i) => ({ id: `actual-perimeter-${i}`, points: [a, perimeter[(i + 1) % perimeter.length]!], role: 'collector', kind: 'local', width: 8.5, builtYear: 1955 }))
+    const result = buildContinuousCityRoads(input)
+    const actualStreetSegments = result.roads.filter(road => road.width >= 4.6 && !road.controlledAccess).flatMap(road => road.points.slice(1).map((b, i) => ({ a: road.points[i]!, b }))), rail = new RailwayRoadConstraints(input.railways)
+    let dry = 0, served = 0
+    for (let y = 230; y < 1400; y += 60) for (let x = 230; x < 1400; x += 60) {
+      const point = { x, y }
+      if (waterAt(point) || Math.abs(y - 820) < 10 || pointInPolygon(point, campus.polygon)) continue
+      dry++
+      // A campus can remain a large block. Measure the ACTUAL dry last leg,
+      // rather than calling its buildable perimeter a void just because the
+      // un-subtracted campus/rail parent polygon exceeds an area threshold.
+      if (actualStreetSegments.some(({ a, b }) => {
+        const contact = projectOnRoadSegment(point, a, b).point, length = distance(point, contact)
+        if (length > 90) return false
+        if (length < .1) return true
+        const count = Math.ceil(length / 4)
+        return !rail.crossings([point, contact]).length && !polygonOverlapsRegion(corridorPolygon(point, contact, 1), campus) && Array.from({ length: count + 1 }, (_, i) => ({ x: point.x + (contact.x - point.x) * i / count, y: point.y + (contact.y - point.y) * i / count })).every(p => !waterAt(p))
+      })) served++
+    }
+    expect(served / dry).toBeGreaterThan(.9)
+    for (const road of result.roads.filter(road => !road.id.startsWith('actual-perimeter'))) for (let i = 1; i < road.points.length; i++) expect(polygonOverlapsRegion(corridorPolygon(road.points[i - 1]!, road.points[i]!, road.width / 2 + .75), campus)).toBe(false)
   }, 15000)
 })

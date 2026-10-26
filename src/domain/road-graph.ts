@@ -4,6 +4,8 @@ export type RoadRole = 'highway' | 'collector' | 'lane' | 'access' | 'bridge' | 
 export interface SimulatedRoad extends Road { builtYear: number; role: RoadRole; reason: string; bridge?: boolean; phase: string; constructionCost: number }
 export interface RoadMetadata { id: string; builtYear: number; role: RoadRole; reason: string; phase: string; width: number; kind: Road['kind']; constructionCost: number; bridge?: boolean; preserveEndpoint?: boolean; level?: number; controlledAccess?: boolean; boundaryContinuation?: boolean; throughRouteId?: string }
 export interface RoadProject { points: Point[]; metadata: RoadMetadata; requireConnection?: boolean; modifies?: string }
+export interface NormalizedRoadCandidate { readonly points: readonly Readonly<Point>[]; readonly reusedRoadId?: string }
+export type RoadInsertionGuard = (candidate: NormalizedRoadCandidate) => boolean
 export interface RoadProjection { point: Point; distance: number; road: SimulatedRoad; a: Point; b: Point; t: number }
 /** Generalized uncongested speed in m/min; historical impedance is applied by
  * year. Width constrains an actual carriageway, including access streets. A
@@ -262,12 +264,15 @@ export class PlanarRoadGraph {
     return null
   }
   /** All crossings are real shared vertices; a road may connect two older roads to close a loop. */
-  add(path: Point[], metadata: RoadMetadata, requireConnection = true): SimulatedRoad | null {
+  add(path: Point[], metadata: RoadMetadata, requireConnection = true, beforeCommit?: RoadInsertionGuard): SimulatedRoad | null {
     if (path.length < 2 || roadLength(path) < (metadata.preserveEndpoint ? 1e-7 : metadata.role === 'bridge' ? .01 : 20)) return null
     path = path.map(p => ({ ...p }))
     for (const i of [0, path.length - 1]) { if (controlledRoad(metadata) || (i === path.length - 1 && metadata.preserveEndpoint)) continue; const near = this.nearest(path[i]!, 1); if (near) path[i] = near.point }
     const existing = this.reusableRoad(path, metadata)
-    if (existing) return existing
+    if (existing) {
+      if (beforeCommit && !beforeCommit(Object.freeze({ points: Object.freeze(existing.points.map(point => Object.freeze({ ...point }))), reusedRoadId: existing.id }))) return null
+      return existing
+    }
     if (requireConnection && this.roads.length && !this.nearest(path[0]!, .15)) return null
     const normalized: Point[] = [path[0]!], junctions: { road: SimulatedRoad; point: Point }[] = []
     for (let i = 1; i < path.length; i++) {
@@ -289,6 +294,11 @@ export class PlanarRoadGraph {
       samples++; if (!controlledRoad(metadata) && this.nearest(middle, metadata.width * .5 + 2)) covered++
     }
     if (samples > 3 && covered / samples > .72) return null
+    // Normalization may snap an endpoint or remove a sub-4cm bend. Validate
+    // exactly the eventual saved geometry before changing ANY old junction,
+    // version, road record or spatial index. Detached frozen copies prevent a
+    // guard from accidentally mutating either the old or staged geometry.
+    if (beforeCommit && !beforeCommit(Object.freeze({ points: Object.freeze(normalized.map(point => Object.freeze({ ...point }))) }))) return null
     const road: SimulatedRoad = { id: metadata.id, points: normalized, kind: metadata.kind, width: metadata.width, builtYear: metadata.builtYear, role: metadata.role, phase: metadata.phase, reason: metadata.reason, constructionCost: metadata.constructionCost, ...(metadata.bridge ? { bridge: true } : {}), ...(metadata.level !== undefined ? { level: metadata.level } : {}), ...(metadata.controlledAccess ? { controlledAccess: true } : {}), ...(metadata.boundaryContinuation ? { boundaryContinuation: true } : {}), ...(metadata.throughRouteId ? { throughRouteId: metadata.throughRouteId } : {}) }
     for (const junction of junctions) this.insert(junction.road, junction.point)
     // Explicit endpoint snaps also split old curves even if the new path is tangent at the connection.
@@ -472,7 +482,7 @@ export class MinHeap<T> {
 }
 
 /** Half-edge left-face walk of the actual normalized street graph, not a land tessellation. */
-export function extractStreetBlocks(roads: Road[]): Point[][] {
+export function extractStreetBlocks(roads: Road[], minimumArea = 150): Point[][] {
   type Edge = { from: string; to: string; a: Point; b: Point; angle: number; reverse: Edge | null; used: boolean }
   const outgoing = new Map<string, Edge[]>(), edges: Edge[] = [], unique = new Set<string>()
   for (const road of roads.filter(road => !controlledRoad(road))) for (let i = 1; i < road.points.length; i++) {
@@ -499,9 +509,18 @@ export function extractStreetBlocks(roads: Road[]): Point[][] {
     if (edge !== first || polygon.length < 3) continue
     // Remove dead-end excursions which retrace the same road within an otherwise closed face.
     let changed = true
-    while (changed && polygon.length > 3) { changed = false; for (let i = 0; i < polygon.length; i++) if (key(polygon[(i + polygon.length - 1) % polygon.length]!) === key(polygon[(i + 1) % polygon.length]!)) { polygon.splice(i, 1); changed = true; break } }
+    while (changed && polygon.length > 2) {
+      changed = false
+      for (let i = 0; i < polygon.length; i++) {
+        const previous = polygon[(i + polygon.length - 1) % polygon.length]!, current = polygon[i]!, next = polygon[(i + 1) % polygon.length]!
+        // Removing a reversed tree tip leaves J,J. Collapse that same graph
+        // node as well, so nested/T/Y excursions can unwind all the way back
+        // to the real perimeter rather than leaving a weakly-simple spike.
+        if (key(current) === key(next) || key(previous) === key(next)) { polygon.splice(i, 1); changed = true; break }
+      }
+    }
     const area = polygon.reduce((sum, p, i) => sum + p.x * polygon[(i + 1) % polygon.length]!.y - polygon[(i + 1) % polygon.length]!.x * p.y, 0) / 2
-    if (area > 150) faces.push(polygon)
+    if (area > minimumArea) faces.push(polygon)
   }
   return faces
 }

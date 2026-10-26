@@ -3,7 +3,7 @@ import type { PolygonRegion } from './geometry'
 import type { PlanningEnvironment } from './road-planner'
 import type { TerrainModel } from './terrain'
 
-export const CONTINUOUS_GENERATOR_VERSION = '2.7.0-continuous.1'
+export const CONTINUOUS_GENERATOR_VERSION = '2.7.0-continuous.2'
 
 /** Development is a continuous accessibility field. Its contours are never
  * street boundaries or privately owned neighbourhood stamps. */
@@ -36,6 +36,9 @@ export interface ContinuousCityLandInput {
   blocks: ContinuousCityBlock[]
   demand: ContinuousCityDemand
   stations: Station[]
+  /** An acquired public approach is the centre anchor when its landmark is
+   * inside reserved grounds. This never grants a shortcut through those grounds. */
+  centerAccess?: { point: Point; builtYear: number }
   reserves: readonly PolygonRegion[]
   terrain: Pick<TerrainModel, 'areas' | 'elevation' | 'slope' | 'waterAt'>
 }

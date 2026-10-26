@@ -1,9 +1,16 @@
-import type { Area, TimelineVersion } from './types'
+import type { Area, Road, TimelineVersion } from './types'
+import { continuousRoadGround } from './continuous-city-cover'
 import type { Bounds, PolygonRegion } from './geometry'
 import { boundsOf, intersectRegions, overlaps, rectangle, regionArea, subtractRegions } from './geometry'
 import { regionQuery } from './region-query'
 
 export interface ContinuousCoverAcquisition { region: PolygonRegion; from: number }
+/** Acquire the same joined pavement that final cover uses. Per-segment
+ * rectangles omit bend shoulders and multiply curved roads into tiny cuts.
+ * Elevated roads leave the ground beneath them intact. */
+export function continuousRoadAcquisitions(roads: readonly Road[]): ContinuousCoverAcquisition[] {
+  return roads.flatMap(road => continuousRoadGround(road).map(region => ({ region, from: road.builtYear ?? 1650 })))
+}
 export interface ContinuousCoverHistoryInput {
   width: number
   height: number
@@ -62,11 +69,16 @@ export function buildContinuousCoverHistory(input: ContinuousCoverHistoryInput):
       if (!remaining.length) continue
       const acquisitions = (tiles.get(id) ?? []).filter(entry => overlaps(entry.bounds, tileBounds))
       for (let index = 0; index < acquisitions.length;) {
-        const from = acquisitions[index]!.from, cuts: PolygonRegion[] = []
-        while (index < acquisitions.length && acquisitions[index]!.from === from && cuts.length < batchSize) cuts.push(acquisitions[index++]!.region)
+        const from = acquisitions[index]!.from, cuts: typeof acquisitions = []
+        while (index < acquisitions.length && acquisitions[index]!.from === from && cuts.length < batchSize) cuts.push(acquisitions[index++]!)
         const next: PolygonRegion[] = []
         for (const piece of remaining) {
-          const after = subtractRegions(piece, cuts)
+          // Acquisition bounds were measured once for the tile index. Reuse
+          // them before the exact predicate, instead of recomputing a growing
+          // remainder's bounds/edges for every unrelated title in each batch.
+          const bounds = boundsOf(piece.polygon), nearby = cuts.filter(cut => overlaps(bounds, cut.bounds)).map(cut => cut.region)
+          if (!nearby.length) { next.push(piece); continue }
+          const after = subtractRegions(piece, nearby)
           if (totalArea(after) < regionArea(piece) - .00001) {
             const converted = after.length ? subtractRegions(piece, after) : [piece]
             for (const part of converted) baseVersion(base, part, from)

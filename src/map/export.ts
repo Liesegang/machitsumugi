@@ -8,6 +8,7 @@ import { seaDepthRaster } from './bathymetry'
 import { landPaintGroups } from './land-paint'
 import { subwayInk, SUBWAY_DASH, SUBWAY_LINE_WIDTH } from './railway-style'
 import { woodlandCrowns, WOODLAND_TEXTURE_MIN_SCALE } from './woodland-texture'
+import { roadStrokeWidths } from './road-style'
 
 function filename(map: CityMap, extension: string) {
   return `${map.config.name.replace(/[\\/:*?"<>|]/g, '_') || 'machitsumugi'}-${map.config.seed.replace(/[^\w\u3000-\u9fff-]/g, '_').slice(0, 48)}.${extension}`
@@ -129,8 +130,8 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
   if (layers.roads) {
     for (const p of map.parcels ?? []) if (p.developedYear && p.retiredYear === undefined && p.access?.length) parts.push(`<path d="${path(p.access)}" fill="none" stroke="${c.roadEdge}" stroke-width="3.4"/><path d="${path(p.access)}" fill="none" stroke="${c.road}" stroke-width="2.8"/>`)
     for (const kind of ['local', 'arterial'] as const) {
-      for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.arteryEdge : c.roadEdge}" stroke-width="${road.width + 2.5}"/>`)
-      for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.artery : c.road}" stroke-width="${road.width}"/>`)
+      for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.arteryEdge : c.roadEdge}" stroke-width="${roadStrokeWidths(road, 4096 / map.width).outlinedWidth}"/>`)
+      for (const road of map.roads.filter(r => r.kind === kind)) parts.push(`<path d="${path(road.points)}" fill="none" stroke="${kind === 'arterial' ? c.artery : c.road}" stroke-width="${roadStrokeWidths(road, 4096 / map.width).width}"/>`)
     }
   }
   if (layers.railway) for (const rail of map.railways) {

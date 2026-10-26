@@ -57,6 +57,9 @@ export interface CityMap {
   unplacedFacilities?: { kind: FacilityKind; reason: string }[];
   /** Transient worker frames are never stored as a completed project. */
   previewPhase?: 'landscape' | 'erosion' | 'hydrology' | 'railway' | 'roads' | 'development';
+  /** Transient acquired grounds for reproducing a road-planning preview.
+   * Completed projects contain their dated geometry instead. */
+  previewPlanning?: { reservedGrounds: { polygon: Point[]; holes?: Point[][] }[] };
   previewCrop?: Point[];
   previewSeaLevel?: number;
   regionalContext?: { surface: TerrainSurface; crop: Point[]; extent: number };

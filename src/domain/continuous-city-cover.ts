@@ -1,4 +1,4 @@
-import { union } from 'polygon-clipping'
+import polygonClipping from 'polygon-clipping'
 import ClipperLib from 'clipper-lib'
 import type { Path, PolyNode } from 'clipper-lib'
 import type { Area, CityConfig, Parcel, Point, Road } from './types'
@@ -8,6 +8,8 @@ import type { ContinuousCityDemand } from './continuous-city-types'
 import { boundsOf, distance, distanceToSegment, intersectRegions, overlaps, pathPointAt, pointInRegion, rectangle, regionArea, subtractRegions } from './geometry'
 import { agriculturalUse, contourLand } from './land-use'
 import { PROJECT_GEOMETRY_LIMITS } from './project'
+
+const { difference, union } = polygonClipping
 
 export interface ContinuousCityCoverInput {
   config: CityConfig
@@ -25,10 +27,10 @@ export interface ContinuousCityCoverInput {
 /** Integer Vatti union is independent of the floating sweep which can exceed
  * its event queue on thousands of almost-touching title verges. Source water
  * never passes through this operation; its exact objects remain unchanged. */
-function integerCoverUnion(parts: readonly PolygonRegion[], boundary?: PolygonRegion): PolygonRegion[] {
+function integerCoverBoolean(parts: readonly PolygonRegion[], boundaries: readonly PolygonRegion[] = [], operation: 'union' | 'intersection' | 'difference' = 'union'): PolygonRegion[] {
   if (!parts.length) return []
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-  for (const region of boundary ? [...parts, boundary] : parts) for (const p of region.polygon) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y) }
+  for (const region of [...parts, ...boundaries]) for (const p of region.polygon) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y) }
   // Clipper.js switches to Int128 above47,453,132, far below the C++ limit.
   // A local origin keeps ordinary blocks and4x3km crops in the fast range.
   // The widest12km crop uses0.2mm; normal source geometry uses0.1mm already.
@@ -46,12 +48,12 @@ function integerCoverUnion(parts: readonly PolygonRegion[], boundary?: PolygonRe
     }
     return paths
   }
-  let subjects = pathsAt(parts), clips = boundary ? pathsAt([boundary]) : []
+  let subjects = pathsAt(parts), clips = pathsAt(boundaries)
   // Exceptional thinner rings get finer precision in this bounded component,
   // never silently disappear. The ordinary whole-city path stays fast.
-  if (!subjects || !clips) { scale = 10000; subjects = pathsAt(parts); clips = boundary ? pathsAt([boundary]) : [] }
-  if (!subjects || !clips) { scale = 1_000_000; subjects = pathsAt(parts); clips = boundary ? pathsAt([boundary]) : [] }
-  if (!subjects || !clips) { scale = 100_000_000; subjects = pathsAt(parts); clips = boundary ? pathsAt([boundary]) : [] }
+  if (!subjects || !clips) { scale = 10000; subjects = pathsAt(parts); clips = pathsAt(boundaries) }
+  if (!subjects || !clips) { scale = 1_000_000; subjects = pathsAt(parts); clips = pathsAt(boundaries) }
+  if (!subjects || !clips) { scale = 100_000_000; subjects = pathsAt(parts); clips = pathsAt(boundaries) }
   if (!subjects || !clips) throw new Error('被覆境界を整数精度で保持できませんでした。')
   const engine = new ClipperLib.Clipper(), tree = new ClipperLib.PolyTree()
   // Clipper's optional DoSimplePolygons pass repeatedly splits the native
@@ -59,8 +61,9 @@ function integerCoverUnion(parts: readonly PolygonRegion[], boundary?: PolygonRe
   // default Vatti PolyTree already retains the same filled set and hole tree.
   engine.StrictlySimple = false
   if (!engine.AddPaths(subjects, ClipperLib.PolyType.ptSubject, true)) throw new Error('被覆境界の整数入力がありません。')
-  if (boundary) engine.AddPaths(clips, ClipperLib.PolyType.ptClip, true)
-  if (!engine.Execute(boundary ? ClipperLib.ClipType.ctIntersection : ClipperLib.ClipType.ctUnion, tree, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) throw new Error('被覆境界の整数結合に失敗しました。')
+  if (boundaries.length) engine.AddPaths(clips, ClipperLib.PolyType.ptClip, true)
+  const type = operation === 'difference' ? ClipperLib.ClipType.ctDifference : operation === 'intersection' ? ClipperLib.ClipType.ctIntersection : ClipperLib.ClipType.ctUnion
+  if (!engine.Execute(type, tree, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) throw new Error('被覆境界の整数演算に失敗しました。')
   const result: PolygonRegion[] = [], ring = (node: PolyNode) => node.Contour().map(p => ({ x: p.X / scale + origin.x, y: p.Y / scale + origin.y }))
   const visit = (node: PolyNode) => {
     if (!node.IsHole() && node.Contour().length >= 3) {
@@ -88,7 +91,7 @@ function joinCoverParts(parts: readonly PolygonRegion[]): PolygonRegion[] {
       })
     } catch { /* The integer algorithm retains these same rings and fragments. */ }
   }
-  return integerCoverUnion(parts)
+  return integerCoverBoolean(parts)
 }
 /** Only an actual portable-format overflow introduces a partition boundary.
  * Exact integer intersections retain both sides, all holes and all fill. */
@@ -97,7 +100,25 @@ function portableCoverRegions(region: PolygonRegion): PolygonRegion[] {
   if (region.polygon.length <= limit && (region.holes?.length ?? 0) <= 10000 && (region.holes ?? []).every(h => h.length <= limit)) return [region]
   const b = boundsOf(region.polygon), vertical = b.maxX - b.minX >= b.maxY - b.minY, middle = vertical ? (b.minX + b.maxX) / 2 : (b.minY + b.maxY) / 2
   const masks = vertical ? [rectangle(b.minX - 1, b.minY - 1, middle - b.minX + 1, b.maxY - b.minY + 2), rectangle(middle, b.minY - 1, b.maxX - middle + 1, b.maxY - b.minY + 2)] : [rectangle(b.minX - 1, b.minY - 1, b.maxX - b.minX + 2, middle - b.minY + 1), rectangle(b.minX - 1, middle, b.maxX - b.minX + 2, b.maxY - middle + 1)]
-  return masks.flatMap(polygon => integerCoverUnion([region], { polygon })).flatMap(portableCoverRegions)
+  return masks.flatMap(polygon => integerCoverBoolean([region], [{ polygon }], 'intersection')).flatMap(portableCoverRegions)
+}
+/** Only high-operand tile acquisition differences bypass the floating sweep.
+ * Native2999-cut input otherwise spends68s on almost-coincident title/ROW
+ * edges. The same0.1–0.2mm survey lattice and full hole tree are retained. */
+export function subtractContinuousCover(subject: PolygonRegion, cuts: readonly PolygonRegion[]): PolygonRegion[] {
+  const bounds = boundsOf(subject.polygon), nearby = cuts.filter(cut => overlaps(bounds, boundsOf(cut.polygon)))
+  if (!nearby.length) return [subject]
+  const vertices = nearby.reduce((n, p) => n + p.polygon.length + (p.holes ?? []).reduce((s, h) => s + h.length, 0), 0)
+  if (nearby.length < 512 && vertices < 12000) return subtractRegions(subject, nearby)
+  // Vatti's weakly-simple outer/holes may touch at acquired title corners.
+  // Reapply the holes as explicit cuts in each small result component, so a
+  // touching hole splits its shell rather than surviving as an invalid ring.
+  // This never restores the pathological whole-tile floating difference.
+  const ring = (points: readonly Point[]) => [...points, points[0]!].map(p => [p.x, p.y] as [number, number])
+  return integerCoverBoolean([subject], nearby, 'difference').flatMap(part => {
+    const geometry = difference([ring(part.polygon)], ...(part.holes ?? []).map(hole => [ring(hole)]))
+    return geometry.map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), ...(rings.length > 1 ? { holes: rings.slice(1).map(hole => hole.slice(0, -1).map(([x, y]) => ({ x, y }))) } : {}) }))
+  })
 }
 /** Already-disjoint conversion pieces need no numeric reunion. Keep exact
  * source coordinates; only the portable format's real limits justify cuts. */
@@ -157,6 +178,35 @@ function regionIndex(regions: readonly PolygonRegion[], cell = 400) {
     const b = boundsOf(region.polygon), found = new Set<PolygonRegion>()
     for (let x = Math.floor(b.minX / cell); x <= Math.floor(b.maxX / cell); x++) for (let y = Math.floor(b.minY / cell); y <= Math.floor(b.maxY / cell); y++) for (const entry of cells.get(`${x}:${y}`) ?? []) if (overlaps(b, entry.bounds)) found.add(entry.region)
     return [...found]
+  }
+}
+/** A component with no mask boundary in its bounds is wholly on one side.
+ * Most title-sized remnants lie deep inside one large demand contour. Exact
+ * boundary boxes avoid clipping that entire contour twice for every remnant;
+ * touching boundaries and enclosed holes retain the ordinary polygon kernel. */
+function coverMaskRelation() {
+  const boundaries = new WeakMap<PolygonRegion, ReturnType<typeof regionIndex>>()
+  return (part: PolygonRegion, mask: PolygonRegion) => {
+    let edges = boundaries.get(mask)
+    if (!edges) {
+      edges = regionIndex([mask.polygon, ...mask.holes ?? []].flatMap(ring => ring.map((a, i) => ({ polygon: [a, ring[(i + 1) % ring.length]!] }))))
+      boundaries.set(mask, edges)
+    }
+    if (edges(part).length) return 'partial'
+    return pointInRegion(part.polygon[0]!, mask) ? 'inside' : 'outside'
+  }
+}
+function coverMaskPartition(masks: readonly PolygonRegion[]) {
+  const query = regionIndex(masks), relation = coverMaskRelation()
+  return (part: PolygonRegion) => {
+    const partial: PolygonRegion[] = []
+    for (const mask of query(part)) {
+      const side = relation(part, mask)
+      if (side === 'partial') partial.push(mask)
+      else if (side === 'inside') return { inside: [part], outside: [] }
+    }
+    if (!partial.length) return { inside: [], outside: [part] }
+    return { inside: partial.flatMap(mask => intersectRegions(part, mask)), outside: subtractRegions(part, partial) }
   }
 }
 /** Continuous full-width ground strip. Bridge water remains the exact water area. */
@@ -256,11 +306,11 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
   onProgress?.(`土地被覆:水・取得地・保護地の索引を作成中（${input.parcels.length}筆）…`)
   const obstacles = [...water, ...input.reserves, ...input.parcels.filter(p => p.retiredYear === undefined).map(p => ({ polygon: p.polygon })), ...ground], obstacleQuery = regionIndex(obstacles)
   onProgress?.(`土地被覆:都市需要面を索引化中（${input.demand.regions.length}面）…`)
-  const demand = partitionContinuousCover(input.demand.regions), demandQuery = regionIndex(demand)
+  const demand = partitionContinuousCover(input.demand.regions), demandPartition = coverMaskPartition(demand)
   onProgress?.('土地被覆:斜面の自然植生を測量中…')
   const steep = contourLand(width, height, p => terrain.slope(p) - .16, Math.max(60, Math.sqrt(width * height / 9000)))
   onProgress?.(`土地被覆:森林と斜面境界を結合中（${steep.length}斜面）…`)
-  const woodland = dissolveContinuousCover([...terrain.areas.filter(a => a.kind === 'forest' || a.landUse === 'woodland'), ...steep]), woodlandQuery = regionIndex(woodland)
+  const woodland = dissolveContinuousCover([...terrain.areas.filter(a => a.kind === 'forest' || a.landUse === 'woodland'), ...steep]), woodlandPartition = coverMaskPartition(woodland)
   const result: Area[] = [], add = (regions: PolygonRegion[], kind: Area['kind'], landUse?: Area['landUse']) => {
     for (const region of regions) if (regionArea(region) > .0001) result.push({ id: `land-continuous-${result.length}`, ...region, kind, ...(landUse ? { landUse } : {}) })
   }
@@ -275,15 +325,15 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
     const cell = { polygon: rectangle(x, y, Math.min(tile, width - x), Math.min(tile, height - y)) }
     const cuts = obstacleQuery(cell)
     onProgress?.(`土地被覆:取得地の除外 ${++tileSerial}/${tileCount}（${x},${y}・${cuts.length}境界）…`)
-    const vacant = subtractRegions(cell, cuts)
+    const vacant = subtractContinuousCover(cell, cuts)
     onProgress?.(`土地被覆:自然・都市・農村の分類 ${tileSerial}/${tileCount}（${vacant.length}残地）…`)
     for (const part of vacant) {
-      const woods = woodlandQuery(part)
-      for (const wood of woods) naturalParts.push(...intersectRegions(part, wood))
-      for (const dry of subtractRegions(part, woods)) {
-        const urban = demandQuery(dry)
-        for (const d of urban) urbanParts.push(...intersectRegions(dry, d))
-        ruralParts.push(...subtractRegions(dry, urban))
+      const wooded = woodlandPartition(part)
+      naturalParts.push(...wooded.inside)
+      for (const dry of wooded.outside) {
+        const developed = demandPartition(dry)
+        urbanParts.push(...developed.inside)
+        ruralParts.push(...developed.outside)
       }
     }
   }
@@ -293,11 +343,17 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
   const publicRoads = input.roads.filter(r => (r.level ?? 0) === 0 && !r.controlledAccess && r.role !== 'expressway' && r.role !== 'ramp'), touchesRoad = roadContacts(publicRoads)
   onProgress?.(`土地被覆:都市内残地の保持（${urbanParts.length}片）…`)
   onGeometry?.('urban', urbanParts)
-  const urban = partitionContinuousCover(urbanParts), blockQuery = regionIndex(input.urbanBlocks)
+  const urban = partitionContinuousCover(urbanParts), blockQuery = regionIndex(input.urbanBlocks), blockRelation = coverMaskRelation()
+  const blockAreas = new WeakMap(input.urbanBlocks.map(block => [block, regionArea(block)] as const))
   onProgress?.(`土地被覆:都市内空地と小公園を分類中（${urban.length}面）…`)
   for (const part of urban) {
     const processingEdge = part.polygon.some((a, i) => { const b = part.polygon[(i + 1) % part.polygon.length]!; return Math.abs(a.x - b.x) < 1e-7 && a.x > 0 && a.x < width && Math.abs(a.x / tile - Math.round(a.x / tile)) < 1e-8 || Math.abs(a.y - b.y) < 1e-7 && a.y > 0 && a.y < height && Math.abs(a.y / tile - Math.round(a.y / tile)) < 1e-8 })
-    const smallPocket = regionArea(part) <= 1600 && blockQuery(part).some(b => (!processingEdge || regionArea(b) <= 1600) && intersectRegions(part, b).reduce((sum, p) => sum + regionArea(p), 0) >= regionArea(part) * .99) && touchesRoad(part)
+    const area = regionArea(part)
+    const smallPocket = area <= 1600 && blockQuery(part).some(b => {
+      if (processingEdge && blockAreas.get(b)! > 1600) return false
+      const side = blockRelation(part, b)
+      return side === 'inside' || side === 'partial' && intersectRegions(part, b).reduce((sum, p) => sum + regionArea(p), 0) >= area * .99
+    }) && touchesRoad(part)
     add([part], 'park', smallPocket ? undefined : 'vacant')
   }
   const ruralQuery = regionIndex(ruralParts)

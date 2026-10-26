@@ -3,13 +3,21 @@ import type { Bounds, PolygonRegion } from './geometry'
 import type { ContinuousCityLandInput } from './continuous-city-types'
 import { boundsOf, corridorPolygon, distance, distanceToSegment, intersectRegions, overlaps, pointInPolygon, pointInRegion, polygonArea, polygonOverlapsRegion, projectPoint, rectangle, regionArea, seededRandom, segmentsCross, subtractRegions } from './geometry'
 import { buildingServiceYears } from './building-lifecycle'
+import { MinHeap } from './road-graph'
 
 interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds }
 interface Frontage { a: Point; b: Point; segment: Segment; length: number }
 interface Cell extends PolygonRegion { frontages: Frontage[] }
+type Stock = 'compact' | 'ordinary' | 'garden' | 'walkup' | 'mixed'
+interface RouteContext { distance: number; availableYear: number; formAvailableYear: number; source: 'center' | 'station' }
+interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext }
+interface TitleProgramme { stock: Stock; frontage: number; depth: number; maximumArea: number; route: RouteContext; parking: boolean }
 const clamp = (n: number, low: number, high: number) => Math.max(low, Math.min(high, n))
 const publicStreet = (road: Road) => !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && road.role !== 'farm' && (road.level ?? 0) === 0
 const sumArea = (regions: readonly PolygonRegion[]) => regions.reduce((sum, region) => sum + regionArea(region), 0)
+// Translate tiny survey rings before summing so global coordinates do not
+// cancel a positive sub-lattice fragment to zero during the entry check.
+const localRingArea = (ring: Point[]) => { const origin = ring[0]; return origin ? Math.abs(ring.reduce((sum, p, i) => { const q = ring[(i + 1) % ring.length]!; return sum + (p.x - origin.x) * (q.y - origin.y) - (q.x - origin.x) * (p.y - origin.y) }, 0)) / 2 : 0 }
 const middle = (a: Point, b: Point): Point => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
 const onBoundary = (p: Point, polygon: Point[]) => polygon.some((a, i) => distanceToSegment(p, a, polygon[(i + 1) % polygon.length]!) < .0005)
 const within = (p: Point, region: PolygonRegion) => (pointInPolygon(p, region.polygon) || onBoundary(p, region.polygon)) && !(region.holes ?? []).some(hole => pointInPolygon(p, hole))
@@ -28,6 +36,40 @@ function samples(polygon: Point[], spacing = 4): Point[] {
 function containsPolygon(region: PolygonRegion, polygon: Point[]) {
   return polygon.every(p => within(p, region)) && !polygon.some((a, i) => [region.polygon, ...region.holes ?? []].some(ring => ring.some((b, j) => segmentsCross(a, polygon[(i + 1) % polygon.length]!, b, ring[(j + 1) % ring.length]!)))) && !(region.holes ?? []).some(hole => hole.some(p => pointInPolygon(p, polygon)))
 }
+const turn = (a: Point, b: Point, p: Point) => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+const convex = (ring: Point[]) => ring.length >= 3 && ring.every((p, i) => turn(p, ring[(i + 1) % ring.length]!, ring[(i + 2) % ring.length]!) >= 0)
+const inConvex = (point: Point, ring: Point[]) => ring.every((a, i) => turn(a, ring[(i + 1) % ring.length]!, point) >= 0)
+function lineClip(ring: Point[], a: Point, b: Point, positive: boolean) {
+  const result: Point[] = []
+  for (let i = 0; i < ring.length; i++) {
+    const p = ring[i]!, q = ring[(i + 1) % ring.length]!, from = turn(a, b, p), to = turn(a, b, q), inside = positive ? from >= 0 : from <= 0, next = positive ? to >= 0 : to <= 0
+    if (inside) result.push(p)
+    if (inside !== next) { const t = from / (from - to); result.push({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t }) }
+  }
+  return result
+}
+/** A line crossing a simple, hole-free title exactly twice divides it into
+ * two connected titles, including a concave street frontage. More crossings
+ * could create disconnected acquisitions and must use the general kernel.
+ * Coordinates use that kernel's existing survey lattice. */
+function simpleLineSplit(cell: PolygonRegion, mask: PolygonRegion): [PolygonRegion[], PolygonRegion[]] | null {
+  if (cell.holes?.length) return null
+  const rounded = (p: Point) => ({ x: Math.round(p.x * 10000) / 10000, y: Math.round(p.y * 10000) / 10000 })
+  const ring = cell.polygon.map(rounded), boundary = mask.polygon.map(rounded)
+  if (!convex(boundary) || boundary.some((a, i) => i !== 1 && ring.some(p => turn(a, boundary[(i + 1) % boundary.length]!, p) < 0))) return null
+  const sides = ring.map(p => turn(boundary[1]!, boundary[2]!, p))
+  // Vertex contacts are deliberately left to the topology-aware kernel.
+  if (sides.some(side => side === 0) || sides.reduce((count, side, i) => count + Number((side > 0) !== (sides[(i + 1) % sides.length]! > 0)), 0) !== 2) return null
+  const region = (points: Point[]): PolygonRegion[] => {
+    const unique = points.filter((p, i) => { const previous = points[(i + points.length - 1) % points.length]!; return p.x !== previous.x || p.y !== previous.y })
+    const clean = unique.filter((p, i) => turn(unique[(i + unique.length - 1) % unique.length]!, p, unique[(i + 1) % unique.length]!) !== 0)
+    if (clean.length < 3 || polygonArea(clean) <= .01) return []
+    let first = 0
+    for (let i = 1; i < clean.length; i++) if (clean[i]!.x < clean[first]!.x || clean[i]!.x === clean[first]!.x && clean[i]!.y < clean[first]!.y) first = i
+    return [{ polygon: [...clean.slice(first), ...clean.slice(0, first)] }]
+  }
+  return [region(lineClip(ring, boundary[1]!, boundary[2]!, true)), region(lineClip(ring, boundary[1]!, boundary[2]!, false))]
+}
 function spatialIndex<T extends { bounds: Bounds }>(size = 80) {
   const bins = new Map<string, T[]>()
   const keys = function* (b: Bounds) { for (let x = Math.floor(b.minX / size); x <= Math.floor(b.maxX / size); x++) for (let y = Math.floor(b.minY / size); y <= Math.floor(b.maxY / size); y++) yield `${x}:${y}` }
@@ -42,21 +84,23 @@ function spatialIndex<T extends { bounds: Bounds }>(size = 80) {
  * an explicitly identified open-space remainder. Physical masks are immutable. */
 export function developContinuousCityLand(input: ContinuousCityLandInput) {
   const endYear = clamp(Math.round(input.config.targetYear ?? 2025), 1650, 2025)
-  const roadIndex = spatialIndex<Segment>(), obstacleIndex = spatialIndex<PolygonRegion & { bounds: Bounds }>()
+  const roadIndex = spatialIndex<Segment>(), obstacleIndex = spatialIndex<PolygonRegion & { bounds: Bounds }>(), streetSegments: Segment[] = []
   const addRoad = (road: Road) => {
     if ((road.level ?? 0) !== 0) return
     for (let i = 1; i < road.points.length; i++) {
       const a = road.points[i - 1]!, b = road.points[i]!
       if (distance(a, b) < .01) continue
       const polygon = corridorPolygon(a, b, road.width / 2 + .25)
-      roadIndex.add({ a, b, road, polygon, bounds: boundsOf(polygon) })
+      const segment = { a, b, road, polygon, bounds: boundsOf(polygon) }
+      roadIndex.add(segment)
+      if (publicStreet(road)) streetSegments.push(segment)
     }
   }
   for (const road of input.roads) addRoad(road)
   for (const region of [...input.terrain.areas.filter(area => area.kind === 'water'), ...input.reserves]) obstacleIndex.add({ ...region, bounds: boundsOf(region.polygon) })
   const parcels: Parcel[] = [], buildings: Building[] = [], accessRoads: Road[] = [], openSpaces: Area[] = [], unassignedGround: PolygonRegion[] = [], events: GrowthEvent[] = []
   const history = { parcels: [] as TimelineVersion<Parcel>[], buildings: [] as TimelineVersion<Building>[], buildingStates: [] as BuildingState[] }
-  const metrics = { blocks: input.blocks.length, buildableArea: 0, parcelArea: 0, accessArea: 0, openSpaceArea: 0, unassignedArea: 0, partitionAreaError: 0, laneAttempts: 0, accessRoads: 0, privateReplacements: 0, lots: 0, oversizedLots: 0, frontageFailures: 0, formationFailures: 0, openReasons: {} as Record<string, { count: number; area: number }> }
+  const metrics = { blocks: input.blocks.length, buildableArea: 0, parcelArea: 0, accessArea: 0, openSpaceArea: 0, unassignedArea: 0, partitionAreaError: 0, laneAttempts: 0, accessRoads: 0, privateReplacements: 0, lots: 0, oversizedLots: 0, frontageFailures: 0, formationFailures: 0, stock: {} as Record<Stock, { count: number; parcelArea: number; roofArea: number; parking: number }>, openReasons: {} as Record<string, { count: number; area: number }> }
   const obstacles = (region: PolygonRegion) => obstacleIndex.query(boundsOf(region.polygon))
   const frontages = (region: PolygonRegion): Frontage[] => {
     const bounds = boundsOf(region.polygon), near = roadIndex.query({ minX: bounds.minX - 18, minY: bounds.minY - 18, maxX: bounds.maxX + 18, maxY: bounds.maxY + 18 }).filter(segment => publicStreet(segment.road))
@@ -99,6 +143,55 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     for (let x = bounds.minX + 2; x < bounds.maxX; x += 4) for (let y = bounds.minY + 2; y < bounds.maxY; y += 4) if (pointInPolygon({ x, y }, polygon)) points.push({ x, y })
     return points.every(p => !input.terrain.waterAt(p) && Number.isFinite(input.terrain.slope(p)) && input.terrain.slope(p) <= maximumSlope)
   }
+  // Junctions are materialized by transport. Route only over those public,
+  // ground-level vertices; geometric proximity never joins two streets.
+  const network = (() => {
+    const indices = new Map<string, number>(), adjacency: { to: number; length: number; year: number }[][] = [], segmentNodes = new Map<Segment, [number, number]>()
+    const node = (p: Point) => { const key = `${p.x.toFixed(5)}:${p.y.toFixed(5)}`; let index = indices.get(key); if (index === undefined) { index = adjacency.length; indices.set(key, index); adjacency.push([]) } return index }
+    for (const segment of streetSegments) {
+      const a = node(segment.a), b = node(segment.b), length = distance(segment.a, segment.b), year = segment.road.builtYear ?? 1650
+      adjacency[a]!.push({ to: b, length, year }); adjacency[b]!.push({ to: a, length, year }); segmentNodes.set(segment, [a, b])
+    }
+    const values: RouteContext[][] = Array.from({ length: adjacency.length }, () => []), queue = new MinHeap<{ index: number; route: RouteContext }>(), contacts: { segment: Segment; point: Point; value: RouteContext }[] = []
+    const improve = (index: number, value: RouteContext) => {
+      const previous = values[index]!
+      if (previous.some(route => route.source === value.source && route.distance <= value.distance + 1e-7 && route.availableYear <= value.availableYear)) return
+      values[index] = previous.filter(route => route.source !== value.source || route.distance < value.distance - 1e-7 || route.availableYear < value.availableYear)
+      values[index]!.push(value); queue.push({ index, route: value }, value.distance)
+    }
+    const sites = [{ point: input.centerAccess?.point ?? input.demand.center, year: input.centerAccess?.builtYear ?? 1650, source: 'center' as const }, ...input.stations.map(station => ({ point: station.entrance ?? station.point, year: station.builtYear ?? 1900, source: 'station' as const }))]
+    for (const site of sites) {
+      if (input.terrain.waterAt(site.point)) continue
+      const p = site.point, nearby = roadIndex.query({ minX: p.x - 18, minY: p.y - 18, maxX: p.x + 18, maxY: p.y + 18 }).filter(segment => segmentNodes.has(segment)).map(segment => ({ segment, point: projectPoint(p, segment.a, segment.b) })).sort((a, b) => distance(p, a.point) - distance(p, b.point) || a.segment.road.id.localeCompare(b.segment.road.id))
+      const contact = nearby.find(contact => distance(p, contact.point) <= 18 && (distance(p, contact.point) < .01 || physical(corridorPolygon(p, contact.point, .65))))
+      if (!contact) continue
+      // At a real shared junction, an old approach and a new shortcut have the
+      // same physical attachment. Neither road's id may choose its opening.
+      for (const attachment of nearby.filter(candidate => distance(candidate.point, contact.point) < 1e-7)) {
+        const availableYear = Math.max(site.year, attachment.segment.road.builtYear ?? 1650), value = { distance: distance(p, attachment.point), availableYear, formAvailableYear: availableYear, source: site.source }
+        contacts.push({ ...attachment, value })
+        const nodes = segmentNodes.get(attachment.segment)!
+        improve(nodes[0], { ...value, distance: value.distance + distance(attachment.point, attachment.segment.a) }); improve(nodes[1], { ...value, distance: value.distance + distance(attachment.point, attachment.segment.b) })
+      }
+    }
+    while (queue.size) {
+      const item = queue.pop()!, { index, route: value } = item.value
+      if (!values[index]!.includes(value)) continue
+      for (const edge of adjacency[index]!) { const availableYear = Math.max(value.availableYear, edge.year); improve(edge.to, { ...value, distance: value.distance + edge.length, availableYear, formAvailableYear: availableYear }) }
+    }
+    return (front: Frontage): RouteContext => {
+      const p = projectPoint(middle(front.a, front.b), front.segment.a, front.segment.b), nodes = segmentNodes.get(front.segment), candidates: RouteContext[] = []
+      if (nodes) for (const [i, endpoint] of [front.segment.a, front.segment.b].entries()) for (const value of values[nodes[i]!]!) candidates.push({ ...value, distance: value.distance + distance(p, endpoint) })
+      for (const contact of contacts) if (contact.segment === front.segment) candidates.push({ ...contact.value, distance: contact.value.distance + distance(p, contact.point) })
+      const current = candidates.sort((a, b) => a.distance - b.distance || a.availableYear - b.availableYear)[0]
+      if (!current) return { distance: Infinity, availableYear: 2025, formAvailableYear: 2025, source: 'center' }
+      // An old qualifying main street survives a later shortcut. Its title can
+      // remain old, while additional station/downtown mass waits for that
+      // faster route and is introduced only with a later physical replacement.
+      const earliest = candidates.filter(route => route.distance < (route.source === 'station' ? 680 : 880)).sort((a, b) => a.availableYear - b.availableYear || a.distance - b.distance)[0]
+      return { ...current, availableYear: earliest?.availableYear ?? current.availableYear, formAvailableYear: current.availableYear }
+    }
+  })()
   const open = (region: PolygonRegion, id: string, reason: string) => {
     openSpaces.push({ polygon: region.polygon, ...(region.holes?.length ? { holes: region.holes } : {}), id: `cf-o-${id}`, kind: 'park', landUse: 'vacant' })
     const group = metrics.openReasons[reason] ?? { count: 0, area: 0 }; group.count++; group.area += regionArea(region); metrics.openReasons[reason] = group
@@ -116,7 +209,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     for (let i = 1; i < cuts.length; i++) if (cuts[i - 1]! < 0 && cuts[i]! > 0) return [cuts[i - 1]!, cuts[i]!] as const
     return null
   }
-  const sharedLane = (region: PolygonRegion, block: PolygonRegion, id: string): Road | null => {
+  const sharedLane = (region: PolygonRegion, block: PolygonRegion, id: string, allowThrough: boolean): Road | null => {
     const fronts = frontages(region)
     if (!fronts.length || regionArea(region) < 1800) return null
     const bounds = boundsOf(region.polygon)
@@ -128,12 +221,34 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     }
     if (maximum <= 27) return null
     const longest = fronts[0]!, length = distance(longest.a, longest.b), tangent = { x: (longest.b.x - longest.a.x) / length, y: (longest.b.y - longest.a.y) / length }
-    for (const direction of [tangent, { x: -tangent.y, y: tangent.x }]) for (const offset of [0, -10, 10]) {
+    const certify = (points: Point[], anchorYears: number[], ground: PolygonRegion): Road | null => {
+      const length = points.slice(1).reduce((sum, point, i) => sum + distance(points[i]!, point), 0)
+      // Transport owns the street pattern. Land can acquire a short rear
+      // access, but cannot bisect a coarse face with another long street.
+      if (length > 110) return null
+      metrics.laneAttempts++
+      const width = 4, strips = points.slice(1).map((b, i) => ({ polygon: corridorPolygon(points[i]!, b, width / 2 + .25) }))
+      if (points.length === 4 && points.slice(1).some((b, i) => roadIndex.query(boundsOf(strips[i]!.polygon)).some(segment => {
+        if (!publicStreet(segment.road)) return false
+        const contact = segmentsCross(points[i]!, b, segment.a, segment.b) || [segment.a, segment.b].some(p => distance(p, points[0]!) > 12 && distanceToSegment(p, points[i]!, b) < 1e-7)
+        return contact || i > 0 && distanceToSegment(b, segment.a, segment.b) < segment.road.width / 2 + width / 2 + .25
+      }))) return null
+      if (strips.some(strip => !physical(strip.polygon, .13))) return null
+      const publicGround = roadIndex.query(boundsOf(strips.flatMap(strip => strip.polygon))).map(segment => ({ polygon: segment.polygon }))
+      if (strips.some(strip => sumArea(subtractRegions(strip, [ground, ...publicGround])) > .02)) return null
+      const checkpoints = points.slice(1).flatMap((b, i) => { const a = points[i]!, count = Math.ceil(distance(a, b) / 4); return Array.from({ length: count + 1 }, (_, n) => ({ x: a.x + (b.x - a.x) * n / count, y: a.y + (b.y - a.y) * n / count })) })
+      if (checkpoints.some((q, i) => i > 0 && Math.abs(input.terrain.elevation(q) - input.terrain.elevation(checkpoints[i - 1]!)) > distance(q, checkpoints[i - 1]!) * .13 + .02)) return null
+      const builtYear = Math.max(...checkpoints.filter(q => input.demand.at(q) > 0).map(opening), ...anchorYears)
+      if (!Number.isFinite(builtYear) || builtYear > 2025) return null
+      return { id: `continuous-shared-${id}`, points, width, kind: 'local', role: 'access', builtYear, reason: '閉街区の奥へ接続する実幅の共有接道' }
+    }
+    for (const direction of allowThrough ? [tangent, { x: -tangent.y, y: tangent.x }] : []) for (const offset of [0, -10, 10]) {
       const p = { x: deepest.x - direction.y * offset, y: deepest.y + direction.x * offset }
       if (!pointInRegion(p, region)) continue
       const parallel = roadIndex.query({ minX: p.x - 35, minY: p.y - 35, maxX: p.x + 35, maxY: p.y + 35 }).some(segment => {
         const length = distance(segment.a, segment.b), alignment = Math.abs(((segment.b.x - segment.a.x) * direction.x + (segment.b.y - segment.a.y) * direction.y) / length)
-        return alignment > .96 && distanceToSegment(p, segment.a, segment.b) < 35
+        const attachment = projectPoint(p, segment.a, segment.b)
+        return publicStreet(segment.road) && alignment > .96 && distance(p, attachment) < 35 && physical(corridorPolygon(p, attachment, .65))
       })
       if (parallel) continue
       const ends = lineEnds(region, p, direction)
@@ -141,91 +256,198 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       const tips = ends.map(t => ({ x: p.x + direction.x * t, y: p.y + direction.y * t }))
       const anchors = tips.map(tip => roadIndex.query({ minX: tip.x - 20, minY: tip.y - 20, maxX: tip.x + 20, maxY: tip.y + 20 }).filter(segment => publicStreet(segment.road) && distanceToSegment(tip, segment.a, segment.b) <= segment.road.width / 2 + 1).map(segment => ({ segment, point: projectPoint(tip, segment.a, segment.b) })).sort((a, b) => distance(tip, a.point) - distance(tip, b.point))[0])
       if (!anchors[0] || !anchors[1] || distance(anchors[0].point, anchors[1].point) < 30) continue
-      metrics.laneAttempts++
-      const points = [anchors[0].point, p, anchors[1].point], width = 4
-      const strips = points.slice(1).map((b, i) => ({ polygon: corridorPolygon(points[i]!, b, width / 2 + .25) }))
-      if (strips.some(strip => !physical(strip.polygon, .13))) continue
-      const publicGround = roadIndex.query(boundsOf(strips.flatMap(strip => strip.polygon))).map(segment => ({ polygon: segment.polygon }))
-      if (strips.some(strip => sumArea(subtractRegions(strip, [block, ...publicGround])) > .02)) continue
-      const checkpoints = points.slice(1).flatMap((b, i) => {
-        const a = points[i]!, count = Math.ceil(distance(a, b) / 4)
-        return Array.from({ length: count + 1 }, (_, n) => ({ x: a.x + (b.x - a.x) * n / count, y: a.y + (b.y - a.y) * n / count }))
-      })
-      if (checkpoints.some((q, i) => i > 0 && Math.abs(input.terrain.elevation(q) - input.terrain.elevation(checkpoints[i - 1]!)) > distance(q, checkpoints[i - 1]!) * .13 + .02)) continue
-      const builtYear = Math.max(...checkpoints.filter(q => input.demand.at(q) > 0).map(opening), opening(p), anchors[0].segment.road.builtYear ?? 1650, anchors[1].segment.road.builtYear ?? 1650)
-      if (!Number.isFinite(builtYear) || builtYear > 2025) continue
-      return { id: `continuous-shared-${id}`, points, width, kind: 'local', role: 'access', builtYear, reason: '閉街区の奥へ接続する実幅の共有接道' }
+      const lane = certify([anchors[0].point, p, anchors[1].point], anchors.map(anchor => anchor!.segment.road.builtYear ?? 1650), block)
+      if (lane) return lane
+    }
+    // A deep rear acquisition need not have a second public outlet. Survey a
+    // finite shared access with a real12m-wide T turning head instead of giving
+    // its entire interior to one frontage house as a fictitious giant garden.
+    for (const front of fronts.slice().sort((a, b) => distance(deepest, middle(a.a, a.b)) - distance(deepest, middle(b.a, b.b))).slice(0, 8)) {
+      const anchor = projectPoint(middle(front.a, front.b), front.segment.a, front.segment.b), run = distance(anchor, deepest)
+      if (run < 35) continue
+      const u = { x: (deepest.x - anchor.x) / run, y: (deepest.y - anchor.y) / run }, end = { x: anchor.x + u.x * Math.min(95, run), y: anchor.y + u.y * Math.min(95, run) }, p = middle(anchor, end)
+      if (!pointInRegion(end, region)) continue
+      if (roadIndex.query({ minX: p.x - 35, minY: p.y - 35, maxX: p.x + 35, maxY: p.y + 35 }).some(segment => { const n = distance(segment.a, segment.b), alignment = Math.abs(((segment.b.x - segment.a.x) * u.x + (segment.b.y - segment.a.y) * u.y) / n), q = projectPoint(p, segment.a, segment.b); return publicStreet(segment.road) && alignment > .96 && distance(p, q) < 35 && physical(corridorPolygon(p, q, .65)) })) continue
+      const lane = certify([anchor, end, { x: end.x - u.y * 4, y: end.y + u.x * 4 }, { x: end.x + u.y * 4, y: end.y - u.x * 4 }], [front.segment.road.builtYear ?? 1650], region)
+      if (lane) return lane
     }
     return null
   }
-  const split = (cell: Cell, seed: string, maximumArea: number): Cell[] | null => {
+  const programmes = (region: PolygonRegion): FrontageProgramme[] => {
+    const fronts = frontages(region), intensity = clamp(input.demand.at(interior(region)), 0, 1)
+    const ordinary: Stock = intensity >= .72 ? 'compact' : intensity < .38 ? 'garden' : 'ordinary'
+    const result: FrontageProgramme[] = fronts.map(front => ({ front, stock: ordinary, from: 0, to: front.length, route: network(front) }))
+    const core = (programme: FrontageProgramme) => programme.route.distance < (programme.route.source === 'station' ? 680 : 880)
+    const wide = result.filter(programme => (programme.front.segment.road.width >= 8 || programme.front.segment.road.role === 'collector' || programme.route.source === 'station' && programme.route.distance < 300 && programme.front.segment.road.width >= 6) && core(programme) && intensity >= .58).sort((a, b) => a.route.distance - b.route.distance || b.front.segment.road.width - a.front.segment.road.width)[0]
+    const local = result.filter(programme => programme.front.segment.road.id !== wide?.front.segment.road.id && programme.front.segment.road.width >= 5 && result.filter(other => other.front.segment.road.id === programme.front.segment.road.id).reduce((sum, other) => sum + other.front.length, 0) >= 25 && core(programme) && intensity >= .68).sort((a, b) => a.front.length - b.front.length || a.route.distance - b.route.distance)[0]
+    // A mixed-use corner or a small apartment acquisition is a contiguous
+    // frontage programme, never a fresh apartment/commercial coin per title.
+    for (const [programme, stock] of [[wide, 'mixed'], [local, 'walkup']] as const) {
+      if (!programme || regionArea(region) < 900) continue
+      const front = programme.front, first = network({ ...front, b: front.a, length: 0 }), last = network({ ...front, a: front.b, length: 0 })
+      const length = Math.min(front.length, stock === 'mixed' ? programme.route.distance < 260 ? 70 : 38 : 42)
+      result.push({ ...programme, stock, from: first.distance <= last.distance ? 0 : front.length - length, to: first.distance <= last.distance ? length : front.length })
+      for (const neighbour of result.slice(0, fronts.length)) if (neighbour !== programme && neighbour.front.segment.road.id === front.segment.road.id && neighbour.route.distance <= programme.route.distance + (stock === 'mixed' ? 38 : 42) && distance(middle(neighbour.front.a, neighbour.front.b), middle(front.a, front.b)) <= 42) result.push({ ...neighbour, stock })
+    }
+    return result
+  }
+  const titleProgramme = (cell: Cell, original: PolygonRegion, plans: FrontageProgramme[]): TitleProgramme => {
+    const front = cell.frontages[0]!, p = middle(front.a, front.b), intensity = clamp(input.demand.at(interior(cell)), 0, 1)
+    const matches = plans.filter(plan => {
+      if (plan.front.segment.road.id !== front.segment.road.id || distanceToSegment(p, plan.front.a, plan.front.b) > .02) return false
+      const u = { x: (plan.front.b.x - plan.front.a.x) / plan.front.length, y: (plan.front.b.y - plan.front.a.y) / plan.front.length }, along = (p.x - plan.front.a.x) * u.x + (p.y - plan.front.a.y) * u.y
+      return along >= plan.from - .01 && along <= plan.to + .01
+    })
+    const plan = matches.at(-1), stock = plan?.stock ?? (intensity >= .72 ? 'compact' : intensity < .38 ? 'garden' : 'ordinary')
+    const totalFrontage = [...new Set(plans.map(plan => plan.front))].reduce((sum, front) => sum + front.length, 0)
+    const meanDepth = regionArea(original) / Math.max(1, totalFrontage), depth = clamp(meanDepth * 1.4, stock === 'compact' ? 16 : 19, stock === 'garden' || stock === 'mixed' || stock === 'walkup' ? 29 : 24)
+    const corner = cell.frontages.some(other => other.segment.road.id !== front.segment.road.id && other.length > 4)
+    const frontage = (stock === 'compact' ? 6.6 + (1 - intensity) * 3 : stock === 'ordinary' ? 9 + (.72 - intensity) * 8 : stock === 'garden' ? 12 + (.38 - intensity) * 12 : stock === 'walkup' ? 19 : 21) * (corner && stock !== 'mixed' && stock !== 'walkup' ? 1.18 : 1)
+    const route = plan?.route ?? { distance: Infinity, availableYear: 2025, formAvailableYear: 2025, source: 'center' as const }
+    return { stock, frontage, depth, maximumArea: frontage * depth * 1.22, route, parking: stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350 }
+  }
+  const split = (cell: Cell, programme: TitleProgramme): Cell[] | null => {
     const front = cell.frontages[0]!, length = front.length, u = { x: (front.b.x - front.a.x) / length, y: (front.b.y - front.a.y) / length }, v = { x: -u.y, y: u.x }
-    const extents = [u, v].map(axis => { const values = cell.polygon.map(p => p.x * axis.x + p.y * axis.y); return { axis, low: Math.min(...values), high: Math.max(...values) } }).sort((a, b) => b.high - b.low - (a.high - a.low))
-    const random = seededRandom(seed), count = Math.max(2, Math.round(regionArea(cell) / (maximumArea * .85))), balance = clamp(Math.floor(count / 2) / count + (random() - .5) * .035, .32, .62)
+    const extents = [u, v].map((axis, i) => { const values = cell.polygon.map(p => p.x * axis.x + p.y * axis.y); return { axis, low: Math.min(...values), high: Math.max(...values), target: i ? programme.depth : programme.frontage } }).sort((a, b) => (b.high - b.low) / b.target - (a.high - a.low) / a.target)
     const b = boundsOf(cell.polygon), reach = Math.hypot(b.maxX - b.minX, b.maxY - b.minY) * 3 + 20
-    for (const { axis, low, high } of extents) for (const fraction of [balance, .5, .38, .62]) {
+    for (const { axis, low, high, target } of extents) {
+      const count = Math.max(2, Math.round((high - low) / target)), acquisition = clamp(target * Math.max(1, Math.floor(count * .42)) / (high - low), .24, .68)
+      for (const fraction of [acquisition, .5, .38, .62]) {
       if (high - low < 11) continue
       const cut = low + (high - low) * fraction, normal = { x: -axis.y, y: axis.x }
       const point = (along: number, across: number): Point => ({ x: axis.x * along + normal.x * across, y: axis.y * along + normal.y * across })
       const across = cell.polygon.map(p => p.x * normal.x + p.y * normal.y), left = Math.min(...across) - reach, right = Math.max(...across) + reach
       const mask = { polygon: [point(low - reach, left), point(cut, left), point(cut, right), point(low - reach, right)] }
-      const first = intersectRegions(cell, mask), second = subtractRegions(cell, [mask]), parts = [...first, ...second]
+      const halves = simpleLineSplit(cell, mask), first = halves?.[0] ?? intersectRegions(cell, mask), second = halves?.[1] ?? subtractRegions(cell, [mask]), parts = [...first, ...second]
       if (!first.length || !second.length || parts.some(part => regionArea(part) < 48)) continue
       const children = parts.map(part => ({ ...part, frontages: frontages(part) }))
-      if (children.some(part => part.frontages.reduce((sum, frontage) => sum + frontage.length, 0) < 3)) continue
+      // A strip with only3–4m on the public street cannot fit the minimum
+      // house plus side setbacks. Keep it in the neighbouring acquisition.
+      if (children.some(part => !part.frontages.some(frontage => {
+        const u = { x: (frontage.b.x - frontage.a.x) / frontage.length, y: (frontage.b.y - frontage.a.y) / frontage.length }, projected = part.polygon.map(p => p.x * u.x + p.y * u.y)
+        const contact = part.frontages.filter(other => other.segment.road.id === frontage.segment.road.id && Math.abs(((other.b.x - other.a.x) * u.x + (other.b.y - other.a.y) * u.y) / other.length) > .97).reduce((sum, other) => sum + other.length, 0)
+        return contact >= 5.25 && Math.max(...projected) - Math.min(...projected) >= 5.25
+      }))) continue
       return children
+      }
     }
     return null
   }
-  const buildingPad = (cell: Cell, front: Frontage, major: boolean) => {
+  const buildingPad = (cell: Cell, front: Frontage, programme: TitleProgramme) => {
     if (cell.holes?.length) return null
-    const origin = middle(front.a, front.b), tangent = { x: (front.b.x - front.a.x) / front.length, y: (front.b.y - front.a.y) / front.length }
+    const initialTangent = { x: (front.b.x - front.a.x) / front.length, y: (front.b.y - front.a.y) / front.length }
+    const contacts = cell.frontages.filter(other => other.segment.road.id === front.segment.road.id && ((other.b.x - other.a.x) * initialTangent.x + (other.b.y - other.a.y) * initialTangent.y) / other.length > .94)
+    const total = contacts.reduce((sum, contact) => sum + contact.length, 0), preferred = contacts.reduce((p, contact) => ({ x: p.x + (contact.a.x + contact.b.x) / 2 * contact.length / total, y: p.y + (contact.a.y + contact.b.y) / 2 * contact.length / total }), { x: 0, y: 0 })
+    // One curved frontage can contain dozens of survey segments. Place the
+    // entrance at its central actual boundary contact, not at whichever tiny
+    // segment happens to sort first near a parcel corner.
+    front = contacts.sort((a, b) => distanceToSegment(preferred, a.a, a.b) - distanceToSegment(preferred, b.a, b.b))[0]!
+    const origin = projectPoint(preferred, front.a, front.b), tangent = { x: (front.b.x - front.a.x) / front.length, y: (front.b.y - front.a.y) / front.length }
     let normal = { x: -tangent.y, y: tangent.x }
     if (!pointInRegion({ x: origin.x + normal.x, y: origin.y + normal.y }, cell)) normal = { x: -normal.x, y: -normal.y }
     const world = (u: number, v: number): Point => ({ x: origin.x + tangent.x * u + normal.x * v, y: origin.y + tangent.y * u + normal.y * v })
     const us = cell.polygon.map(p => (p.x - origin.x) * tangent.x + (p.y - origin.y) * tangent.y), vs = cell.polygon.map(p => (p.x - origin.x) * normal.x + (p.y - origin.y) * normal.y)
-    const fullWidth = Math.min(major ? 24 : 12, Math.max(...us) - Math.min(...us) - 1.25), fullDepth = Math.min(major ? 18 : 12, Math.max(...vs) - 3)
-    for (const scale of [1, .86, .72, .6]) for (const shift of [0, -1.5, 1.5]) {
-      const width = fullWidth * scale, depth = fullDepth * scale, frontGap = major ? 1.3 : 1.6
+    const stock = programme.stock, merged = stock === 'mixed' || stock === 'walkup', availableWidth = Math.max(...us) - Math.min(...us), sideParking = programme.parking && !merged && availableWidth >= 13.5
+    const desiredWidth = stock === 'compact' ? clamp(programme.frontage * 1.1, 7, 9) : stock === 'ordinary' ? clamp(programme.frontage - .9, 8, 10.8) : stock === 'garden' ? 10.5 : stock === 'walkup' ? 20 : 26
+    const frontParking = programme.parking && !sideParking && Math.max(...vs) >= 15
+    const frontGap = stock === 'mixed' ? 1.3 : frontParking ? 5.7 : stock === 'walkup' ? 2.6 : 1.8
+    // The programme reserves titled ground for its garden, service court or
+    // surveyed parking bay. Roof depth follows that acquisition and usable
+    // width, rather than every road getting the same12m-deep building band.
+    const roofBudget = regionArea(cell) * (stock === 'compact' ? .56 : stock === 'ordinary' ? .47 : stock === 'garden' ? .36 : stock === 'walkup' ? .48 : .58)
+    const desiredDepth = merged ? stock === 'walkup' ? 14 : 15.5 : clamp(roofBudget / Math.min(desiredWidth, availableWidth - (sideParking ? 4.2 : 1.3)), stock === 'compact' ? 8.5 : 9.5, stock === 'garden' ? 14 : 13)
+    const fullWidth = Math.min(desiredWidth, availableWidth - (sideParking ? 4.2 : merged ? 2.4 : 1.3)), fullDepth = Math.min(desiredDepth, Math.max(...vs) - frontGap - 1.1)
+    const align = sideParking ? -1.5 : 0
+    let acquiredAccess: { attachment: Point; access: Point[]; covered: boolean } | undefined
+    for (const scale of [1, .9, .8, .7, .6]) for (const shift of [align, align - 1, align + 1]) {
+      const width = fullWidth * scale, depth = fullDepth * scale
       if (width < 3.8 || depth < 5 || width * depth < 30) continue
       const polygon = [world(shift - width / 2, frontGap), world(shift + width / 2, frontGap), world(shift + width / 2, frontGap + depth), world(shift - width / 2, frontGap + depth)].map(point => ({ x: Math.round(point.x * 10000) / 10000, y: Math.round(point.y * 10000) / 10000 }))
       if (!containsPolygon(cell, polygon) || !physical(polygon)) continue
       const elevations = [...polygon, middle(polygon[0]!, polygon[2]!)].map(input.terrain.elevation)
       if (Math.max(...elevations) - Math.min(...elevations) > 2.4) continue
-      const attachment = projectPoint(origin, front.segment.a, front.segment.b), access = corridorPolygon(attachment, origin, 1.1)
-      if (!physical(access) || polygonOverlapsRegion(access, { polygon }) || sumArea(subtractRegions({ polygon: access }, [cell, { polygon: front.segment.polygon }])) > .01) continue
-      return { polygon, entrance: origin, attachment }
+      if (!acquiredAccess) {
+        const attachment = projectPoint(origin, front.segment.a, front.segment.b), access = corridorPolygon(attachment, origin, 1.1)
+        // A straight frontage is the supporting edge of a convex title.
+        // Certify each half of its short entrance against the title and one
+        // actual surveyed ROW. This is a sufficient exact coverage proof;
+        // curved/concave cases retain the general union/difference check.
+        const titleConvex = convex(cell.polygon), road = front.segment.polygon
+        const inside = titleConvex ? lineClip(access, front.a, front.b, true) : [], outside = titleConvex ? lineClip(access, front.a, front.b, false) : []
+        const proved = titleConvex && convex(road) && inside.length >= 3 && outside.length >= 3 && inside.every(p => inConvex(p, cell.polygon)) && outside.every(p => inConvex(p, road))
+        const publicGround = proved ? [] : roadIndex.query(boundsOf(access)).filter(segment => segment.road.id === front.segment.road.id).map(segment => ({ polygon: segment.polygon }))
+        acquiredAccess = { attachment, access, covered: physical(access) && (proved || sumArea(subtractRegions({ polygon: access }, [cell, ...publicGround])) <= .01) }
+      }
+      const { attachment, access, covered } = acquiredAccess
+      if (!covered || polygonOverlapsRegion(access, { polygon })) continue
+      const parking = [world(sideParking ? Math.max(...us) - 3.1 : -1.3, .6), world(sideParking ? Math.max(...us) - .5 : 1.3, .6), world(sideParking ? Math.max(...us) - .5 : 1.3, 5.6), world(sideParking ? Math.max(...us) - 3.1 : -1.3, 5.6)]
+      const hasParking = programme.parking && containsPolygon(cell, parking) && physical(parking) && !polygonOverlapsRegion(parking, { polygon })
+      return { polygon, entrance: origin, attachment, parking: hasParking, front }
     }
     return null
   }
+  const demandMasks = input.demand.regions.map(region => ({ region, bounds: boundsOf(region.polygon) }))
   let serial = 0
   for (const block of input.blocks) {
+    const entryArea = localRingArea(block.polygon) - (block.holes ?? []).reduce((sum, hole) => sum + localRingArea(hole), 0)
+    if (entryArea >= 0 && entryArea <= .01) {
+      // The fixed0.1mm crop kernel may collapse a positive planning sliver.
+      // Keep its exact rings as unassigned ground instead of clipping it away
+      // or attempting to manufacture a title from non-buildable dimensions.
+      unassignedGround.push({ polygon: block.polygon, ...(block.holes?.length ? { holes: block.holes } : {}) })
+      metrics.buildableArea += entryArea; metrics.unassignedArea += entryArea
+      continue
+    }
     const cropped = intersectRegions(block, { polygon: rectangle(0, 0, input.width, input.height) })
     const bounds = boundsOf(block.polygon), roads = roadIndex.query(bounds).map(segment => ({ polygon: segment.polygon }))
     let regions = cropped.flatMap(part => subtractRegions(part, [...obstacles(part), ...roads]))
     const initialArea = sumArea(regions); metrics.buildableArea += initialArea
-    let blockAccessArea = 0
-    for (let laneNumber = 0; laneNumber < 6; laneNumber++) {
+    const beforeLots = metrics.parcelArea, beforeOpen = metrics.openSpaceArea, beforeUnassigned = metrics.unassignedArea
+    const inDemand: PolygonRegion[] = []
+    for (const part of regions) {
+      const bounds = boundsOf(part.polygon), masks = demandMasks.filter(mask => overlaps(bounds, mask.bounds)).map(mask => mask.region)
+      const outside = masks.length ? subtractRegions(part, masks) : [part]
+      // Closed faces may straddle the demand edge. Separate their ground
+      // before any representative-point decision; demand overlaps are one cut,
+      // not duplicate titles or artificial streets between support polygons.
+      if (!outside.length) inDemand.push(part)
+      else {
+        if (masks.length && !(outside.length === 1 && outside[0] === part)) inDemand.push(...subtractRegions(part, outside))
+        for (const remainder of outside) {
+          unassignedGround.push({ polygon: remainder.polygon, ...(remainder.holes?.length ? { holes: remainder.holes } : {}) })
+          metrics.unassignedArea += regionArea(remainder)
+        }
+      }
+    }
+    regions = inDemand
+    let blockAccessArea = 0, throughAccesses = 0
+    // Missing neighbourhood streets belong to transport, not a second street
+    // generator hidden in cadastre. Only a few rear acquisitions are allowed.
+    const laneBudget = 4
+    for (let laneNumber = 0; laneNumber < laneBudget; laneNumber++) {
       let acquired = false
       for (const region of regions.slice().sort((a, b) => regionArea(b) - regionArea(a))) {
         if (input.demand.at(interior(region)) <= 0) continue
-        const lane = sharedLane(region, block, `${block.id}-${laneNumber}`)
+        const lane = sharedLane(region, region, `${block.id}-${laneNumber}`, throughAccesses === 0)
         if (!lane) continue
         const strips = lane.points.slice(1).map((b, i) => ({ polygon: corridorPolygon(lane.points[i]!, b, lane.width / 2 + .25) }))
         const next = regions.flatMap(part => subtractRegions(part, strips)), acquiredArea = sumArea(regions) - sumArea(next)
         if (acquiredArea < 1) continue
-        accessRoads.push(lane); addRoad(lane); metrics.accessRoads++; blockAccessArea += acquiredArea; regions = next; acquired = true
+        accessRoads.push(lane); addRoad(lane); metrics.accessRoads++; throughAccesses += Number(lane.points.length === 3); blockAccessArea += acquiredArea; regions = next; acquired = true
         if ((lane.builtYear ?? 1650) <= endYear) events.push({ id: `continuous-road-${lane.id}`, year: lane.builtYear ?? 1650, kind: 'road', entityId: lane.id, reason: '閉街区内の共有接道を取得' })
         break
       }
       if (!acquired) break
     }
     metrics.accessArea += blockAccessArea
-    const beforeLots = metrics.parcelArea, beforeOpen = metrics.openSpaceArea, beforeUnassigned = metrics.unassignedArea
-    const pending: { cell: Cell; depth: number }[] = regions.map(region => ({ cell: { ...region, frontages: frontages(region) }, depth: 0 }))
+    const pending: { cell: Cell; original: PolygonRegion; plans: FrontageProgramme[]; depth: number }[] = regions.map(region => ({ cell: { ...region, frontages: frontages(region) }, original: region, plans: programmes(region), depth: 0 }))
+    // A network-first coarse face can contain many real local trees while
+    // remaining a single topological face. Budget its private cuts by ground
+    // area/minimum48m² title, not the former tiny closed-street-block count.
+    const processingBudget = clamp(Math.ceil(initialArea / 48) * 3, 4096, 80_000)
     let processed = 0
     while (pending.length) {
-      const { cell, depth } = pending.pop()!, cellSerial = serial++, id = `${block.id}-${cellSerial}`, p = interior(cell), intensity = clamp(input.demand.at(p), 0, 1), area = regionArea(cell)
+      const { cell, original, plans, depth } = pending.pop()!, cellSerial = serial++, p = interior(cell), intensity = clamp(input.demand.at(p), 0, 1), area = regionArea(cell)
       if (!intensity) {
         // Cover owns this ground's woodland/farm classification. Never publish
         // the working Cell (frontages retain complete road/segment objects).
@@ -234,21 +456,47 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         continue
       }
       if (!cell.frontages.length) { metrics.frontageFailures++; open(cell, String(cellSerial), '実接道を確保できない街区内地'); continue }
-      const front = cell.frontages[0]!, major = front.segment.road.width >= 8 && intensity >= .58
-      const maximumArea = major ? intensity > .8 ? 440 : 360 : intensity >= .72 ? 170 : 280
-      if ((area > maximumArea || cell.holes?.length) && depth < 16 && processed++ < 4096) {
-        const children = split(cell, `${input.config.seed}:${id}:cut`, maximumArea)
-        if (children) { for (const child of children) pending.push({ cell: child, depth: depth + 1 }); continue }
+      const front = cell.frontages[0]!, programme = titleProgramme(cell, original, plans), major = programme.stock === 'mixed', maximumArea = programme.maximumArea
+      if ((area > maximumArea || cell.holes?.length) && depth < 20 && processed++ < processingBudget) {
+        const children = split(cell, programme)
+        if (children) { for (const child of children) pending.push({ cell: child, original, plans, depth: depth + 1 }); continue }
       }
-      const pad = buildingPad(cell, front, major)
-      const createdYear = Math.max(opening(p), ...(pad?.polygon ?? []).map(opening), front.segment.road.builtYear ?? 1650)
+      let pad: ReturnType<typeof buildingPad> = null
+      const tried = new Set<string>()
+      for (const contact of cell.frontages) {
+        const angle = Math.atan2(contact.b.y - contact.a.y, contact.b.x - contact.a.x), key = `${contact.segment.road.id}:${Math.round(angle * 12 / Math.PI)}`
+        if (tried.has(key)) continue
+        tried.add(key); pad = buildingPad(cell, contact, programme)
+        if (pad || tried.size >= 8) break
+      }
+      const merged = major || programme.stock === 'walkup'
+      const createdYear = Math.max(opening(p), ...(pad?.polygon ?? []).map(opening), (pad?.front ?? front).segment.road.builtYear ?? 1650, merged ? programme.route.availableYear : 1650)
       if (!pad || !Number.isFinite(createdYear) || createdYear > 2025) { metrics.formationFailures++; open(cell, String(cellSerial), pad ? '将来形成する接道地' : '形状・地形上の建築不適地'); continue }
-      const parcel: Parcel = { id: `cf-p-${cellSerial}`, polygon: cell.polygon, entrance: pad.entrance, access: [pad.attachment, pad.entrance], roadId: front.segment.road.id, createdYear, developedYear: createdYear, use: major ? 'commercial' : 'residential' }
+      if (area > maximumArea * 2 && polygonArea(pad.polygon) / area < .2) {
+        const origin = pad.entrance, served = pad.front, u = { x: (served.b.x - served.a.x) / served.length, y: (served.b.y - served.a.y) / served.length }
+        let n = { x: -u.y, y: u.x }
+        if (!pointInRegion({ x: origin.x + n.x, y: origin.y + n.y }, cell)) n = { x: -n.x, y: -n.y }
+        const reach = Math.hypot(boundsOf(cell.polygon).maxX - boundsOf(cell.polygon).minX, boundsOf(cell.polygon).maxY - boundsOf(cell.polygon).minY) * 2 + 10
+        const servedDepth = Math.max(programme.depth, ...pad.polygon.map(q => (q.x - origin.x) * n.x + (q.y - origin.y) * n.y + 1.1))
+        const world = (x: number, y: number) => ({ x: origin.x + u.x * x + n.x * y, y: origin.y + u.y * x + n.y * y })
+        const band = { polygon: [world(-reach, -reach), world(reach, -reach), world(reach, servedDepth), world(-reach, servedDepth)] }, fronts = intersectRegions(cell, band), rear = subtractRegions(cell, [band])
+        // Unserved land cannot be disguised as a many-thousand-square-metre
+        // private garden. Retain the physically served acquisition; report the
+        // remaining access deficit honestly until a street can be surveyed.
+        if (sumArea(rear) > .5 && fronts.some(part => containsPolygon(part, pad.polygon))) {
+          rear.forEach((part, i) => open(part, `${cellSerial}-rear-${i}`, '共有接道の延長を確保できない街区内地'))
+          for (const part of fronts) pending.push({ cell: { ...part, frontages: frontages(part) }, original, plans, depth: depth + 1 })
+          continue
+        }
+        metrics.formationFailures++; open(cell, String(cellSerial), '取得目的に対して過大な接道不成立地'); continue
+      }
+      const parcel: Parcel = { id: `cf-p-${cellSerial}`, polygon: cell.polygon, entrance: pad.entrance, access: [pad.attachment, pad.entrance], roadId: pad.front.segment.road.id, createdYear, developedYear: createdYear, use: major ? 'commercial' : 'residential' }
       metrics.parcelArea += area; metrics.lots++; if (area > maximumArea) metrics.oversizedLots++
+      const stockMetrics = metrics.stock[programme.stock] ?? { count: 0, parcelArea: 0, roofArea: 0, parking: 0 }; stockMetrics.count++; stockMetrics.parcelArea += area; stockMetrics.roofArea += polygonArea(pad.polygon); stockMetrics.parking += Number(pad.parking); metrics.stock[programme.stock] = stockMetrics
       const versions: TimelineVersion<Building>[] = []
       for (let year = createdYear, frame = 0; year <= 2025 && frame < 10; frame++) {
-        const random = seededRandom(`${input.config.seed}:${parcel.id}:${year}:frame`), height = year < 1955 ? 1 + Number(random() < .45) : major ? 3 + Math.floor(random() * (intensity > .8 ? 4 : 2)) : intensity >= .75 ? 2 + Math.floor(random() * 3) : 1 + Number(random() < .85)
-        const building: Building = { id: `cf-b-${cellSerial}-${year}-${frame}`, polygon: pad.polygon.map(point => ({ ...point })), kind: major ? 'commercial' : 'residential', height, parcelId: parcel.id, builtYear: year, occupancy: 'occupied', occupiedHouseholds: major ? 0 : Math.max(1, Math.floor(polygonArea(pad.polygon) * height / 70)) }
+        const random = seededRandom(`${input.config.seed}:${parcel.id}:${year}:frame`), height = year < 1955 || year < programme.route.formAvailableYear ? 1 + Number(random() < .45) : major ? 3 + Math.floor(random() * (programme.route.distance < 350 ? 4 : 2)) : programme.stock === 'walkup' ? 3 + Math.floor(random() * 2) : programme.stock === 'compact' && programme.route.distance < 650 && intensity >= .85 ? 3 : 1 + Number(random() < .85)
+        const building: Building = { id: `cf-b-${cellSerial}-${year}-${frame}`, polygon: pad.polygon.map(point => ({ ...point })), kind: major ? 'commercial' : 'residential', height, parcelId: parcel.id, builtYear: year, occupancy: 'occupied', occupiedHouseholds: major ? 0 : programme.stock === 'walkup' ? Math.max(2, Math.floor(polygonArea(pad.polygon) * height / 60)) : 1 }
         const next = year + buildingServiceYears(input.config.seed, building)
         versions.push({ from: year, ...(next <= 2025 ? { to: next } : {}), value: building }); year = next
       }

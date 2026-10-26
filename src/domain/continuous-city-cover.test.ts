@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
-import { buildContinuousCityCover, continuousRoadGround, dissolveContinuousCover, partitionContinuousCover } from './continuous-city-cover'
+import { buildContinuousCityCover, continuousRoadGround, dissolveContinuousCover, partitionContinuousCover, subtractContinuousCover } from './continuous-city-cover'
 import type { ContinuousCityCoverInput } from './continuous-city-cover'
 import type { ContinuousCityDemand } from './continuous-city-types'
 import type { Area, CityConfig, Parcel, Road } from './types'
 import { distanceToSegment, intersectRegions, pointInRegion, rectangle, regionArea, subtractRegions } from './geometry'
 import type { PolygonRegion } from './geometry'
+import { regionQuery } from './region-query'
 
 const config: CityConfig = { name: '連続市街地', seed: 'continuous-cover', type: 'post', terrain: 'plain', density: 100, forest: 0, railway: false, stations: 0, arterial: true, facilities: [], targetYear: 2025 }
 const demand = (regions: PolygonRegion[] = []): ContinuousCityDemand => ({ center: { x: 400, y: 300 }, regions, at: p => regions.some(r => pointInRegion(p, r)) ? 1 : 0, costAt: () => 0, openingAt: () => 1955, metrics: { cellSize: 100, reachableLandArea: 480000, targetUrbanArea: 0, selectedUrbanArea: 0 } })
@@ -72,6 +73,18 @@ describe('continuous city residual cover', () => {
     const small = run({ demand: demand([pocket]), urbanBlocks: [pocket], roads: [road] })
     expect(small.some(a => a.kind === 'park' && a.landUse === undefined && regionArea(a) <= 1600)).toBe(true)
     expect(small.filter(a => a.kind !== 'water').every(a => a.name === undefined)).toBe(true)
+  })
+  it('classifies deep interior remnants and enclosed demand holes without changing the filled partition', () => {
+    const support = { polygon: rectangle(40, 40, 720, 520), holes: [rectangle(300, 200, 120, 100)] }
+    const titles = [parcel, { ...parcel, id: 'outside-title', polygon: rectangle(5, 120, 20, 30) }]
+    const result = run({ demand: demand([support]), parcels: titles }), urban = result.filter(a => a.landUse === 'vacant')
+    expect(sum(urban)).toBeCloseTo(720 * 520 - 120 * 100 - 70 * 80, 2)
+    expect(urban.some(a => pointInRegion({ x: 700, y: 500 }, a))).toBe(true)
+    expect(urban.some(a => pointInRegion({ x: 350, y: 250 }, a))).toBe(false)
+    expect(urban.some(a => pointInRegion({ x: 20, y: 400 }, a))).toBe(false)
+    expect(result.some(a => a.landUse === 'meadow' && pointInRegion({ x: 350, y: 250 }, a))).toBe(true)
+    expect(sum(result)).toBeCloseTo(480000 - 70 * 80 - 20 * 30, 2)
+    for (const a of result) for (const title of titles) expect(overlap(a, title)).toBeLessThan(.001)
   })
   it('is deterministic, leaves all inputs intact, and bounds whole-crop terrain sampling', () => {
     const input = { roads: [{ id: 'road', kind: 'local' as const, width: 6, points: [{ x: 0, y: 100 }, { x: 800, y: 100 }] }], parcels: [parcel] }, before = JSON.stringify(input)
@@ -151,5 +164,33 @@ describe('continuous city residual cover', () => {
     expect(united.reduce((n, p) => n + p.polygon.length + (p.holes ?? []).reduce((s, h) => s + h.length, 0), 0)).toBeLessThan(inputVertices * 1.2)
     expect(united.reduce((n, p) => n + (p.holes?.length ?? 0), 0)).toBe(2715)
     console.info(`actual native1659-piece cover partition + generic union: ${(performance.now() - start).toFixed(1)}ms`)
+  }, 10000)
+  it('retains subject holes and dry islands when a high-operand acquisition difference uses integers', () => {
+    const subject = { polygon: rectangle(1800, 0, 900, 900), holes: [rectangle(1850, 50, 30, 30)] }, acquisition = { polygon: rectangle(1900, 100, 600, 600), holes: [rectangle(2100, 300, 200, 200)] }
+    const cuts = Array.from({ length: 512 }, () => acquisition), original = JSON.stringify({ subject, cuts }), result = subtractContinuousCover(subject, cuts)
+    expect(sum(result)).toBeCloseTo(sum(subtractRegions(subject, [acquisition])), 4)
+    expect(result.some(r => pointInRegion({ x: 2150, y: 350 }, r))).toBe(true)
+    expect(result.some(r => pointInRegion({ x: 1950, y: 150 }, r))).toBe(false)
+    expect(result.some(r => pointInRegion({ x: 1860, y: 60 }, r))).toBe(false)
+    expect(JSON.stringify({ subject, cuts })).toBe(original)
+  })
+  it('replays the actual2999-boundary tile against its independently computed exclusion set', () => {
+    // GEOS/Shapely2.0.7 computes cell minus unary_union(all exact cuts).
+    // The former floating result painted4,834.58m² of acquired private ground;
+    // preserving that output would preserve the defect rather than the set.
+    const fixture = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/continuous-cover-difference-tile.json.gz', import.meta.url))).toString()) as { subject: PolygonRegion; cuts: PolygonRegion[]; expected: PolygonRegion[]; original: PolygonRegion[]; originalExcludedOverlap: number }
+    expect(fixture.cuts).toHaveLength(2999)
+    const original = JSON.stringify(fixture), started = performance.now(), result = subtractContinuousCover(fixture.subject, fixture.cuts), milliseconds = performance.now() - started
+    const areaDifference = Math.abs(sum(result) - sum(fixture.expected)), expectedAt = regionQuery(fixture.expected), resultAt = regionQuery(result)
+    expect(areaDifference).toBeLessThan(.1)
+    for (let x = 1803.37; x < 2700; x += 13.37) for (let y = 3.91; y < 900; y += 13.37) expect(resultAt({ x, y })).toBe(expectedAt({ x, y }))
+    const acquiredInterior = { x: 2217.84, y: 137.61 }
+    expect(fixture.originalExcludedOverlap).toBeGreaterThan(4834)
+    expect(regionQuery(fixture.original)(acquiredInterior)).toBe(true)
+    expect(regionQuery(fixture.cuts)(acquiredInterior)).toBe(true)
+    expect(resultAt(acquiredInterior)).toBe(false)
+    for (const part of result) expect(sum(subtractRegions(part, [fixture.subject]))).toBeLessThan(.001)
+    expect(JSON.stringify(fixture)).toBe(original)
+    console.info(`actual2999-cut cover difference: ${milliseconds.toFixed(1)}ms; area delta ${areaDifference.toFixed(6)}m²; ${result.length} residual pieces`)
   }, 10000)
 })

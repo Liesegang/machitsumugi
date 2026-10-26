@@ -24,6 +24,10 @@ beforeAll(()=>{
   const capture=process.env.CONTINUOUS_COVER_CAPTURE
   let captured=false
   map=generateContinuousCity(config,progress,undefined,input=>{calls++;return plain(input)},{coverGeometry:(stage,parts)=>{if(capture&&stage==='urban'&&!captured){writeFileSync(capture,JSON.stringify(parts));captured=true}}})
+  if(process.env.CONTINUOUS_MAP_CAPTURE){
+    writeFileSync(process.env.CONTINUOUS_MAP_CAPTURE,JSON.stringify(map))
+    writeFileSync(process.env.CONTINUOUS_MAP_CAPTURE+'.report.json',JSON.stringify(continuousCityGenerationReport(map)))
+  }
   if(file)appendFileSync(file,JSON.stringify({time:Date.now(),phase:'complete',timings:continuousCityGenerationReport(map)?.phases})+'\n')
 },60000)
 describe('continuous city production composition',()=>{

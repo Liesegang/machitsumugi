@@ -1,9 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import { buildContinuousCoverHistory } from './continuous-city-cover-history'
+import { buildContinuousCoverHistory, continuousRoadAcquisitions } from './continuous-city-cover-history'
 import type { Area } from './types'
 import { pointInRegion, rectangle, regionArea, subtractRegions } from './geometry'
 
 describe('continuous cover acquisition history', () => {
+  it('clears real bend shoulders at opening while retaining fields under elevated roads', () => {
+    const road = { id: 'bend', kind: 'local' as const, width: 10, builtYear: 1955, points: [{ x: 20, y: 50 }, { x: 100, y: 50 }, { x: 100, y: 150 }] }
+    const acquisitions = continuousRoadAcquisitions([road])
+    const base: Area = { id: 'base', kind: 'field', polygon: rectangle(0, 0, 200, 200) }
+    const finalCover: Area[] = subtractRegions(base, acquisitions.map(a => a.region)).map((region, index) => ({ ...region, id: 'final-' + index, kind: 'field' }))
+    const history = buildContinuousCoverHistory({ width: 200, height: 200, baseCover: [base], finalCover, acquisitions })
+    const groundAt = (year: number) => history.some(v => v.from <= year && (v.to === undefined || year < v.to) && pointInRegion({ x: 103, y: 47 }, v.value))
+    expect(groundAt(1954)).toBe(true)
+    expect(groundAt(1955)).toBe(false)
+    expect(groundAt(2025)).toBe(false)
+    expect(continuousRoadAcquisitions([{ ...road, level: 1 }])).toEqual([])
+  })
   it('restores base cover until earliest acquisition, conserves tiles and preserves exact water islands', () => {
     const water: Area = { id: 'natural-water', kind: 'water', name: '湖', polygon: rectangle(340, 20, 40, 60), holes: [rectangle(350, 40, 15, 15)], waterLevel: 7 }
     const forest: Area = { id: 'forest', kind: 'forest', polygon: rectangle(0, 0, 720, 160), holes: [water.polygon] }, island: Area = { id: 'island', kind: 'forest', polygon: water.holes![0]! }
