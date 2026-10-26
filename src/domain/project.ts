@@ -81,7 +81,7 @@ function configFrom(value: unknown): CityConfig {
     arterial: boolean(input.arterial, '幹線道路'), facilities,
   }
   if (input.era !== undefined) config.era = choice(input.era, ['historic', 'railway', 'present'] as const, '発展段階')
-  if (input.cityEngine !== undefined) config.cityEngine = choice(input.cityEngine, ['history', 'layout'] as const, '生成方式')
+  if (input.cityEngine !== undefined) config.cityEngine = choice(input.cityEngine, ['history', 'layout', 'continuous'] as const, '生成方式')
   if (input.targetYear !== undefined) config.targetYear = number(input.targetYear, '表示年代', 1650, 2025, true)
   if (input.settlement !== undefined) config.settlement = choice(input.settlement, ['village', 'rural-town', 'regional-city', 'metropolis'] as const, '地域の規模')
   if (input.populationTrend !== undefined) config.populationTrend = choice(input.populationTrend, ['declining', 'stable', 'growing'] as const, '人口推移')

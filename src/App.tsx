@@ -51,7 +51,7 @@ function sessionDraft(fallback: CityConfig): CityConfig {
 }
 const normalizeConfig = (config: CityConfig): CityConfig => ({ ...config, era: config.era ?? 'present', relief: config.relief ?? 'hills', terrain: (config.type === 'port' || config.facilities.includes('port')) && config.terrain === 'plain' ? 'coast' : config.terrain })
 const newProject = (): Project => {
-  const config: CityConfig = { ...DEFAULT_CONFIG, cityEngine: 'layout' }
+  const config: CityConfig = { ...DEFAULT_CONFIG, cityEngine: 'continuous' }
   return { version: 2, config: livePreview ? sessionDraft(config) : config, layers: DEFAULT_LAYERS, annotations: [], style: 'standard' }
 }
 const layerNames = { terrain: '地形・水域・緑地', buildings: '建物・住宅', roads: '道路', railway: '線路・駅', labels: '地名・ラベル', districts: '町域・区境', facilities: '施設', grid: '100 m グリッド' }

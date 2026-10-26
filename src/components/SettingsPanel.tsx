@@ -26,7 +26,7 @@ export function SettingsPanel({ config, onChange, generating, dirty, onGenerate,
   return <>
     <div className="panel-scroll settings-scroll">
       <div className="settings-identity">
-        <label className="field-row"><span>生成方式</span><select value={config.cityEngine ?? 'history'} onChange={event => update('cityEngine', event.target.value as CityConfig['cityEngine'])}><option value="layout">街区から設計（試作）</option><option value="history">歴史から生成</option></select></label>
+        <label className="field-row"><span>生成方式</span><select aria-label="生成方式" value={config.cityEngine ?? 'history'} onChange={event => update('cityEngine', event.target.value as CityConfig['cityEngine'])}><option value="continuous">連続した市街地（試作）</option><option value="layout">街区から設計（旧試作）</option><option value="history">歴史から生成</option></select></label>
         <label className="field-row"><span>街の名前</span><input value={config.name} maxLength={30} onChange={event => update('name', event.target.value)} /></label>
         <label className="field-row"><span>街の種類</span><select value={config.type} onChange={event => selectType(event.target.value as CityType)}>{CITY_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>
         <label className="field-row"><span>地図の広さ</span><select value={config.mapSize ?? 'small'} onChange={event => update('mapSize', event.target.value as CityConfig['mapSize'])}><option value="small">4 × 3 km</option><option value="medium">8 × 6 km</option><option value="large">12 × 9 km</option></select></label>

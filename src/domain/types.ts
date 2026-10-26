@@ -6,7 +6,7 @@ export type Terrain = 'river' | 'plain' | 'coast';
 export type FacilityKind = 'shrine' | 'school' | 'university' | 'hospital' | 'police' | 'shop' | 'park' | 'castle' | 'port' | 'onsen';
 export interface CityConfig {
   /** Missing on older projects: their history engine and saved geometry stay intact. */
-  cityEngine?: 'history' | 'layout';
+  cityEngine?: 'history' | 'layout' | 'continuous';
   name: string; seed: string; type: CityType; terrain: Terrain; density: number; forest: number;
   railway: boolean; stations: number; arterial: boolean; facilities: FacilityKind[];
   era?: 'historic' | 'railway' | 'present';

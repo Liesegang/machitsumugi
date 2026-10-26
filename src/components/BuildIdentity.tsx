@@ -1,9 +1,10 @@
 import { BUILD_INFO } from '../build-info'
 import { GENERATOR_VERSION } from '../domain/land-development'
 import { LAYOUT_GENERATOR_VERSION } from '../domain/layout-first-types'
+import { CONTINUOUS_GENERATOR_VERSION } from '../domain/continuous-city-types'
 
-export function BuildIdentity({ mapVersion, preview = false, engine }: { mapVersion?: string; preview?: boolean; engine?: 'history' | 'layout' }) {
-  const currentVersion = engine === 'layout' ? LAYOUT_GENERATOR_VERSION : GENERATOR_VERSION
+export function BuildIdentity({ mapVersion, preview = false, engine }: { mapVersion?: string; preview?: boolean; engine?: 'history' | 'layout' | 'continuous' }) {
+  const currentVersion = engine === 'continuous' ? CONTINUOUS_GENERATOR_VERSION : engine === 'layout' ? LAYOUT_GENERATOR_VERSION : GENERATOR_VERSION
   const { commit, dirty, builtAt } = BUILD_INFO
   const title = `${commit ? `Git ${commit}` : 'Git情報を取得できませんでした'}${dirty ? '・未コミット変更あり' : ''}${builtAt ? `\nビルド: ${new Date(builtAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })} JST` : ''}`
   return <span className="build-identity" title={title}>

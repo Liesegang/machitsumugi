@@ -44,6 +44,9 @@ describe('saved projects', () => {
     const restored = parseProject(JSON.stringify(project))
     expect(restored.config.cityEngine).toBe('layout')
     expect(restored.snapshot).toEqual(project.snapshot)
+    project.config.cityEngine = 'continuous'
+    project.snapshot!.config.cityEngine = 'continuous'
+    expect(parseProject(JSON.stringify(project)).snapshot).toEqual(project.snapshot)
     expect(parseProject(JSON.stringify(sample())).config.cityEngine).toBeUndefined()
     expect(() => parseProject(JSON.stringify({ ...sample(), config: { ...sample().config, cityEngine: 'unknown' } }))).toThrow('生成方式')
   })
