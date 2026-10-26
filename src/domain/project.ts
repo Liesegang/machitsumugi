@@ -111,6 +111,43 @@ function sameConfig(a: CityConfig, b: CityConfig): boolean {
   return JSON.stringify(normalized(a)) === JSON.stringify(normalized(b))
 }
 
+/** Nondegeneracy is about the exact supplied coordinates, not a minimum land
+ * acquisition size. A saved native residual triangle is only0.029mm². Most
+ * rings have an area well beyond their translated sum's roundoff bound; rare
+ * tiny/cancelling rings use exact IEEE754 dyadics without changing any point. */
+function hasPolygonArea(ring: readonly Point[]): boolean {
+  const origin = ring[0]!
+  let sum = 0, correction = 0, magnitude = 0
+  for (let i = 0; i < ring.length; i++) {
+    const p = ring[i]!, q = ring[(i + 1) % ring.length]!
+    const a = (p.x - origin.x) * (q.y - origin.y), b = (q.x - origin.x) * (p.y - origin.y), term = a - b, next = sum + term
+    correction += Math.abs(sum) >= Math.abs(term) ? (sum - next) + term : (term - next) + sum
+    sum = next; magnitude += Math.abs(a) + Math.abs(b)
+  }
+  const roundoff = magnitude * Number.EPSILON * (ring.length + 4) * 4
+  if (Math.abs(sum + correction) > Math.max(.000001, roundoff)) return true
+  const view = new DataView(new ArrayBuffer(8)), fraction = (1n << 52n) - 1n
+  let exponent = Infinity
+  const dyadic = (value: number) => {
+    view.setFloat64(0, value)
+    const bits = view.getBigUint64(0), encodedExponent = Number(bits >> 52n & 2047n)
+    let coefficient = (bits & fraction) + (encodedExponent ? 1n << 52n : 0n)
+    if (bits >> 63n) coefficient = -coefficient
+    const power = encodedExponent ? encodedExponent - 1075 : -1074
+    if (coefficient) exponent = Math.min(exponent, power)
+    return { coefficient, power }
+  }
+  const exact = ring.map(p => [dyadic(p.x), dyadic(p.y)] as const)
+  if (!Number.isFinite(exponent)) return false
+  const coordinates = exact.map(p => p.map(v => v.coefficient ? v.coefficient << BigInt(v.power - exponent) : 0n))
+  let twice = 0n
+  for (let i = 0; i < coordinates.length; i++) {
+    const p = coordinates[i]!, q = coordinates[(i + 1) % coordinates.length]!
+    twice += p[0]! * q[1]! - q[0]! * p[1]!
+  }
+  return twice !== 0n
+}
+
 /** Linear, bounded validation of a portable snapshot, without running the generator. */
 function snapshotFrom(value: unknown, config: CityConfig): CityMap {
   const input = object(value, '保存済み地図')
@@ -139,10 +176,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     if (list.length < (polygon ? 3 : 2)) throw new Error(`${label}の頂点が不足しています。`)
     const result = list.map(p => point(p, label))
     if (!result.some((p, i) => i > 0 && (p.x !== result[0].x || p.y !== result[0].y))) throw new Error(`${label}の形が正しくありません。`)
-    if (polygon) {
-      const area = result.reduce((sum, p, i) => { const next = result[(i + 1) % result.length]; return sum + p.x * next.y - next.x * p.y }, 0)
-      if (Math.abs(area) < .000001) throw new Error(`${label}の面積がありません。`)
-    }
+    if (polygon && !hasPolygonArea(result)) throw new Error(`${label}の面積がありません。`)
     return result
   }
   function entities<T>(value: unknown, label: string, limit: number, read: (input: Record<string, unknown>, id: string) => T): T[] {

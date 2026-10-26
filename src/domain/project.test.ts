@@ -37,6 +37,40 @@ const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
+  it('preserves the actual native12 positive subthreshold land triangle in current and dated wire forms', () => {
+    // Exact IEEE dyadic area=2.9244600933667242e-8m². This is real positive
+    // source fill, not a collinear/retraced contour or a rounding tolerance.
+    const polygon = [{ x: 10687.634, y: 971.0437999999999 }, { x: 10687.651623021793, y: 971.0432151079877 }, { x: 10687.634100000001, y: 971.0437999999999 }]
+    const project = withSnapshot(), map = project.snapshot!
+    project.config.cityEngine = 'continuous'; map.config.cityEngine = 'continuous'; map.width = 12000; map.height = 9000; map.year = 2025
+    map.areas = [{ id: 'cf-o-16213', kind: 'park', polygon }]
+    const original = JSON.stringify(polygon), current = validateProject(project)
+    expect(current.snapshot!.areas[0]!.polygon).toEqual(polygon)
+    map.timeline = createCityTimeline(map, { areas: [{ from: 1955, value: map.areas[0]! }] })
+    for (const text of [JSON.stringify(portableProject(project)), serializeProject(project)]) {
+      const restored = parseProject(text).snapshot!
+      expect(restored.areas[0]!.polygon).toEqual(polygon)
+      expect(restored.timeline!.areas[0]).toEqual({ from: 1955, value: map.areas[0] })
+    }
+    expect(JSON.stringify(polygon)).toBe(original)
+  })
+  it('accepts small translated positive fill while rejecting exact collinear and retraced rings', () => {
+    const project = withSnapshot(), map = project.snapshot!
+    map.width = 50000; map.height = 50000
+    const positive = [{ x: 10000, y: 10000 }, { x: 10000.0001, y: 10000 }, { x: 10000, y: 10000.0001 }]
+    const rawTwice = (ring: typeof positive) => ring.reduce((sum, p, i) => { const q = ring[(i + 1) % ring.length]!; return sum + p.x * q.y - q.x * p.y }, 0)
+    expect(rawTwice(positive)).toBe(0)
+    map.areas[0]!.polygon = positive
+    expect(validateProject(project).snapshot!.areas[0]!.polygon).toEqual(positive)
+    const collinear = [{ x: 32000, y: 48000.875 }, { x: 6.075140390748857e-13, y: .8750000000009113 }, { x: 10.000000000001823, y: 15.875000000002734 }]
+    // Exact dyadic y=1.5*x+.875, despite a nonzero translated floating sum.
+    const o = collinear[0]!, translated = collinear.map(p => ({ x: p.x - o.x, y: p.y - o.y }))
+    expect(rawTwice(translated)).not.toBe(0)
+    for (const polygon of [collinear, [{ x: 1000, y: 1000 }, { x: 1010, y: 1000 }, { x: 1010, y: 1010 }, { x: 1010, y: 1000 }]]) {
+      map.areas[0]!.polygon = polygon
+      expect(() => validateProject(project)).toThrow('面積がありません')
+    }
+  })
   it('keeps dense continuous table capacity finite without expanding saved legacy engine budgets', () => {
     const reached = new Error('record reader reached'), deferred = <T,>(length: number): T[] => {
       const values = new Array<T>(length)
