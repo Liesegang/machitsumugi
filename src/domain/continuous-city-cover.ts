@@ -11,6 +11,66 @@ import { PROJECT_GEOMETRY_LIMITS } from './project'
 
 const { difference, union } = polygonClipping
 
+/** Working-union diagnostics, never source stock edits. The fixed survey
+ * lattice can collapse floating sweep noise; its raw fill is recorded. */
+export const continuousCoverDiagnostics = { collapsedRings: 0, collapsedHoles: 0, collapsedRawFilledArea: 0, maximumGridSpacing: 0, exactAreaFallbacks: 0, zeroSignedPositiveRings: 0 }
+const localArea = (ring: readonly Point[]) => {
+  const origin = ring[0]
+  return origin ? ring.reduce((sum, p, i) => { const q = ring[(i + 1) % ring.length]!; return sum + (p.x - origin.x) * (q.y - origin.y) - (q.x - origin.x) * (p.y - origin.y) }, 0) / 2 : 0
+}
+function exactIntegerAreaSign(path: Path) {
+  const origin = path[0]!
+  let local = 0, magnitude = 0
+  for (let i = 0; i < path.length; i++) {
+    const p = path[i]!, q = path[(i + 1) % path.length]!, a = (p.X - origin.X) * (q.Y - origin.Y), b = (q.X - origin.X) * (p.Y - origin.Y)
+    local += a - b; magnitude += Math.abs(a) + Math.abs(b)
+  }
+  // The translated shoelace avoids city-coordinate cancellation. Only a sign
+  // beyond this conservative floating error bound is trusted; doubtful sums
+  // use the exact integer determinant, including nonzero grid-sized slivers.
+  if (Math.abs(local) > magnitude * Number.EPSILON * (path.length + 4) * 4) return Math.sign(local)
+  continuousCoverDiagnostics.exactAreaFallbacks++
+  let twice = 0n
+  for (let i = 0; i < path.length; i++) { const p = path[i]!, q = path[(i + 1) % path.length]!; twice += BigInt(p.X) * BigInt(q.Y) - BigInt(q.X) * BigInt(p.Y) }
+  return twice < 0n ? -1 : twice > 0n ? 1 : 0
+}
+function coverGrid(parts: readonly PolygonRegion[], boundaries: readonly PolygonRegion[] = []) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const region of [...parts, ...boundaries]) for (const p of region.polygon) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y) }
+  const origin = { x: Math.round((minX + maxX) / 2 * 5000) / 5000, y: Math.round((minY + maxY) / 2 * 5000) / 5000 }
+  const reach = Math.max(maxX - origin.x, origin.x - minX, maxY - origin.y, origin.y - minY)
+  return { origin, scale: reach * 10000 < 47453100 ? 10000 : 5000 }
+}
+function gridRing(ring: readonly Point[], grid: ReturnType<typeof coverGrid>) {
+  const path = ring.map(p => ({ X: Math.round((p.x - grid.origin.x) * grid.scale), Y: Math.round((p.y - grid.origin.y) * grid.scale) })).filter((p, i, all) => !i || p.X !== all[i - 1]!.X || p.Y !== all[i - 1]!.Y)
+  if (path.length > 1 && path[0]!.X === path.at(-1)!.X && path[0]!.Y === path.at(-1)!.Y) path.pop()
+  if (path.length < 3) return { paths: [] as Path[], simplified: false }
+  if (exactIntegerAreaSign(path) !== 0) return { paths: [path], simplified: false }
+  // Signed zero is NOT filled zero: a figure eight has two positive lobes.
+  // A single integer-ring simplification resolves its fill before deciding.
+  const paths = ClipperLib.Clipper.SimplifyPolygon(path, ClipperLib.PolyFillType.pftNonZero)
+  if (paths.length) continuousCoverDiagnostics.zeroSignedPositiveRings++
+  return { paths, simplified: true }
+}
+function recordCollapsedRing(ring: Point[], hole: boolean, scale: number) {
+  continuousCoverDiagnostics.collapsedRings++; continuousCoverDiagnostics.collapsedHoles += Number(hole)
+  continuousCoverDiagnostics.maximumGridSpacing = Math.max(continuousCoverDiagnostics.maximumGridSpacing, 1 / scale)
+  const origin = ring[0]
+  if (!origin || ring.length < 3) return
+  // Translate this one tiny contour before measuring. Global shoelaces can
+  // cancel its positive 1e-12m² fill at city coordinates near 5km.
+  const local = ring.map(p => [p.x - origin.x, p.y - origin.y] as [number, number])
+  const geometry = union([local])
+  continuousCoverDiagnostics.collapsedRawFilledArea += geometry.reduce((sum, rings) => sum + Math.abs(localArea(rings[0]!.map(([x, y]) => ({ x, y })))) - rings.slice(1).reduce((holes, h) => holes + Math.abs(localArea(h.map(([x, y]) => ({ x, y })))), 0), 0)
+}
+function workingCoverRegions(parts: readonly PolygonRegion[], grid: ReturnType<typeof coverGrid>) {
+  return parts.flatMap(part => {
+    if (!gridRing(part.polygon, grid).paths.length) { recordCollapsedRing(part.polygon, false, grid.scale); return [] }
+    const holes = (part.holes ?? []).filter(hole => { if (gridRing(hole, grid).paths.length) return true; recordCollapsedRing(hole, true, grid.scale); return false })
+    return holes.length === (part.holes?.length ?? 0) ? [part] : [{ polygon: part.polygon, ...(holes.length ? { holes } : {}) }]
+  })
+}
+
 export interface ContinuousCityCoverInput {
   config: CityConfig
   width: number
@@ -29,32 +89,23 @@ export interface ContinuousCityCoverInput {
  * never passes through this operation; its exact objects remain unchanged. */
 function integerCoverBoolean(parts: readonly PolygonRegion[], boundaries: readonly PolygonRegion[] = [], operation: 'union' | 'intersection' | 'difference' = 'union'): PolygonRegion[] {
   if (!parts.length) return []
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-  for (const region of [...parts, ...boundaries]) for (const p of region.polygon) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y) }
   // Clipper.js switches to Int128 above47,453,132, far below the C++ limit.
   // A local origin keeps ordinary blocks and4x3km crops in the fast range.
   // The widest12km crop uses0.2mm; normal source geometry uses0.1mm already.
-  const origin = { x: Math.round((minX + maxX) / 2 * 5000) / 5000, y: Math.round((minY + maxY) / 2 * 5000) / 5000 }
-  const reach = Math.max(maxX - origin.x, origin.x - minX, maxY - origin.y, origin.y - minY)
-  let scale = reach * 10000 < 47453100 ? 10000 : 5000
-  const pathsAt = (regions: readonly PolygonRegion[]): Path[] | null => {
+  const grid = coverGrid(parts, boundaries), { origin, scale } = grid
+  const pathsAt = (regions: readonly PolygonRegion[]): Path[] => {
     const paths: Path[] = []
-    for (const region of regions) for (const [index, ring] of [region.polygon, ...(region.holes ?? [])].entries()) {
-      const path = ring.map(p => ({ X: Math.round((p.x - origin.x) * scale), Y: Math.round((p.y - origin.y) * scale) })).filter((p, i, all) => !i || p.X !== all[i - 1]!.X || p.Y !== all[i - 1]!.Y)
-      if (path.length > 1 && path[0]!.X === path.at(-1)!.X && path[0]!.Y === path.at(-1)!.Y) path.pop()
-      if (path.length < 3 || ClipperLib.Clipper.Area(path) === 0) return null
-      if (ClipperLib.Clipper.Orientation(path) !== (index === 0)) path.reverse()
-      paths.push(path)
+    for (const region of workingCoverRegions(regions, grid)) for (const [index, ring] of [region.polygon, ...(region.holes ?? [])].entries()) {
+      const resolved = gridRing(ring, grid)
+      for (const path of resolved.paths) {
+        if (resolved.simplified ? index > 0 : (exactIntegerAreaSign(path) > 0) !== (index === 0)) path.reverse()
+        paths.push(path)
+      }
     }
     return paths
   }
-  let subjects = pathsAt(parts), clips = pathsAt(boundaries)
-  // Exceptional thinner rings get finer precision in this bounded component,
-  // never silently disappear. The ordinary whole-city path stays fast.
-  if (!subjects || !clips) { scale = 10000; subjects = pathsAt(parts); clips = pathsAt(boundaries) }
-  if (!subjects || !clips) { scale = 1_000_000; subjects = pathsAt(parts); clips = pathsAt(boundaries) }
-  if (!subjects || !clips) { scale = 100_000_000; subjects = pathsAt(parts); clips = pathsAt(boundaries) }
-  if (!subjects || !clips) throw new Error('被覆境界を整数精度で保持できませんでした。')
+  const subjects = pathsAt(parts), clips = pathsAt(boundaries)
+  if (!subjects.length || operation === 'intersection' && !clips.length) return []
   const engine = new ClipperLib.Clipper(), tree = new ClipperLib.PolyTree()
   // Clipper's optional DoSimplePolygons pass repeatedly splits the native
   // cadastre's touching hole vertices, exploding23k vertices into260k. The
@@ -79,6 +130,9 @@ function integerCoverBoolean(parts: readonly PolygonRegion[], boundaries: readon
  * vertex ceiling prevents restoring its failed whole-city event queue; any
  * numerical failure and every larger merge use the independent integer path. */
 function joinCoverParts(parts: readonly PolygonRegion[]): PolygonRegion[] {
+  if (!parts.length) return []
+  parts = workingCoverRegions(parts, coverGrid(parts))
+  if (!parts.length) return []
   const count = parts.reduce((sum, p) => sum + p.polygon.length + (p.holes ?? []).reduce((n, h) => n + h.length, 0), 0)
   if (count <= 12000) {
     try {

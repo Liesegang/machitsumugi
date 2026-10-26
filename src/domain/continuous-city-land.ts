@@ -439,7 +439,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         const next = regions.flatMap(part => subtractRegions(part, strips)), acquiredArea = sumArea(regions) - sumArea(next)
         if (acquiredArea < 1) continue
         accessRoads.push(lane); addRoad(lane); metrics.accessRoads++; throughAccesses += Number(lane.points.length === 3); blockAccessArea += acquiredArea; regions = next; acquired = true
-        if ((lane.builtYear ?? 1650) <= endYear) events.push({ id: `continuous-road-${lane.id}`, year: lane.builtYear ?? 1650, kind: 'road', entityId: lane.id, reason: '閉街区内の共有接道を取得' })
+        if ((lane.builtYear ?? 1650) <= endYear) events.push({ id: `continuous-road-${lane.id}`, year: lane.builtYear ?? 1650, kind: 'road', entityId: lane.id, reason: '住宅地への細い通りが開通' })
         break
       }
       if (!acquired) break
@@ -511,8 +511,8 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         history.parcels.push({ from: createdYear, value: parcel })
         history.buildings.push(...visible.map(version => version.to !== undefined && version.to > endYear ? { from: version.from, value: version.value } : version))
         for (const version of visible) {
-          events.push({ id: `cf-c-${cellSerial}-${version.from}`, year: version.from, kind: 'construction', entityId: version.value.id, reason: '実街区の接道筆に建築' })
-          if (version.to !== undefined && version.to <= endYear) events.push({ id: `cf-d-${cellSerial}-${version.to}`, year: version.to, kind: 'demolition', entityId: version.value.id, reason: '同じ筆の建物を更新' })
+          events.push({ id: `cf-c-${cellSerial}-${version.from}`, year: version.from, kind: 'construction', entityId: version.value.id, reason: version.from === createdYear ? major ? '店舗が開業' : '住宅を新築' : '同じ敷地で建物を建て替え' })
+          if (version.to !== undefined && version.to <= endYear) events.push({ id: `cf-d-${cellSerial}-${version.to}`, year: version.to, kind: 'demolition', entityId: version.value.id, reason: '建て替えに伴い旧建物を解体' })
         }
         metrics.privateReplacements += visible.length - 1
       }

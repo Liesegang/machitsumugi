@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
-import { buildContinuousCityCover, continuousRoadGround, dissolveContinuousCover, partitionContinuousCover, subtractContinuousCover } from './continuous-city-cover'
+import { buildContinuousCityCover, continuousCoverDiagnostics, continuousRoadGround, dissolveContinuousCover, partitionContinuousCover, subtractContinuousCover } from './continuous-city-cover'
 import type { ContinuousCityCoverInput } from './continuous-city-cover'
 import type { ContinuousCityDemand } from './continuous-city-types'
 import type { Area, CityConfig, Parcel, Road } from './types'
@@ -192,5 +192,39 @@ describe('continuous city residual cover', () => {
     for (const part of result) expect(sum(subtractRegions(part, [fixture.subject]))).toBeLessThan(.001)
     expect(JSON.stringify(fixture)).toBe(original)
     console.info(`actual2999-cut cover difference: ${milliseconds.toFixed(1)}ms; area delta ${areaDifference.toFixed(6)}m²; ${result.length} residual pieces`)
+  }, 10000)
+  it('classifies a grid-collapsed derived needle without deleting its raw source or a meaningful hole', () => {
+    const needle = [{ x: 5313.213447328113, y: 3378.2676703986804 }, { x: 5312.853818923021, y: 3378.437730058252 }, { x: 5311.400958565827, y: 3379.124752924776 }, { x: 5312.853818923021, y: 3378.437730058253 }]
+    const parent = { polygon: rectangle(5300, 3360, 30, 30), holes: [needle, rectangle(5302, 3362, .5, .5)] }, other = { polygon: rectangle(5329, 3360, 2, 30) }, parts = [parent, other], before = JSON.stringify(parts), diagnostics = { ...continuousCoverDiagnostics }
+    const result = dissolveContinuousCover(parts)
+    expect(sum(result)).toBeCloseTo(31 * 30 - .25, 5)
+    expect(result.some(part => pointInRegion({ x: 5302.25, y: 3362.25 }, part))).toBe(false)
+    expect(continuousCoverDiagnostics.collapsedHoles).toBeGreaterThan(diagnostics.collapsedHoles)
+    expect(continuousCoverDiagnostics.collapsedRawFilledArea - diagnostics.collapsedRawFilledArea).toBeGreaterThan(0)
+    expect(continuousCoverDiagnostics.collapsedRawFilledArea - diagnostics.collapsedRawFilledArea).toBeLessThan(1e-10)
+    expect(JSON.stringify(parts)).toBe(before)
+  })
+  it('retains both positive lobes of signed-zero figure eights as acquisitions and holes', () => {
+    const figure = [{ x: 0, y: 0 }, { x: 20, y: 20 }, { x: 0, y: 20 }, { x: 20, y: 0 }], square = { polygon: rectangle(0, 0, 30, 30) }
+    const acquisition = subtractContinuousCover(square, Array.from({ length: 512 }, () => ({ polygon: figure })))
+    expect(sum(acquisition)).toBeCloseTo(700, 5)
+    expect(acquisition.some(part => pointInRegion({ x: 10, y: 3 }, part))).toBe(false)
+    expect(acquisition.some(part => pointInRegion({ x: 10, y: 17 }, part))).toBe(false)
+    const holed = subtractContinuousCover({ ...square, holes: [figure] }, Array.from({ length: 512 }, () => ({ polygon: rectangle(25, 25, 1, 1) })))
+    expect(sum(holed)).toBeCloseTo(699, 5)
+    expect(holed.some(part => pointInRegion({ x: 3, y: 10 }, part))).toBe(true)
+    expect(holed.some(part => pointInRegion({ x: 10, y: 3 }, part))).toBe(false)
+  })
+  it('replays native08 first failed union within its existing fixed-grid boundary error band', () => {
+    const fixture = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/continuous-cover-native08-zero-hole.json.gz', import.meta.url))).toString()) as { parts: PolygonRegion[]; expected: PolygonRegion[]; boundaryBandArea: number }
+    expect(fixture.parts).toHaveLength(9)
+    const source = JSON.stringify(fixture), result = dissolveContinuousCover(fixture.parts)
+    // Independent GEOS additionally proves XOR outside the0.2mm input-edge
+    // buffer is exactly zero; all raw rings, blocks and road stock are intact.
+    expect(Math.abs(sum(result) - sum(fixture.expected))).toBeLessThan(fixture.boundaryBandArea)
+    const actual = regionQuery(result), expected = regionQuery(fixture.expected)
+    for (let y = 17.23; y < 9000; y += 173.19) for (let x = 29.17; x < 12000; x += 173.19) expect(actual({ x, y })).toBe(expected({ x, y }))
+    expect(result.every(part => Number.isFinite(regionArea(part)) && regionArea(part) > 0)).toBe(true)
+    expect(JSON.stringify(fixture)).toBe(source)
   }, 10000)
 })
