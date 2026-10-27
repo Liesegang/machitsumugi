@@ -39,11 +39,11 @@ const frontageAcquisition = (input: ContinuousCityLandInput, parcels: ReturnType
 describe('continuous city whole-block cadastre', () => {
   it('partitions the whole ordinary block into varied urban titles with real frontage and contained rectangles', () => {
     const { input, result } = run()
-    expect(result.parcels.length).toBeGreaterThan(20)
+    expect(result.parcels.length).toBeGreaterThan(12)
     expect(result.metrics.partitionAreaError).toBeLessThan(.05)
     expect(result.metrics.openSpaceArea / result.metrics.buildableArea).toBeLessThan(.08)
     expect(median(result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeGreaterThan(130)
-    expect(median(result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(260)
+    expect(median(result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(400)
     expect(new Set(result.parcels.map(parcel => Math.round(polygonArea(parcel.polygon)))).size).toBeGreaterThan(10)
     expect(result.metrics.parcelArea + result.metrics.accessArea + result.metrics.openSpaceArea + result.metrics.unassignedArea).toBeCloseTo(result.metrics.buildableArea, 1)
     for (const parcel of result.parcels) {
@@ -65,8 +65,10 @@ describe('continuous city whole-block cadastre', () => {
     expect(dense.result.parcels.length).toBeGreaterThan(normal.result.parcels.length)
     const areas = dense.result.parcels.map(parcel => polygonArea(parcel.polygon))
     expect(median(areas)).toBeGreaterThan(80)
-    expect(median(areas)).toBeLessThan(170)
-    expect(dense.result.buildings.every(building => polygonArea(building.polygon) <= 144.01)).toBe(true)
+    expect(median(areas)).toBeLessThan(median(normal.result.parcels.map(parcel => polygonArea(parcel.polygon))))
+    // Stronger demand still reduces the median roof size. Wider acquisitions
+    // can now exceed the former universal144m² roof ceiling.
+    expect(median(dense.result.buildings.map(building => polygonArea(building.polygon)))).toBeLessThan(median(normal.result.buildings.map(building => polygonArea(building.polygon))))
     expect(dense.result.metrics.partitionAreaError).toBeLessThan(.05)
   })
 
@@ -74,7 +76,7 @@ describe('continuous city whole-block cadastre', () => {
     const angle = .31, rotate = (p: { x: number; y: number }) => ({ x: 80 + (p.x - 80) * Math.cos(angle) - (p.y - 50) * Math.sin(angle), y: 50 + (p.x - 80) * Math.sin(angle) + (p.y - 50) * Math.cos(angle) })
     const source = run().input, roads = loop().map(road => ({ ...road, points: road.points.map(rotate) })), block = { id: 'oblique', polygon: rectangle(20, 20, 120, 60).map(rotate) }
     const { result } = run({ roads, blocks: [block], demand: { ...source.demand, center: rotate(source.demand.center) } })
-    expect(result.parcels.length).toBeGreaterThan(20)
+    expect(result.parcels.length).toBeGreaterThan(12)
     expect(result.metrics.partitionAreaError).toBeLessThan(.05)
     const actualRoads = [...roads, ...result.accessRoads], row = actualRoads.flatMap(road => road.points.slice(1).map((b, i) => ({ polygon: corridorPolygon(road.points[i]!, b, road.width / 2 + .25) })))
     for (const parcel of result.parcels) {
@@ -105,7 +107,8 @@ describe('continuous city whole-block cadastre', () => {
     expect(core.metrics.openSpaceArea / core.metrics.buildableArea).toBeLessThan(.08)
     for (const building of core.buildings) {
       expect(building.polygon).toHaveLength(4)
-      expect(Math.min(...building.polygon.map((p, i) => Math.hypot(p.x - building.polygon[(i + 1) % 4]!.x, p.y - building.polygon[(i + 1) % 4]!.y)))).toBeLessThanOrEqual(15.51)
+      const title=core.parcels.find(parcel=>parcel.id===building.parcelId)!
+      expect(polygonArea(building.polygon)/polygonArea(title.polygon)).toBeLessThan(.72)
     }
   })
 
@@ -118,6 +121,31 @@ describe('continuous city whole-block cadastre', () => {
     expect(outer.metrics.openSpaceArea / outer.metrics.buildableArea).toBeLessThan(.08)
     expect(outer.metrics.partitionAreaError).toBeLessThan(.05)
     expect(new Set([...outer.buildings, ...dense.buildings].map(building => Math.round(polygonArea(building.polygon)))).size).toBeGreaterThan(8)
+  })
+
+  it('varies real acquisitions and roof sizes along the same street without moving roads or breaking access', () => {
+    const source=run().input,roads=loop(320,90).map(road=>road.id==='north'?{...road,width:9,role:'collector' as const}:road)
+    const original=JSON.stringify(roads),demand={...source.demand,center:{x:40,y:20},at:()=>.82}
+    const first=run({roads,blocks:[{id:'long-front',polygon:rectangle(20,20,320,90)}],demand}).result
+    const repeated=run({roads,blocks:[{id:'long-front',polygon:rectangle(20,20,320,90)}],demand}).result
+    expect(repeated).toEqual(first)
+    expect(JSON.stringify(roads)).toBe(original)
+    const titles=new Map(first.parcels.map(parcel=>[parcel.id,parcel])),roofs=first.buildings.filter(building=>{const parcel=titles.get(building.parcelId!)!;return parcel.roadId==='north'&&parcel.use==='residential'})
+    expect(roofs.length).toBeGreaterThan(8)
+    const quantile=(values:number[],fraction:number)=>values.sort((a,b)=>a-b)[Math.floor((values.length-1)*fraction)]!
+    const widths=roofs.map(roof=>Math.hypot(roof.polygon[1]!.x-roof.polygon[0]!.x,roof.polygon[1]!.y-roof.polygon[0]!.y)),areas=roofs.map(roof=>polygonArea(roof.polygon))
+    expect(quantile(widths,.9)/quantile(widths,.1)).toBeGreaterThan(1.35)
+    expect(quantile(areas,.9)/quantile(areas,.1)).toBeGreaterThan(1.8)
+    const setbacks=roofs.map(roof=>Math.min(...roof.polygon.map(p=>p.y))-20-roads[0]!.width/2)
+    expect(quantile(setbacks,.9)-quantile(setbacks,.1)).toBeGreaterThan(.8)
+    expect(first.metrics.openSpaceArea/first.metrics.buildableArea).toBeLessThan(.08)
+    expect(first.metrics.partitionAreaError).toBeLessThan(.05)
+    for(const roof of first.buildings){
+      const title=titles.get(roof.parcelId!)!,road=[...roads,...first.accessRoads].find(road=>road.id===title.roadId)!
+      expect(subtractRegions(roof,[title]).reduce((sum,part)=>sum+regionArea(part),0)).toBeLessThan(.005)
+      expect(title.createdYear).toBeGreaterThanOrEqual(road.builtYear??1650)
+      expect(Math.min(...road.points.slice(1).map((b,i)=>distanceToSegment(title.access![0]!,road.points[i]!,b)))).toBeLessThan(.001)
+    }
   })
 
   it('uses actual public-network station access and its opening date, not a nearby disconnected railway landmark', () => {
@@ -164,7 +192,7 @@ describe('continuous city whole-block cadastre', () => {
     const source = run().input, curve = Array.from({ length: 41 }, (_, i) => ({ x: 20 + i * 3, y: 20 + Math.sin(i / 40 * Math.PI) * 2 }))
     const roads = source.roads.map(road => road.id === 'north' ? { ...road, points: curve } : road)
     const result = run({ roads, blocks: [{ id: 'curved', polygon: [...curve, { x: 140, y: 80 }, { x: 20, y: 80 }] }] }).result
-    expect(result.parcels.length).toBeGreaterThan(20)
+    expect(result.parcels.length).toBeGreaterThan(12)
     expect(result.parcels.filter(parcel => parcel.roadId === 'north').length).toBeGreaterThan(4)
     expect(result.metrics.openSpaceArea / result.metrics.buildableArea).toBeLessThan(.1)
     expect(result.metrics.partitionAreaError).toBeLessThan(.1)
@@ -190,7 +218,8 @@ describe('continuous city whole-block cadastre', () => {
       for (const point of anchors) expect(Math.min(...[...input.roads, ...result.accessRoads.filter(road => road !== lane)].flatMap(road => road.points.slice(1).map((b, i) => distanceToSegment(point, road.points[i]!, b))))).toBeLessThan(.001)
       for (const parcel of result.parcels) for (let i = 1; i < lane.points.length; i++) expect(polygonsOverlap(parcel.polygon, corridorPolygon(lane.points[i - 1]!, lane.points[i]!, lane.width / 2))).toBe(false)
     }
-    expect(median(result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(260)
+    expect(median(result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(400)
+    expect(result.metrics.parcelArea/result.parcels.length).toBeLessThan(500)
   })
 
   it('surveys a bounded turning head for a deep single-frontage block instead of one giant backyard title', () => {

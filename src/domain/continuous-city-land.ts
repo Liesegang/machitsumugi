@@ -6,14 +6,16 @@ import { buildingServiceYears } from './building-lifecycle'
 import { MinHeap } from './road-graph'
 import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { subtractContinuousCover } from './continuous-city-cover'
+import { streetHolding } from './street-holding'
+import type { HoldingProfile } from './street-holding'
 
-interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds }
+interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds; chainage: number }
 interface Frontage { a: Point; b: Point; segment: Segment; length: number }
 interface Cell extends PolygonRegion { frontages: Frontage[] }
 type Stock = 'compact' | 'ordinary' | 'garden' | 'walkup' | 'mixed'
 interface RouteContext { distance: number; availableYear: number; formAvailableYear: number; source: 'center' | 'station' }
-interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext }
-interface TitleProgramme { stock: Stock; frontage: number; depth: number; maximumArea: number; route: RouteContext; parking: boolean }
+interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext; holding?: HoldingProfile }
+interface TitleProgramme { stock: Stock; frontage: number; depth: number; maximumArea: number; route: RouteContext; parking: boolean; holding: HoldingProfile; cuts: number[] }
 const clamp = (n: number, low: number, high: number) => Math.max(low, Math.min(high, n))
 const publicStreet = (road: Road) => !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && road.role !== 'farm' && (road.level ?? 0) === 0
 const sumArea = (regions: readonly PolygonRegion[]) => regions.reduce((sum, region) => sum + regionArea(region), 0)
@@ -90,11 +92,13 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
   const obstacleOverlaps = new WeakMap<PolygonRegion, (polygon: Point[]) => boolean>()
   const addRoad = (road: Road) => {
     if ((road.level ?? 0) !== 0) return
+    let chainage = 0
     for (let i = 1; i < road.points.length; i++) {
       const a = road.points[i - 1]!, b = road.points[i]!
       if (distance(a, b) < .01) continue
       const polygon = corridorPolygon(a, b, road.width / 2 + .25)
-      const segment = { a, b, road, polygon, bounds: boundsOf(polygon) }
+      const segment = { a, b, road, polygon, bounds: boundsOf(polygon), chainage }
+      chainage += distance(a,b)
       roadIndex.add(segment)
       if (publicStreet(road)) streetSegments.push(segment)
     }
@@ -285,7 +289,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     const result: FrontageProgramme[] = fronts.map(front => ({ front, stock: ordinary, from: 0, to: front.length, route: network(front) }))
     const core = (programme: FrontageProgramme) => programme.route.distance < (programme.route.source === 'station' ? 680 : 880)
     const wide = result.filter(programme => (programme.front.segment.road.width >= 8 || programme.front.segment.road.role === 'collector' || programme.route.source === 'station' && programme.route.distance < 300 && programme.front.segment.road.width >= 6) && core(programme) && intensity >= .58).sort((a, b) => a.route.distance - b.route.distance || b.front.segment.road.width - a.front.segment.road.width)[0]
-    const local = result.filter(programme => programme.front.segment.road.id !== wide?.front.segment.road.id && programme.front.segment.road.width >= 4.6 && result.filter(other => other.front.segment.road.id === programme.front.segment.road.id).reduce((sum, other) => sum + other.front.length, 0) >= 25 && core(programme) && intensity >= .68).sort((a, b) => a.front.length - b.front.length || a.route.distance - b.route.distance)[0]
+    const local = result.filter(programme => programme.front.segment.road.id !== wide?.front.segment.road.id && programme.front.segment.road.width >= 4.6 && result.filter(other => other.front.segment.road.id === programme.front.segment.road.id).reduce((sum, other) => sum + other.front.length, 0) >= 25 && programme.route.distance < (programme.route.source === 'station' ? 1500 : 1600) && intensity >= .58).sort((a, b) => b.front.length - a.front.length || a.route.distance - b.route.distance)[0]
     // A mixed-use corner or a small apartment acquisition is a contiguous
     // frontage programme, never a fresh apartment/commercial coin per title.
     for (const [programme, stock] of [[wide, 'mixed'], [local, 'walkup']] as const) {
@@ -295,22 +299,63 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       result.push({ ...programme, stock, from: first.distance <= last.distance ? 0 : front.length - length, to: first.distance <= last.distance ? length : front.length })
       for (const neighbour of result.slice(0, fronts.length)) if (neighbour !== programme && neighbour.front.segment.road.id === front.segment.road.id && neighbour.route.distance <= programme.route.distance + (stock === 'mixed' ? 38 : 42) && distance(middle(neighbour.front.a, neighbour.front.b), middle(front.a, front.b)) <= 42) result.push({ ...neighbour, stock })
     }
-    return result
+    // Acquisitions precede private cuts. Their widths and building programmes
+    // follow an ordered sequence on each actual road side, rather than the
+    // recursive subdivision serial or one globally repeated house width.
+    const overlays = new Map<Frontage, FrontageProgramme[]>()
+    for (const plan of result) { const group = overlays.get(plan.front) ?? []; group.push(plan); overlays.set(plan.front, group) }
+    return fronts.flatMap(front => {
+      const plans = overlays.get(front)!, cuts = [...new Set(plans.flatMap(plan => [plan.from, plan.to]))].sort((a,b)=>a-b)
+      const segment = front.segment, length = distance(segment.a,segment.b), dx = (segment.b.x-segment.a.x)/length, dy = (segment.b.y-segment.a.y)/length
+      const tangent = {x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length}, midpoint = middle(front.a,front.b)
+      const inward = pointInRegion({x:midpoint.x-tangent.y,y:midpoint.y+tangent.x},region)?1:-1
+      const side = (-dy * -tangent.y + dx * tangent.x) * inward > 0 ? 'left' : 'right', key = `${segment.road.id}:${side}`
+      const phase = seededRandom(`${input.config.seed}:${key}:holding-origin`)()*72
+      const start = segment.chainage + (front.a.x-segment.a.x)*dx + (front.a.y-segment.a.y)*dy, direction = tangent.x*dx+tangent.y*dy
+      const acquired: FrontageProgramme[] = []
+      for(let zone=1;zone<cuts.length;zone++){
+        const from=cuts[zone-1]!,to=cuts[zone]!,mid=(from+to)/2,plan=plans.filter(plan=>plan.from<=mid&&plan.to>=mid).at(-1)!
+        const low=Math.min(start+from*direction,start+to*direction),high=Math.max(start+from*direction,start+to*direction)
+        const group: FrontageProgramme[]=[]
+        for(let cohort=Math.floor((low-phase)/72);cohort<=Math.floor((high-phase)/72);cohort++){
+          const cohortKey=`${key}:${cohort}`,end=phase+(cohort+1)*72
+          for(let position=phase+cohort*72,index=0;position<end-.001;index++){
+            const holding=streetHolding(input.config.seed,`${cohortKey}:${index}`,plan.stock,intensity,cohortKey)
+            let width=Math.min(holding.frontage,end-position)
+            if(end-position-width<5.25)width=end-position
+            const left=Math.max(low,position),right=Math.min(high,position+width)
+            if(right-left>.001){const a=(left-start)/direction,b=(right-start)/direction;group.push({...plan,from:Math.max(from,Math.min(a,b)),to:Math.min(to,Math.max(a,b)),holding:{...holding,frontage:width}})}
+            position+=width
+          }
+        }
+        group.sort((a,b)=>a.from-b.from)
+        // A clipped end of a real run is part of its neighbouring holding,
+        // never a fabricated sub-five-metre independent building title.
+        const minimumFrontage=plan.stock==='mixed'||plan.stock==='walkup'?12:5.8
+        for(let i=0;i<group.length;i++)if(group[i]!.to-group[i]!.from<minimumFrontage&&group.length>1){if(i){group[i-1]!.to=group[i]!.to;group.splice(i--,1)}else{group[1]!.from=group[0]!.from;group.shift();i--}}
+        acquired.push(...group)
+      }
+      return acquired
+    })
   }
+  const programmeIndex=new WeakMap<FrontageProgramme[],{roads:Map<string,FrontageProgramme[]>;totalFrontage:number}>()
   const titleProgramme = (cell: Cell, original: PolygonRegion, plans: FrontageProgramme[]): TitleProgramme => {
     const front = cell.frontages[0]!, p = middle(front.a, front.b), intensity = clamp(input.demand.at(interior(cell)), 0, 1)
-    const matches = plans.filter(plan => {
+    let index=programmeIndex.get(plans)
+    if(!index){const roads=new Map<string,FrontageProgramme[]>();for(const plan of plans){const group=roads.get(plan.front.segment.road.id)??[];group.push(plan);roads.set(plan.front.segment.road.id,group)}index={roads,totalFrontage:[...new Set(plans.map(plan=>plan.front))].reduce((sum,front)=>sum+front.length,0)};programmeIndex.set(plans,index)}
+    const alongRoad=index.roads.get(front.segment.road.id)??[]
+    const matches = alongRoad.filter(plan => {
       if (plan.front.segment.road.id !== front.segment.road.id || distanceToSegment(p, plan.front.a, plan.front.b) > .02) return false
       const u = { x: (plan.front.b.x - plan.front.a.x) / plan.front.length, y: (plan.front.b.y - plan.front.a.y) / plan.front.length }, along = (p.x - plan.front.a.x) * u.x + (p.y - plan.front.a.y) * u.y
       return along >= plan.from - .01 && along <= plan.to + .01
     })
     const plan = matches.at(-1), stock = plan?.stock ?? (intensity >= .72 ? 'compact' : intensity < .38 ? 'garden' : 'ordinary')
-    const totalFrontage = [...new Set(plans.map(plan => plan.front))].reduce((sum, front) => sum + front.length, 0)
-    const meanDepth = regionArea(original) / Math.max(1, totalFrontage), depth = clamp(meanDepth * 1.4, stock === 'compact' ? 16 : 19, stock === 'garden' || stock === 'mixed' || stock === 'walkup' ? 29 : 24)
-    const corner = cell.frontages.some(other => other.segment.road.id !== front.segment.road.id && other.length > 4)
-    const frontage = (stock === 'compact' ? 6.6 + (1 - intensity) * 3 : stock === 'ordinary' ? 9 + (.72 - intensity) * 8 : stock === 'garden' ? 12 + (.38 - intensity) * 12 : stock === 'walkup' ? 19 : 21) * (corner && stock !== 'mixed' && stock !== 'walkup' ? 1.18 : 1)
+    const fallbackKey=`${front.segment.road.id}:${Math.floor(p.x/24)}:${Math.floor(p.y/24)}`,holding=plan?.holding??streetHolding(input.config.seed,fallbackKey,stock,intensity)
+    const meanDepth = regionArea(original) / Math.max(1, index.totalFrontage), depth = Math.min(holding.depth,clamp(meanDepth*1.65,16,40)),frontage=holding.frontage
+    const u={x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length},cuts:number[]=[]
+    for(const candidate of alongRoad)if(distanceToSegment(p,candidate.front.a,candidate.front.b)<.02){const axis={x:(candidate.front.b.x-candidate.front.a.x)/candidate.front.length,y:(candidate.front.b.y-candidate.front.a.y)/candidate.front.length};for(const end of [candidate.from,candidate.to]){const q={x:candidate.front.a.x+axis.x*end,y:candidate.front.a.y+axis.y*end};if(distanceToSegment(q,front.a,front.b)<.02&&distance(q,front.a)>=5.25&&distance(q,front.b)>=5.25)cuts.push(q.x*u.x+q.y*u.y)}}
     const route = plan?.route ?? { distance: Infinity, availableYear: 2025, formAvailableYear: 2025, source: 'center' as const }
-    return { stock, frontage, depth, maximumArea: frontage * depth * 1.22, route, parking: stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350 }
+    return { stock, frontage, depth, maximumArea: frontage * depth * 1.28, route, parking: stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350, holding, cuts:[...new Set(cuts)] }
   }
   const split = (cell: Cell, programme: TitleProgramme): Cell[] | null => {
     const front = cell.frontages[0]!, length = front.length, u = { x: (front.b.x - front.a.x) / length, y: (front.b.y - front.a.y) / length }, v = { x: -u.y, y: u.x }
@@ -318,7 +363,8 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     const b = boundsOf(cell.polygon), reach = Math.hypot(b.maxX - b.minX, b.maxY - b.minY) * 3 + 20
     for (const { axis, low, high, target } of extents) {
       const count = Math.max(2, Math.round((high - low) / target)), acquisition = clamp(target * Math.max(1, Math.floor(count * .42)) / (high - low), .24, .68)
-      for (const fraction of [acquisition, .5, .38, .62]) {
+      const holdingCuts=Math.abs(axis.x*u.x+axis.y*u.y)>.99?programme.cuts.filter(cut=>cut>low+5.25&&cut<high-5.25).sort((a,b)=>Math.abs(a-(low+high)/2)-Math.abs(b-(low+high)/2)).map(cut=>(cut-low)/(high-low)):[]
+      for (const fraction of [...holdingCuts, acquisition, .5, .38, .62]) {
       if (high - low < 11) continue
       const cut = low + (high - low) * fraction, normal = { x: -axis.y, y: axis.x }
       const point = (along: number, across: number): Point => ({ x: axis.x * along + normal.x * across, y: axis.y * along + normal.y * across })
@@ -354,16 +400,18 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     const world = (u: number, v: number): Point => ({ x: origin.x + tangent.x * u + normal.x * v, y: origin.y + tangent.y * u + normal.y * v })
     const us = cell.polygon.map(p => (p.x - origin.x) * tangent.x + (p.y - origin.y) * tangent.y), vs = cell.polygon.map(p => (p.x - origin.x) * normal.x + (p.y - origin.y) * normal.y)
     const stock = programme.stock, merged = stock === 'mixed' || stock === 'walkup', availableWidth = Math.max(...us) - Math.min(...us), sideParking = programme.parking && !merged && availableWidth >= 13.5
-    const desiredWidth = stock === 'compact' ? clamp(programme.frontage * 1.1, 7, 9) : stock === 'ordinary' ? clamp(programme.frontage - .9, 8, 10.8) : stock === 'garden' ? 10.5 : stock === 'walkup' ? 20 : 26
     const frontParking = programme.parking && !sideParking && Math.max(...vs) >= 15
-    const frontGap = stock === 'mixed' ? 1.3 : frontParking ? 5.7 : stock === 'walkup' ? 2.6 : 1.8
+    // The certified entrance strip has a1.1m end cap inside the title.
+    // Its clearance is part of site fitting, not an overlap to waive.
+    const frontGap = Math.max(1.25,programme.holding.frontGap,frontParking?5.7:0)
     // The programme reserves titled ground for its garden, service court or
     // surveyed parking bay. Roof depth follows that acquisition and usable
     // width, rather than every road getting the same12m-deep building band.
-    const roofBudget = regionArea(cell) * (stock === 'compact' ? .56 : stock === 'ordinary' ? .47 : stock === 'garden' ? .36 : stock === 'walkup' ? .48 : .58)
-    const desiredDepth = merged ? stock === 'walkup' ? 14 : 15.5 : clamp(roofBudget / Math.min(desiredWidth, availableWidth - (sideParking ? 4.2 : 1.3)), stock === 'compact' ? 8.5 : 9.5, stock === 'garden' ? 14 : 13)
+    const roofBudget = regionArea(cell) * programme.holding.coverage
+    const desiredWidth = clamp(Math.min(programme.frontage*programme.holding.widthRatio,Math.sqrt(roofBudget*programme.holding.aspect)),merged?10:4.8,merged?32:18)
+    const desiredDepth = clamp(roofBudget/Math.min(desiredWidth,availableWidth-(sideParking?4.2:1.3)),6,merged?24:20)
     const fullWidth = Math.min(desiredWidth, availableWidth - (sideParking ? 4.2 : merged ? 2.4 : 1.3)), fullDepth = Math.min(desiredDepth, Math.max(...vs) - frontGap - 1.1)
-    const align = sideParking ? -1.5 : 0
+    const align = (sideParking ? -1.5 : 0) + programme.holding.sideBias*Math.max(0,availableWidth-fullWidth-1.3)
     let acquiredAccess: { attachment: Point; access: Point[]; covered: boolean } | undefined
     for (const scale of [1, .9, .8, .7, .6]) for (const shift of [align, align - 1, align + 1]) {
       const width = fullWidth * scale, depth = fullDepth * scale
@@ -466,7 +514,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       }
       if (!cell.frontages.length) { metrics.frontageFailures++; open(cell, String(cellSerial), '実接道を確保できない街区内地'); continue }
       const front = cell.frontages[0]!, programme = titleProgramme(cell, original, plans), major = programme.stock === 'mixed', maximumArea = programme.maximumArea
-      if ((area > maximumArea || cell.holes?.length) && depth < 20 && processed++ < processingBudget) {
+      if ((area > maximumArea || programme.cuts.length || cell.holes?.length) && depth < 20 && processed++ < processingBudget) {
         const children = split(cell, programme)
         if (children) { for (const child of children) pending.push({ cell: child, original, plans, depth: depth + 1 }); continue }
       }
