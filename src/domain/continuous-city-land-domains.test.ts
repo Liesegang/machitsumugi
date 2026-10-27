@@ -118,4 +118,18 @@ describe('continuous city ownership domains beyond closed street faces', () => {
     expect(milliseconds).toBeLessThan(2000)
     console.info(`actual892-face ownership complement: ${milliseconds.toFixed(1)}ms; ${result.fringe.length} residual pieces`)
   }, 5000)
+
+  it('bounds the working union of the actual834 curved arterial faces while preserving their geometry and residual fill', () => {
+    const fixture = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/continuous-land-domains-arterial.json.gz', import.meta.url))).toString()) as { demandRegions: PolygonRegion[]; streetBlocks: ContinuousCityBlock[]; expectedFringe: PolygonRegion[] }
+    expect(fixture.streetBlocks).toHaveLength(834)
+    const before = JSON.stringify(fixture), started = performance.now(), result = buildContinuousCityLandDomains(fixture), milliseconds = performance.now() - started
+    expect(result.metrics.boundedDifferences).toBe(1)
+    expect(result.domains.slice(0, fixture.streetBlocks.length).every((block, i) => block === fixture.streetBlocks[i])).toBe(true)
+    expect(result.fringe).toHaveLength(fixture.expectedFringe.length)
+    expect(Math.abs(sum(result.fringe) - sum(fixture.expectedFringe))).toBeLessThan(.1)
+    const expectedAt = regionQuery(fixture.expectedFringe), actualAt = regionQuery(result.fringe)
+    for (let y = 7.13; y < 1600; y += 23.71) for (let x = 11.97; x < 2000; x += 23.71) expect(actualAt({ x, y })).toBe(expectedAt({ x, y }))
+    expect(JSON.stringify(fixture)).toBe(before)
+    expect(milliseconds).toBeLessThan(2000)
+  }, 5000)
 })

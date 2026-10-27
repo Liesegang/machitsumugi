@@ -13,6 +13,7 @@ import { alignmentDiagnostics, resampleAlignment } from './road-alignment'
 import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { regionQuery } from './region-query'
 import { indexedPolygonOverlap } from './indexed-polygon-overlap'
+import { continuousRoadEndcapsClear } from './continuous-road-endcaps'
 import { planModernTransport } from './modern-transport'
 import { layoutMainCivilGuides, surveyLayoutMainCivilCrossings } from './layout-first-main-civil-bridges'
 
@@ -22,6 +23,8 @@ export interface ContinuousRoadDiagnostics {
   coarseFaces: number; blocks: number; demandSamples: number; framedDemandSamples: number; demandCoverage: number
   coarseDemandCoverage?: number
   collectorReachability?: { samples: number; servedBefore: number; servedAfter: number; attempted: number; streets: number; maximumDryDistance: number }
+  arterialNetwork?: { samples: number; servedBefore: number; servedAfter: number; attempted: number; routes: number; addedLength: number; maximumDryDistance: number; links: { from: Point; to: Point; via: Point; width: number; year: number; length: number; ratio: number }[] }
+  regionalDistrictRoutes?: { attempted: number; routes: number; addedLength: number }
   unservedAccessIds: string[]; accessAttempts: { id: string; from: Point; endHeading?: number; found: boolean }[]
   modern: { requested: string[]; completed: string[]; unavailable: { kind: string; reason: string }[] }
   bridgeSpans: (SurveyedBridgeSpan & { roadId: string })[]
@@ -123,6 +126,7 @@ class ContinuousRoadDesign {
   private serial = 0
   private siteApproaches = new Map<string, SimulatedRoad>()
   private frontageObstacles: { bounds: ReturnType<typeof boundsOf>; overlaps: (polygon: Point[]) => boolean }[]
+  private endcapsClear: ReturnType<typeof continuousRoadEndcapsClear>
   private surfaceRail: RailwayRoadConstraints
   private railCells = new Map<string, { a: Point; b: Point }[]>()
   readonly input: ContinuousCityRoadInput
@@ -135,6 +139,7 @@ class ContinuousRoadDesign {
     this.environment = { ...base, exactLandCost: true, landCost: p => reserved(p) ? Infinity : base.landCost?.(p) ?? 0 }
     this.reserves = input.reservedRegions.map(region => ({ region, bounds: boundsOf(region.polygon) }))
     this.frontageObstacles = [...input.reservedRegions, ...base.areas.filter(area => area.kind === 'water')].map(region => ({ bounds: boundsOf(region.polygon), overlaps: indexedPolygonOverlap(region) }))
+    this.endcapsClear = continuousRoadEndcapsClear(base.areas.filter(area => area.kind === 'water'))
     this.surfaceRail = new RailwayRoadConstraints(input.railways)
     for (const railway of input.railways) if (railway.mode !== 'subway') for (let i = 1; i < railway.points.length; i++) {
       const a = railway.points[i - 1]!, b = railway.points[i]!
@@ -159,6 +164,7 @@ class ContinuousRoadDesign {
     return p.x < 0 || p.y < 0 || p.x > width || p.y > height ? terrain?.continuationTerrain?.elevation(p) ?? terrain?.elevation(p) ?? 0 : terrain?.elevation(p) ?? 0
   }
   private rowAllows(points: readonly Point[], width: number) {
+    if (!this.endcapsClear(points, width)) return false
     for (let i = 1; i < points.length; i++) {
       const a = points[i - 1]!, b = points[i]!, strip = corridorPolygon(a, b, width / 2 + .75), bounds = boundsOf(strip)
       if (this.reserves.some(item => overlaps(bounds, item.bounds) && polygonOverlapsRegion(strip, item.region))) return false
@@ -195,7 +201,8 @@ class ContinuousRoadDesign {
     const points = this.canonical(route, role === 'access')
     if (!points || !this.valid({ ...route, points }, width, role, outside)) { this.diagnostics.rejected++; return null }
     const nextId = this.serial + 1
-    const added = this.graph.add(points, { id: `continuous-road-${nextId}`, builtYear: year, role, width, kind: outside && (role === 'highway' || width >= 10) ? 'arterial' : 'local', phase: outside ? 'continuous-regional-trunk' : 'continuous-urban-fabric', reason, constructionCost: route.cost, ...(outside ? { boundaryContinuation: true, throughRouteId: `continuous-trunk-${nextId}` } : {}), ...(route.bridgeLength > 0 ? { bridge: true } : {}), ...(role === 'access' ? { preserveEndpoint: true } : {}) }, requireConnection, candidate => {
+    const arterial = role === 'highway' || role === 'collector' && width >= 8 || outside && width >= 10
+    const added = this.graph.add(points, { id: `continuous-road-${nextId}`, builtYear: year, role, width, kind: arterial ? 'arterial' : 'local', phase: outside ? 'continuous-regional-trunk' : 'continuous-urban-fabric', reason, constructionCost: route.cost, ...(outside ? { boundaryContinuation: true, throughRouteId: `continuous-trunk-${nextId}` } : {}), ...(route.bridgeLength > 0 ? { bridge: true } : {}), ...(role === 'access' ? { preserveEndpoint: true } : {}) }, requireConnection, candidate => {
       const normalized = candidate.points.map(point => ({ ...point }))
       if (parent && !partitionContinuousCityFace(parent, normalized)) {
         this.diagnostics.normalizationRejectedCuts++
@@ -206,10 +213,12 @@ class ContinuousRoadDesign {
       return (!serviceGuard || serviceGuard(normalized)) && (unchanged || this.valid({ ...route, points: normalized }, width, role, outside))
     })
     if (!added) { this.diagnostics.rejected++; return null }
-    if (added.id === `continuous-road-${nextId}`) this.serial = nextId
-    Object.assign(added, { surveyedBridgeSpans: route.surveyedBridgeSpans })
+    if (added.id === `continuous-road-${nextId}`) {
+      this.serial = nextId
+      Object.assign(added, { surveyedBridgeSpans: route.surveyedBridgeSpans })
+    }
     this.diagnostics.accepted++; this.diagnostics.streetLength += roadLength(added.points)
-    for (const span of route.surveyedBridgeSpans ?? []) this.diagnostics.bridgeSpans.push({ ...span, roadId: added.id })
+    for (const span of (added as CityRoad).surveyedBridgeSpans ?? []) this.diagnostics.bridgeSpans.push({ ...span, roadId: added.id })
     if (this.input.railways.some(railway => railway.points.slice(1).some((b, i) => route.points.slice(1).some((d, j) => hit(railway.points[i]!, b, route.points[j]!, d))))) this.syncRail()
     return added
   }
@@ -233,8 +242,8 @@ class ContinuousRoadDesign {
     const portals = sides.map(preferred => this.regional!.boundaryPortals(center, { width: 12, preferred, maxCandidates: 1 })[0])
     this.diagnostics.trunkSurveys.push({ stage: 'regional-portals', milliseconds: performance.now() - started, candidates: portals.filter(Boolean).length })
     const pairs = [[0, 1], [2, 3], [0, 2], [1, 2], [0, 3], [1, 3]].flatMap(([a, b]) => portals[a!] && portals[b!] ? [{ a: portals[a!]!, b: portals[b!]! }] : [])
-    let main: SimulatedRoad | null = null
-    for (const pair of pairs) {
+    let main: SimulatedRoad | null = this.graph.roads.find(road=>road.role==='highway'&&road.width>=8&&road.boundaryContinuation&&!road.controlledAccess&&(road.level??0)===0)??null
+    for (const pair of main?[]:pairs) {
       if (distance(pair.a, pair.b) < Math.min(width, height) * .6) continue
       // Civil bridge alternatives come from the actual road bearing; they are
       // engineering surveys, not an inherited city alignment or district map.
@@ -256,7 +265,7 @@ class ContinuousRoadDesign {
     }
     if (!main) return
     for (const portal of portals) {
-      if (!portal || main.points.some(point => distance(point, portal) < 100)) continue
+      if (!portal || this.graph.roads.some(road=>road.boundaryContinuation&&road.width>=8&&road.points.slice(1).some((b,i)=>distanceToSegment(portal,road.points[i]!,b)<100))) continue
       const anchor = this.publicProjections(center, 1650, 1)[0]
       if (!anchor) continue
       started = performance.now()
@@ -264,15 +273,18 @@ class ContinuousRoadDesign {
       for (const width of [11, 9]) {
         const route = this.regional.plan(portal, anchor.point, { role: 'collector', width, allowBridge: true, maximumGrade: .13, maxNodes: 3200 })
         this.diagnostics.trunkSurveys.push({ stage: 'regional-branch', milliseconds: performance.now() - started, from: portal, to: anchor.point, found: !!route })
-        if (this.accept(route, width, 'collector', 1650, '異なる区域外方向と都心を結ぶ地域幹線', true, false)) break
+        if (route && route.length <= distance(portal, anchor.point) * 1.65 && this.accept(route, width, 'collector', 1650, '異なる区域外方向と都心を結ぶ地域幹線', true, false, undefined, points => roadLength(points) <= distance(points[0]!, points.at(-1)!) * 1.65)) break
       }
     }
   }
   /** Each short connection is independent. A wet failed link cannot veto all
    * the other dry district boundaries in a many-kilometre enclosing loop. */
   private sharedCollector(from: Point, to: Point, year: number, reason: string, width = 6.6) {
+    return this.accept(this.surveyCollector(from,to,width),width,'collector',year,reason)
+  }
+  private surveyCollector(from: Point, to: Point, width: number): PlannedRoute | null {
     const role = 'collector' as const, direct = this.planner.cost([from, to], role)
-    if (this.valid(direct, width, role)) return this.accept(direct, width, role, year, reason)
+    if (this.valid(direct, width, role)) return direct
     const points = resampleAlignment([from, to], 12)
     if (points.some(point => this.environment.terrain?.seaAt?.(point))) return null
     let route: PlannedRoute | null = null
@@ -286,12 +298,146 @@ class ContinuousRoadDesign {
       if (pairs.length) route = routeAcrossBridges({ start: from, goal: to, pairs, role, width, lowerBound: (a, b) => distance(a, b) * roadConstructionFactor(role), cost: path => this.planner.cost(path, role, true), dry: (a, b, startHeading, endHeading) => this.planner.plan(a, b, { role, width, alignment: 'planned', allowBridge: false, maximumGrade: .13, maxNodes: 650, startHeading, endHeading }) })
     } else route = this.planner.plan(from, to, { role, width, allowBridge: false, alignment: 'planned', maximumGrade: .13, maxNodes: 650 })
     if (!route || route.length > distance(from, to) * 1.7) { this.diagnostics.sharedExpansion.routeFailures++; return null }
-    return this.accept(route, width, role, year, reason)
+    return route
   }
   private fieldSamples() {
     const { width, height } = this.environment, step = Math.max(120, Math.sqrt(width * height / 1600)), result: Point[] = []
     for (let y = step / 2; y < height; y += step) for (let x = step / 2; x < width; x += step) { const point = { x, y }; if (this.input.demand.at(point) > 0 && !this.planner.waterAt(point) && (this.environment.terrain?.slope(point) ?? 0) <= .13 && Number.isFinite(this.environment.landCost?.(point) ?? 0)) result.push(point) }
     return result
+  }
+  /** A large urban basin needs regional outlets away from the original
+   * centre crossing too. Survey the real terrain beyond the crop; never
+   * terminate a new major corridor at the edge or invent outside elevations. */
+  private regionalDistrictStreets(samples: Point[]) {
+    const { config, demand } = this.input, regional = this.regional
+    const budget = Math.min(config.settlement === 'metropolis' ? 5 : 3, Math.floor(demand.metrics.selectedUrbanArea / 12_000_000))
+    if (!regional || !config.arterial || !budget || config.settlement === 'village' || config.settlement === 'rural-town') return
+    const width = config.settlement === 'metropolis' ? 10.2 : 9
+    const major = () => this.graph.roads.filter(road => road.width >= 8 && !road.controlledAccess && (road.level ?? 0) === 0 && !['access', 'farm', 'ramp'].includes(road.role))
+    const project = (point: Point) => {
+      let best: { point: Point; road: SimulatedRoad; distance: number } | undefined
+      for (const road of major()) for (let i = 1; i < road.points.length; i++) {
+        const q = projectOnRoadSegment(point, road.points[i - 1]!, road.points[i]!).point, depth = distance(point, q)
+        if (!best || depth < best.distance) best = { point: q, road, distance: depth }
+      }
+      return best
+    }
+    const metrics = { attempted: 0, routes: 0, addedLength: 0 }, tried: Point[] = []
+    this.diagnostics.regionalDistrictRoutes = metrics
+    for (let attempt = 0; attempt < budget * 3 && metrics.routes < budget; attempt++) {
+      const candidates = samples.filter(point => demand.at(point) >= .3 && !tried.some(old => distance(old, point) < 650)).map(point => ({ point, anchor: project(point) })).filter(item => item.anchor && item.anchor.distance > 850)
+      candidates.sort((a, b) => b.anchor!.distance * (.5 + demand.at(b.point)) - a.anchor!.distance * (.5 + demand.at(a.point)))
+      const candidate = candidates[0]
+      if (!candidate) break
+      const goal = candidate.point, anchor = candidate.anchor!
+      tried.push(goal)
+      const direction = { x: goal.x - anchor.point.x, y: goal.y - anchor.point.y }
+      for (const portal of regional.boundaryPortals(goal, { width, direction, maxCandidates: 2 })) {
+        if (distance(portal, goal) < 200 || distance(portal, anchor.point) < 1400) continue
+        metrics.attempted++
+        const started = performance.now(), route = regional.plan(anchor.point, portal, { role: 'collector', width, allowBridge: true, through: goal, alignment: 'planned', maximumGrade: .09, maxNodes: 4200, avoidRepeatedRiverCrossings: true })
+        this.diagnostics.trunkSurveys.push({ stage: 'district-regional-alignment', milliseconds: performance.now() - started, from: anchor.point, to: portal, found: !!route })
+        if (!route || route.length > distance(anchor.point, portal) * 1.65 || !continuousCityRoadGradeAllowed(route, .09, this.elevation)) continue
+        const year = Math.max(1955, anchor.road.builtYear, ...resampleAlignment(route.points, 120).filter(point => demand.at(point) > 0).map(point => demand.openingAt(point)))
+        if (!Number.isFinite(year) || year > 2025) continue
+        const spans = route.surveyedBridgeSpans ?? []
+        const accepted = this.accept(route, width, 'collector', year, '都心の一本へ集中させず、発展した地区から区域外へ続く地域幹線', true, true, undefined, points => {
+          const first = points[0]!, last = points.at(-1)!, { width: mapWidth, height } = this.environment
+          return anchor.road.points.slice(1).some((b, i) => distanceToSegment(first, anchor.road.points[i]!, b) < EPS)
+            && (last.x < 0 || last.y < 0 || last.x > mapWidth || last.y > height)
+            && roadLength(points) <= distance(first, last) * 1.65
+            && continuousCityRoadGradeAllowed({ points, surveyedBridgeSpans: spans }, .09, this.elevation)
+            && spans.every(span => [span.bankA, span.bankB].every(bank => points.slice(1).some((b, i) => distanceToSegment(bank, points[i]!, b) < EPS)))
+        })
+        if (!accepted) continue
+        metrics.routes++; metrics.addedLength += roadLength(accepted.points)
+        break
+      }
+    }
+  }
+  /** Urban through routes are acquired before local frontage streets. A dry
+   * catchment gap chooses a district to serve, not a rectangular street face;
+   * both ends must join the already acquired major network. */
+  private arterialStreets(samples: Point[]) {
+    const {config,demand}=this.input,{width:mapWidth,height}=this.environment
+    if(!config.arterial||config.settlement==='village'||config.settlement==='rural-town'||demand.metrics.selectedUrbanArea<1_500_000)return
+    const major=(road:SimulatedRoad)=>road.width>=8&&!road.controlledAccess&&(road.level??0)===0&&!['access','farm','ramp'].includes(road.role)
+    if(!this.graph.roads.some(major))return
+    const width=config.settlement==='metropolis'?10.2:9,budget=Math.min(36,Math.max(2,Math.ceil(demand.metrics.selectedUrbanArea/(config.settlement==='metropolis'?1_300_000:2_000_000))))
+    type Anchor={point:Point;road:SimulatedRoad;a:Point;b:Point;distance:number}
+    const nearest=(point:Point,points:readonly Point[])=>{let depth=Infinity,contact=points[0]!;for(let i=1;i<points.length;i++){const q=projectOnRoadSegment(point,points[i-1]!,points[i]!).point,d=distance(point,q);if(d<depth){depth=d;contact=q}}return {depth,contact}}
+    const cells=samples.filter(point=>demand.at(point)>=.25).map(point=>({point,target:config.settlement==='metropolis'?360+(1-demand.at(point))*140:460+(1-demand.at(point))*160,distance:Infinity,rawDistance:Infinity,tried:false}))
+    const update=(roads:readonly SimulatedRoad[])=>{for(const cell of cells){if(cell.distance<=cell.target)continue;for(const road of roads){const hit=nearest(cell.point,road.points);cell.rawDistance=Math.min(cell.rawDistance,hit.depth);if(hit.depth<cell.distance&&this.dryAccessClear(cell.point,hit.contact))cell.distance=hit.depth}}}
+    update(this.graph.roads.filter(major))
+    const metrics={samples:cells.length,servedBefore:cells.filter(cell=>cell.distance<=cell.target).length,servedAfter:0,attempted:0,routes:0,addedLength:0,maximumDryDistance:0,links:[] as NonNullable<ContinuousRoadDiagnostics['arterialNetwork']>['links']}
+    this.diagnostics.arterialNetwork=metrics
+    const anchors=(goal:Point)=>{
+      const candidates:Anchor[]=[]
+      for(const road of this.graph.roads.filter(major)){
+        let best=Infinity,chainage=0,at=0
+        for(let i=1;i<road.points.length;i++){const a=road.points[i-1]!,b=road.points[i]!,q=projectOnRoadSegment(goal,a,b).point,d=distance(goal,q);if(d<best){best=d;at=chainage+distance(a,q)}chainage+=distance(a,b)}
+        const reach=Math.max(650,Math.min(2400,best*1.5))
+        for(const offset of [0,-reach,reach]){
+          const point=pointAlong(road.points,at+offset)
+          if(point.x<0||point.y<0||point.x>mapWidth||point.y>height||!this.planner.suitable(point,width))continue
+          const i=road.points.findIndex((a,index)=>index+1<road.points.length&&distanceToSegment(point,a,road.points[index+1]!)<EPS)
+          if(i>=0)candidates.push({point,road,a:road.points[i]!,b:road.points[i+1]!,distance:distance(point,goal)})
+        }
+      }
+      candidates.sort((a,b)=>a.distance-b.distance)
+      const selected:Anchor[]=[],sectors=new Map<number,number>()
+      for(const candidate of candidates){const sector=Math.floor((heading(goal,candidate.point)+Math.PI)/(Math.PI/4));if((sectors.get(sector)??0)>=2||selected.some(other=>distance(other.point,candidate.point)<180))continue;selected.push(candidate);sectors.set(sector,(sectors.get(sector)??0)+1);if(selected.length>=12)break}
+      return selected
+    }
+    const gain=(points:readonly Point[])=>cells.filter(cell=>cell.distance>cell.target&&(()=>{const hit=nearest(cell.point,points);return hit.depth<=cell.target&&this.dryAccessClear(cell.point,hit.contact)})())
+    const step=Math.max(120,Math.sqrt(mapWidth*height/1600)),maximumLength=Math.max(2400,Math.min(8000,Math.sqrt(demand.metrics.selectedUrbanArea)*1.3))
+    const bankOnPath=(points:readonly Point[],spans:readonly SurveyedBridgeSpan[])=>spans.every(span=>[span.bankA,span.bankB].every(bank=>points.slice(1).some((b,i)=>distanceToSegment(bank,points[i]!,b)<EPS)))
+    for(let attempt=0;attempt<budget*3&&metrics.routes<budget;attempt++){
+      const cell=cells.filter(cell=>!cell.tried&&cell.distance>cell.target).sort((a,b)=>Math.min(1800,b.distance)*(1+demand.at(b.point))-Math.min(1800,a.distance)*(1+demand.at(a.point)))[0]
+      if(!cell)break
+      cell.tried=true;metrics.attempted++
+      const cluster=cells.filter(other=>other.distance>other.target&&distance(other.point,cell.point)<300),weight=cluster.reduce((sum,other)=>sum+.5+demand.at(other.point),0)
+      const centroid=cluster.reduce((sum,other)=>({x:sum.x+other.point.x*(.5+demand.at(other.point))/weight,y:sum.y+other.point.y*(.5+demand.at(other.point))/weight}),{x:0,y:0})
+      const goal=weight&&demand.at(centroid)>0&&this.planner.suitable(centroid,width)?centroid:cell.point
+      if(!this.planner.suitable(goal,width))continue
+      const contacts=anchors(goal),pairs:{a:Anchor;b:Anchor;length:number}[]=[]
+      for(let i=0;i<contacts.length;i++)for(let j=i+1;j<contacts.length;j++){
+        const a=contacts[i]!,b=contacts[j]!,direct=distance(a.point,b.point),length=a.distance+b.distance
+        if(direct<600||length>maximumLength||length/direct>1.65||Math.abs(angleDifference(heading(goal,a.point),heading(goal,b.point)))<Math.PI/3)continue
+        pairs.push({a,b,length})
+      }
+      pairs.sort((a,b)=>a.length-b.length)
+      let acquired=false
+      for(const {a,b}of pairs.slice(0,4)){
+        const direct=distance(a.point,b.point),curve=roundedStreet([a.point,goal,b.point],120,.42)
+        let route:PlannedRoute|null=this.planner.cost(curve,'collector')
+        if(!this.valid(route,width,'collector')||!continuousCityRoadGradeAllowed(route,.09,this.elevation)){
+          // Search legs without acquiring either of them. A failed second
+          // survey must not leave an arterial stub at the first district.
+          const first=this.surveyCollector(a.point,goal,width),last=first&&this.surveyCollector(goal,b.point,width)
+          if(!first||!last)continue
+          const turn=roundedStreet([first.points.at(-2)!,goal,last.points[1]!],120,.42),points=[...first.points.slice(0,-2),...turn,...last.points.slice(2)]
+          route={...first,points,length:roadLength(points),cost:first.cost+last.cost,bridgeLength:first.bridgeLength+last.bridgeLength,surveyedBridgeSpans:[...first.surveyedBridgeSpans??[],...last.surveyedBridgeSpans??[]]}
+        }
+        const spans=route.surveyedBridgeSpans??[]
+        if(route.length/direct>1.65||!bankOnPath(route.points,spans)||!continuousCityRoadGradeAllowed(route,.09,this.elevation))continue
+        const year=Math.max(1955,a.road.builtYear,b.road.builtYear,...resampleAlignment(route.points,120).filter(point=>demand.at(point)>0).map(point=>demand.openingAt(point)))
+        if(!Number.isFinite(year)||year>2025)continue
+        let gained:typeof cells=[]
+        const accepted=this.accept(route,width,'collector',year,'市街地の通過交通を受け持ち、既存の幹線どうしを結ぶ地区幹線',false,true,undefined,points=>{
+          const endpoints=[[points[0]!,a],[points.at(-1)!,b]] as const
+          if(endpoints.some(([point,anchor])=>distanceToSegment(point,anchor.a,anchor.b)>EPS)||roadLength(points)/direct>1.65||!bankOnPath(points,spans)||!continuousCityRoadGradeAllowed({points,surveyedBridgeSpans:spans},.09,this.elevation))return false
+          gained=gain(points)
+          return gained.length>=2&&gained.length*step*step>=roadLength(points)*150
+        })
+        if(!accepted)continue
+        metrics.routes++;metrics.addedLength+=roadLength(accepted.points);metrics.links.push({from:{...accepted.points[0]!},to:{...accepted.points.at(-1)!},via:goal,width,year,length:roadLength(accepted.points),ratio:roadLength(accepted.points)/direct})
+        update([accepted]);acquired=true;break
+      }
+      if(!acquired)for(const other of cluster)other.tried=true
+    }
+    metrics.servedAfter=cells.filter(cell=>cell.distance<=cell.target).length
+    for(const cell of cells)if(Number.isFinite(cell.distance))metrics.maximumDryDistance=Math.max(metrics.maximumDryDistance,cell.distance)
   }
   /** A sparse collector frontier supplies the dry hinterland of real regional
    * streets. Closed faces are an observation, never a reason to draw a loop. */
@@ -390,7 +536,9 @@ class ContinuousRoadDesign {
     return false
   }
   private secondaryStreets() {
-    const stations = [...this.siteApproaches].filter(([id, road]) => id.startsWith('station') && roadLength(road.points) > 170).map(([id, road]) => ({ id, point: pointAlong(road.points, roadLength(road.points) - 100), year: road.builtYear })).sort((a, b) => a.point.x - b.point.x)
+    // Station gates acquired before this stage still count as destinations
+    // when they need no newly grown approach spur.
+    const stations = (this.input.accessTargets??[]).filter(target=>target.id.startsWith('station-access-')).map(target=>{const approach=this.siteApproaches.get(target.id);return {id:target.id,point:approach&&roadLength(approach.points)>170?pointAlong(approach.points,roadLength(approach.points)-100):target.point,year:target.builtYear,order:Number(target.id.match(/\d+$/)?.[0]??0)}}).sort((a,b)=>a.year-b.year||a.order-b.order)
     for (let i = 1; i < stations.length; i++) { const a = stations[i - 1]!, b = stations[i]!; if (distance(a.point, b.point) <= 3500) this.sharedCollector(a.point, b.point, Math.max(a.year, b.year), '取得済みの駅前市街地どうしを結ぶ二次幹線', 10.2) }
     const port = [...this.siteApproaches].find(([id, road]) => id.includes('port') && roadLength(road.points) > 170)
     if (port && stations.length) {
@@ -428,7 +576,7 @@ class ContinuousRoadDesign {
    * dry component returns to two ACTUAL public perimeter contacts on its own
    * side. It need not make an impossible full-width river/railway chord. */
   private componentService(polygon: Point[], opening: number): Point[][] | null {
-    const components = this.dryComponents(polygon).sort((a, b) => regionArea(b) - regionArea(a)), width = 6, role = 'lane' as const
+    const components = this.dryComponents(polygon).sort((a, b) => regionArea(b) - regionArea(a)), width = 6.6, role = 'collector' as const
     for (const component of components) {
       if (regionArea(component) < 18000) continue
       const contacts: { point: Point; normal: Point; year: number; run: number }[] = []
@@ -610,14 +758,16 @@ class ContinuousRoadDesign {
     metrics.servedAfter = cells.filter(cell => cell.served).length; metrics.unservedAreaEstimate = (metrics.dryCells - metrics.servedAfter) * cellSize * cellSize
     this.diagnostics.localNetwork = metrics
   }
-  build(localOnly = false) {
-    if (!localOnly && !this.graph.roads.some(road => road.width >= 8)) this.trunks()
+  build(localOnly = false, frameOnly = false) {
+    const majorRoads=this.graph.roads.filter(road=>road.width>=8&&!road.controlledAccess&&(road.level??0)===0),outsideSides=new Set<string>()
+    for(const road of majorRoads.filter(road=>road.boundaryContinuation))for(const point of [road.points[0]!,road.points.at(-1)!]){if(point.x<0)outsideSides.add('west');if(point.x>this.environment.width)outsideSides.add('east');if(point.y<0)outsideSides.add('north');if(point.y>this.environment.height)outsideSides.add('south')}
+    if (!localOnly && (!majorRoads.length||this.regional&&outsideSides.size<3)) this.trunks()
     let started = performance.now()
     if (!localOnly) { for (const target of this.input.accessTargets ?? []) if (!this.gate(target)) this.diagnostics.unservedAccessIds.push(target.id); this.secondaryStreets() }
     this.diagnostics.phaseMilliseconds.openingAccess = performance.now() - started
     const samples = this.fieldSamples()
     started = performance.now()
-    if (!localOnly) { this.input.onProgress?.('広域幹線から乾地の集散路到達不足へ地区道を延伸中…'); this.growCollectors(samples); this.modern() }
+    if (!localOnly) { this.input.onProgress?.('発展した地区から区域外へ続く幹線を測量中…'); this.regionalDistrictStreets(samples); this.input.onProgress?.('市街地の幹線到達不足へ、幹線間の横連絡を測量中…');this.arterialStreets(samples);this.input.onProgress?.('広域幹線から乾地の集散路到達不足へ地区道を延伸中…'); this.growCollectors(samples); this.modern() }
     this.diagnostics.phaseMilliseconds.frame = performance.now() - started
     const coarse = extractStreetBlocks(this.graph.roads)
     this.diagnostics.coarseFaces = coarse.length; this.diagnostics.demandSamples = samples.length
@@ -627,6 +777,7 @@ class ContinuousRoadDesign {
     // A few actual dry-component return streets supply large enclosed voids;
     // no child-face queue follows them and their shape is never a tiling rule.
     for (const polygon of coarse) if (polygonArea(polygon) > 250000 && samples.some(point => pointInPolygon(point, polygon) && !this.graph.nearest(point, 180))) this.componentService(polygon, this.input.demand.openingAt(centerOf(polygon)))
+    if(frameOnly)return this.result()
     this.input.onProgress?.('実frontageから未接道の乾地へ短い生活街路を一本ずつ測量中…')
     started = performance.now(); this.growLocalNetwork(); this.diagnostics.phaseMilliseconds.localNetwork = performance.now() - started
     const retry = new Set(this.diagnostics.unservedAccessIds); this.diagnostics.unservedAccessIds = []
@@ -653,6 +804,8 @@ class ContinuousRoadDesign {
 
 export function surveyContinuousCityTrunks(input: ContinuousCityRoadInput) { const design = new ContinuousRoadDesign({ ...input, initialRoads: [] }); design.trunks(); const { roads, diagnostics } = design.result(); return { roads, diagnostics } }
 export function buildContinuousCityRoads(input: ContinuousCityRoadInput) { return new ContinuousRoadDesign(input).build() }
+/** The same acquisition stages used by the city generator, before local infill. */
+export function surveyContinuousCityRoadFrame(input:ContinuousCityRoadInput){return new ContinuousRoadDesign(input).build(false,true)}
 /** Local survey over already materialized roads from this generation. Also
  * allows a recorded failed face to be reproduced without rerunning terrain,
  * external main-road search, railway acquisition or the rest of the city. */

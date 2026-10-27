@@ -27,7 +27,10 @@ export function buildContinuousCityLandDomains({ demandRegions, streetBlocks }: 
     // exclusion set first, rather than passing every shared edge through the
     // difference as another touching hole. This changes no original face/ref
     // and introduces no processing boundary in the ownership complement.
-    const obstacles = large ? dissolveContinuousCover(nearby.map(cut => cut.block)) : nearby.map(cut => cut.block)
+    // Curved shared faces can send a near-touching 12k-vertex union through a
+    // very expensive integer fallback. Smaller working batches retain the
+    // same survey precision and balanced merge without touching source faces.
+    const obstacles = large ? dissolveContinuousCover(nearby.map(cut => cut.block), { batchVertices: 3000 }) : nearby.map(cut => cut.block)
     return large ? subtractContinuousCover(region, obstacles) : subtractRegions(region, obstacles)
   })
   // Keep disconnected ownership components together; no processing grid or

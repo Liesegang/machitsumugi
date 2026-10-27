@@ -182,8 +182,9 @@ export function partitionContinuousCover(parts: readonly PolygonRegion[]): Polyg
 /** Spatial components avoid repeatedly unioning unrelated blocks. Connected
  * inputs enter bounded-vertex batches and a balanced merge tree, rather than
  * one unbounded floating event queue or a quadratic growing accumulator. */
-export function dissolveContinuousCover(parts: readonly PolygonRegion[]): PolygonRegion[] {
+export function dissolveContinuousCover(parts: readonly PolygonRegion[], options: { batchVertices?: number } = {}): PolygonRegion[] {
   if (parts.length < 2) return parts.flatMap(portableCoverRegions)
+  const batchVertices = Math.max(3, Math.min(12000, Math.floor(options.batchVertices ?? 12000)))
   const cell = 900, bins = new Map<string, number[]>(), parents = parts.map((_, i) => i)
   const bounds = parts.map(p => { const b = boundsOf(p.polygon); return { minX: b.minX - .00001, minY: b.minY - .00001, maxX: b.maxX + .00001, maxY: b.maxY + .00001 } })
   const root = (i: number): number => { while (parents[i] !== i) { parents[i] = parents[parents[i]!]!; i = parents[i]! } return i }
@@ -205,7 +206,7 @@ export function dissolveContinuousCover(parts: readonly PolygonRegion[]): Polygo
     let groups: PolygonRegion[][] = [], batch: PolygonRegion[] = [], vertices = 0
     for (const i of indices) {
       const part = parts[i]!, count = part.polygon.length + (part.holes ?? []).reduce((n, h) => n + h.length, 0)
-      if (batch.length && vertices + count > 12000) { groups.push(joinCoverParts(batch)); batch = []; vertices = 0 }
+      if (batch.length && vertices + count > batchVertices) { groups.push(joinCoverParts(batch)); batch = []; vertices = 0 }
       batch.push(part); vertices += count
     }
     if (batch.length) groups.push(joinCoverParts(batch))
