@@ -6,6 +6,7 @@ import { corridorPolygon, distance, distanceToSegment, pointInRegion, polygonOve
 import { planRailway } from './railway-planner'
 import type { RailwayPlan } from './railway-planner'
 import { stationFootprint } from './station-footprint'
+import { projectOnRoadSegment } from './road-graph'
 
 type RailTerrain = Pick<TerrainModel, 'areas' | 'elevation' | 'slope' | 'waterAt'> & Partial<Pick<TerrainModel, 'channelAt'>>
 export interface LayoutFirstRailInput {
@@ -49,6 +50,63 @@ interface StationCandidate {
 }
 const MINIMUM_SPACING = 650
 const nearestDistance = (point: Point, points: Point[]) => Math.min(...points.slice(1).map((b, i) => distanceToSegment(point, points[i]!, b)))
+
+export interface StationAccessRepairReport { accessId: string; candidates: number; attempted: number; adopted?: Point; reason?: string }
+const stationAccessRepairs=new WeakMap<LayoutFirstRailResult,StationAccessRepairReport>()
+export const stationAccessRepairReport=(result:LayoutFirstRailResult)=>stationAccessRepairs.get(result)
+
+/** Reacquire one station on its existing regional line before household land
+ * is allocated. Other stations, names, dates and the railway alignment survive.
+ * The caller must certify an actual public approach before a site is adopted. */
+export function resurveyLayoutFirstStation(input:LayoutFirstRailInput,previous:LayoutFirstRailResult,accessId:string,certify:(candidate:LayoutFirstRailResult)=>boolean):LayoutFirstRailResult {
+  const report:StationAccessRepairReport={accessId,candidates:0,attempted:0},index=Number(/^station-access-(\d+)$/.exec(accessId)?.[1]??-1),old=previous.stations[index]
+  const fail=(reason:string)=>{report.reason=reason;stationAccessRepairs.set(previous,report);return previous}
+  if(!old)return fail('station-not-found')
+  const railway=previous.railways.find(line=>line.id===old.railwayId&&line.mode!=='subway')
+  if(!railway||railway.points.length<2)return fail('existing-line-not-found')
+  const chain=[0];for(let i=1;i<railway.points.length;i++)chain.push(chain[i-1]!+distance(railway.points[i-1]!,railway.points[i]!))
+  const along=(p:Point)=>{
+    let nearest=Infinity,at=0
+    for(let i=1;i<railway.points.length;i++){const hit=projectOnRoadSegment(p,railway.points[i-1]!,railway.points[i]!),d=distance(p,hit.point);if(d<nearest){nearest=d;at=chain[i-1]!+distance(railway.points[i-1]!,hit.point)}}
+    return at
+  }
+  const origin=along(old.point),otherStations=previous.stations.filter((_,i)=>i!==index).map(station=>along(station.point)),ownGround=(id:string)=>id===`station-forecourt-${index}`||id===`station-trackground-${index}`
+  const remainingGrounds=previous.stationGrounds.filter(area=>!ownGround(area.id)),reserves=[...input.reserves,...remainingGrounds]
+  const roads=(input.roads??[]).filter(road=>road.id!==accessId),main=old.name===`${input.config.name.replace(/[市町村]$/,'')}駅`
+  const bounded=(p:Point)=>p.x>=4&&p.y>=4&&p.x<=input.width-4&&p.y<=input.height-4
+  const waters=input.terrain.areas.filter(area=>area.kind==='water'),candidates:{along:number;score:number;footprint:NonNullable<ReturnType<typeof stationFootprint>>}[]=[]
+  for(const offset of [0,-80,80,-160,160,-280,280,-420,420]){
+    const at=origin+offset
+    if(at<160||at>chain.at(-1)!-160||otherStations.some(other=>Math.abs(other-at)<MINIMUM_SPACING))continue
+    for(const side of [-1,1]){
+      const footprint=stationFootprint({points:railway.points,chain,along:at,side,config:input.config,main})
+      if(!footprint)continue
+      const {building,forecourt,gate,publicGatePad,platforms,trackGround,entrance,gateDistance}=footprint,acquired=[forecourt,publicGatePad,trackGround]
+      const samples=[...acquired.flat(),...building,...platforms.flat(),gate,entrance]
+      if(acquired.some(polygon=>reserves.some(region=>polygonOverlapsRegion(polygon,region)))||samples.some(p=>!bounded(p)||input.terrain.waterAt(p)||input.terrain.slope(p)>.12)||waters.some(water=>acquired.some(polygon=>polygonOverlapsRegion(polygon,water))))continue
+      if(roads.some(road=>road.points.slice(1).some((b,i)=>acquired.some(polygon=>polygonOverlapsRegion(polygon,{polygon:corridorPolygon(road.points[i]!,b,road.width/2+.5)})))))continue
+      const levels=samples.map(input.terrain.elevation)
+      if(!levels.every(Number.isFinite)||Math.max(...levels)-Math.min(...levels)>2)continue
+      let segment=0;while(segment+1<chain.length&&chain[segment+1]!<at)segment++
+      const fraction=(at-chain[segment]!)/(chain[segment+1]!-chain[segment]!),level=railway.elevations?railway.elevations[segment]!+(railway.elevations[segment+1]!-railway.elevations[segment]!)*fraction:input.terrain.elevation(old.point)
+      if(!Number.isFinite(level)||Math.abs(level-input.terrain.elevation(footprint.point))>2.5)continue
+      if(forecourt.some(p=>nearestDistance(p,railway.points)<8.5)||polygonOverlapsRegion(forecourt,{polygon:trackGround}))continue
+      const outward={x:(gate.x-footprint.point.x)/gateDistance,y:(gate.y-footprint.point.y)/gateDistance}
+      if(!surveyLayoutStationApproaches({gate,outward,railPoints:railway.points,terrain:input.terrain,reserves,width:input.width,height:input.height}).length)continue
+      const oldRoads=roads.filter(road=>(road.builtYear??1650)<=(old.builtYear??1900)&&!road.controlledAccess&&road.role!=='farm'&&(road.level??0)===0),roadDistance=oldRoads.length?Math.min(...oldRoads.map(road=>nearestDistance(gate,road.points))):Infinity
+      candidates.push({along:at,score:Math.abs(offset)*.3+roadDistance,footprint})
+    }
+  }
+  report.candidates=candidates.length
+  for(const {footprint} of candidates.sort((a,b)=>a.score-b.score||a.along-b.along).slice(0,6)){
+    report.attempted++
+    const {point,entrance,building,platforms,forecourt,trackGround,gate}=footprint
+    const candidate:LayoutFirstRailResult={...previous,stations:previous.stations.map((station,i)=>i===index?{...station,point,entrance,buildingPolygon:building,platformPolygons:platforms}:station),stationGrounds:[...remainingGrounds,{id:`station-forecourt-${index}`,kind:'field',landUse:'vacant',polygon:forecourt,name:`${old.name}前広場`},{id:`station-trackground-${index}`,kind:'field',landUse:'vacant',polygon:trackGround}],accessTargets:previous.accessTargets.map(target=>target.id===accessId?{...target,point:gate,endHeading:Math.atan2(entrance.y-gate.y,entrance.x-gate.x)}:target),stationPaths:previous.stationPaths.map(road=>road.id===accessId?{...road,points:[gate,entrance]}:road)}
+    if(!certify(candidate))continue
+    report.adopted=point;stationAccessRepairs.set(candidate,report);return candidate
+  }
+  return fail('no-surveyed-site-with-dated-public-approach')
+}
 
 /** A dry platform/forecourt pad is insufficient when a parallel creek traps
  * the public gate against its own railway. Survey complete street-width exits

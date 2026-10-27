@@ -64,6 +64,22 @@ describe('continuous city residual cover', () => {
     expect(result.some(a => a.landUse === 'meadow' && pointInRegion({ x: 450, y: 220 }, a))).toBe(true)
     expect(result.some(a => a.kind === 'field' && pointInRegion({ x: 450, y: 220 }, a))).toBe(false)
   })
+  it('surveys real frontage on two roads when every500m site sample falls in the neighbouring urban band', () => {
+    const support = [{ polygon: rectangle(0, 0, 800, 250) }, { polygon: rectangle(0, 350, 800, 250) }], roads: Road[] = [
+      { id: 'west-public', kind: 'local', width: 6, points: [{ x: 200, y: 0 }, { x: 200, y: 600 }] },
+      { id: 'east-public', kind: 'local', width: 6, points: [{ x: 600, y: 0 }, { x: 600, y: 600 }] },
+    ]
+    const before = JSON.stringify({ support, roads }), result = run({ roads, demand: demand(support) }), farms = result.filter(a => a.kind === 'field')
+    expect(sum(farms)).toBeGreaterThan(50000)
+    expect(farms.some(farm => pointInRegion({ x: 400, y: 300 }, farm))).toBe(true)
+    expect(farms.every(farm => farm.polygon.length === 4)).toBe(true)
+    for (const farm of farms) for (const road of roads) for (const pavement of continuousRoadGround(road)) expect(overlap(farm, pavement)).toBeLessThan(.001)
+    expect(JSON.stringify({ support, roads })).toBe(before)
+    expect(sum(result)).toBeCloseTo(sum(subtractRegions({ polygon: rectangle(0, 0, 800, 600) }, roads.flatMap(continuousRoadGround))), 2)
+    const infertile = run({ roads, demand: demand(support), terrain: { areas: [], elevation: () => 20, slope: () => 0, waterAt: () => false, cultivable: () => false } })
+    expect(infertile.some(a => a.kind === 'field')).toBe(false)
+    expect(infertile.some(a => a.landUse === 'meadow' && pointInRegion({ x: 400, y: 300 }, a))).toBe(true)
+  })
   it('labels missing urban development as vacant and only makes bounded actual-block park pockets', () => {
     const support = { polygon: rectangle(0, 0, 800, 600) }
     const result = run({ demand: demand([support]), parcels: [parcel], urbanBlocks: [support] })
@@ -73,6 +89,21 @@ describe('continuous city residual cover', () => {
     const small = run({ demand: demand([pocket]), urbanBlocks: [pocket], roads: [road] })
     expect(small.some(a => a.kind === 'park' && a.landUse === undefined && regionArea(a) <= 1600)).toBe(true)
     expect(small.filter(a => a.kind !== 'water').every(a => a.name === undefined)).toBe(true)
+  })
+  it('regenerates budgeted woodland on uncleared low terraces without occupying clearing, wet meadow or acquired ground', () => {
+    const water: Area = { id: 'wet-pond', kind: 'water', polygon: rectangle(350, 200, 100, 200) }, road: Road = { id: 'cleared-road', kind: 'local', width: 6, points: [{ x: 0, y: 80 }, { x: 800, y: 80 }] }, reserve = { polygon: rectangle(250, 300, 40, 70) }
+    const terrain = { areas: [water], elevation: p => 20 + p.x * .015, slope: p => .005 + p.x / 800 * .035, wetness: p => p.x > 650 ? .85 : .1 + p.y / 600 * .35, waterAt: p => pointInRegion(p, water), cultivable: () => false } satisfies ContinuousCityCoverInput['terrain']
+    const input = { config: { ...config, forest: 30 }, terrain, roads: [road], parcels: [parcel], reserves: [reserve] }, before = JSON.stringify(input), result = run(input), woodland = result.filter(area => area.landUse === 'woodland')
+    expect(sum(woodland)).toBeGreaterThan(40000)
+    expect(sum(woodland)).toBeLessThanOrEqual((480000 - regionArea(water)) * .3)
+    expect(result.some(area => area.landUse === 'meadow' && pointInRegion({ x: 730, y: 400 }, area))).toBe(true)
+    for (const forest of woodland) for (const acquired of [water, reserve, { polygon: parcel.polygon }, ...continuousRoadGround(road)]) expect(overlap(forest, acquired)).toBeLessThan(.001)
+    expect(result.some(area => area.kind === 'field')).toBe(false)
+    const expected = sum(subtractRegions({ polygon: rectangle(0, 0, 800, 600) }, [reserve, { polygon: parcel.polygon }, ...continuousRoadGround(road)]))
+    expect(sum(result)).toBeCloseTo(expected, 2)
+    expect(run(input)).toEqual(result)
+    expect(JSON.stringify(input)).toBe(before)
+    expect(run({ ...input, config: { ...config, forest: 0 } }).some(area => area.landUse === 'woodland')).toBe(false)
   })
   it('classifies deep interior remnants and enclosed demand holes without changing the filled partition', () => {
     const support = { polygon: rectangle(40, 40, 720, 520), holes: [rectangle(300, 200, 120, 100)] }

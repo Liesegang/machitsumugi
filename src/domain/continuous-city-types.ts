@@ -3,7 +3,7 @@ import type { PolygonRegion } from './geometry'
 import type { PlanningEnvironment } from './road-planner'
 import type { TerrainModel } from './terrain'
 
-export const CONTINUOUS_GENERATOR_VERSION = '2.7.0-continuous.5'
+export const CONTINUOUS_GENERATOR_VERSION = '2.7.0-continuous.6'
 
 /** Development is a continuous accessibility field. Its contours are never
  * street boundaries or privately owned neighbourhood stamps. */

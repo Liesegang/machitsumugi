@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
 import { subdivideContinuousFarmDistrict } from './continuous-city-farm-plots'
 import type { ContinuousFarmDistrictInput } from './continuous-city-farm-plots'
-import { boundsOf, distanceToSegment, intersectRegions, pointInRegion, polygonOverlapsRegion, rectangle, regionArea, subtractRegions } from './geometry'
+import { boundsOf, intersectRegions, pointInRegion, polygonOverlapsRegion, rectangle, regionArea, subtractRegions } from './geometry'
 
 const fixture = (): ContinuousFarmDistrictInput => ({ regions: [{ polygon: rectangle(104, 100, 400, 300) }], road: { id: 'actual-farm-road', kind: 'local', role: 'farm', width: 8, builtYear: 1970, points: [{ x: 100, y: 50 }, { x: 100, y: 450 }] }, origin: { x: 100, y: 250 }, seed: 'actual-farm-district', terrain: { elevation: () => 20, slope: () => 0, wetness: () => 0, channelAt: () => null, cultivable: () => true, waterAt: () => false } })
 const sum = (regions: readonly { polygon: { x: number; y: number }[]; holes?: { x: number; y: number }[][] }[]) => regions.reduce((n, r) => n + regionArea(r), 0)
@@ -47,7 +47,36 @@ describe('real road-served agricultural holdings', () => {
     expect(subdivideContinuousFarmDistrict({ ...input, road: { ...input.road, controlledAccess: true } }).plots).toEqual([])
     expect(subdivideContinuousFarmDistrict({ ...input, regions: [{ polygon: rectangle(1000, 1000, 400, 300) }] }).plots).toEqual([])
   })
-  it('packs the actual uncut coast03 residual without leaving its broad interior labelled as grassed bunds', () => {
+  it('requires tractor-width working access through a neck instead of treating topological connection as a farm lane', () => {
+    const input = fixture(), region = (half: number) => ({ polygon: [
+      { x: 104, y: 100 }, { x: 204, y: 100 }, { x: 204, y: 250 - half }, { x: 404, y: 250 - half }, { x: 404, y: 100 }, { x: 704, y: 100 },
+      { x: 704, y: 400 }, { x: 404, y: 400 }, { x: 404, y: 250 + half }, { x: 204, y: 250 + half }, { x: 204, y: 400 }, { x: 104, y: 400 },
+    ] }), narrow = region(.6), wide = region(1.6), before = JSON.stringify([narrow, wide])
+    const rejected = subdivideContinuousFarmDistrict({ ...input, regions: [narrow] }), connected = subdivideContinuousFarmDistrict({ ...input, regions: [wide] })
+    expect(rejected.plots.length).toBeGreaterThan(0)
+    expect(rejected.plots.some(plot => boundsOf(plot.polygon).minX > 400)).toBe(false)
+    expect(connected.plots.some(plot => boundsOf(plot.polygon).minX > 400)).toBe(true)
+    expect(sum(rejected.plots) + sum(rejected.bunds)).toBeCloseTo(sum([narrow]), 2)
+    expect(sum(connected.plots) + sum(connected.bunds)).toBeCloseTo(sum([wide]), 2)
+    expect(JSON.stringify([narrow, wide])).toBe(before)
+  })
+  it('reserves small-holding survey effort across a large district when coarse units cross uncultivable contour bands', () => {
+    const input = fixture(), cultivable = (p: { y: number }) => Math.sin((p.y - 100) * Math.PI / 35) > .4
+    input.regions = [{ polygon: rectangle(104, 100, 2000, 1000) }]
+    input.road = { ...input.road, points: [{ x: 100, y: 50 }, { x: 100, y: 1150 }] }
+    input.origin = { x: 100, y: 600 }; input.terrain.cultivable = cultivable
+    const result = subdivideContinuousFarmDistrict(input)
+    expect(result.plots.length).toBeGreaterThan(10)
+    expect(result.plots.some(plot => boundsOf(plot.polygon).minY > 850)).toBe(true)
+    expect(result.plots.some(plot => boundsOf(plot.polygon).maxY < 350)).toBe(true)
+    for (const plot of result.plots) {
+      expect(regionArea(plot)).toBeGreaterThanOrEqual(200)
+      for (const p of plot.polygon) expect(cultivable(p)).toBe(true)
+    }
+    expect(Math.abs(result.diagnostics.areaError)).toBeLessThan(.01)
+    expect(result.plots.length).toBeLessThanOrEqual(2048)
+  })
+  it('preserves the legacy coast03 narrow working holes while accepting only vehicle-served new holdings', () => {
     const source = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/continuous-farm-SE-bund.json.gz', import.meta.url))).toString()) as {
       regions: ContinuousFarmDistrictInput['regions']; road: ContinuousFarmDistrictInput['road']; origin: ContinuousFarmDistrictInput['origin']; seed: string
       terrainSurface: { cellSize: number; columns: number; rows: number; origin: { x: number; y: number }; elevations: number[] }
@@ -59,16 +88,11 @@ describe('real road-served agricultural holdings', () => {
       return value(0, 0) * (1 - u) * (1 - v) + value(1, 0) * u * (1 - v) + value(0, 1) * (1 - u) * v + value(1, 1) * u * v
     }
     const input: ContinuousFarmDistrictInput = { ...source, terrain: { elevation, slope: p => Math.hypot(elevation({ x: p.x + 12.5, y: p.y }) - elevation({ x: p.x - 12.5, y: p.y }), elevation({ x: p.x, y: p.y + 12.5 }) - elevation({ x: p.x, y: p.y - 12.5 })) / 25, wetness: () => 0, channelAt: () => null, cultivable: () => true, waterAt: p => source.waterAreas.some(region => pointInRegion(p, region)) } }
-    const before = JSON.stringify(source), result = subdivideContinuousFarmDistrict(input), allFields = [...source.adjacentExistingPlots, ...result.plots], distances: number[] = [], bounds = boundsOf(source.regions.flatMap(region => region.polygon))
-    for (let x = bounds.minX + 4; x < bounds.maxX; x += 8) for (let y = bounds.minY + 4; y < bounds.maxY; y += 8) {
-      const p = { x, y }
-      if (!source.regions.some(region => pointInRegion(p, region)) || result.plots.some(plot => pointInRegion(p, plot))) continue
-      distances.push(Math.min(...allFields.flatMap(plot => plot.polygon.map((a, i) => distanceToSegment(p, a, plot.polygon[(i + 1) % plot.polygon.length]!)))))
-    }
-    distances.sort((a, b) => a - b)
-    expect(sum(result.plots)).toBeGreaterThan(13000)
-    expect(distances[Math.floor((distances.length - 1) * .9)]).toBeLessThan(15)
-    expect(Math.max(...distances)).toBeLessThan(25)
+    const before = JSON.stringify(source), result = subdivideContinuousFarmDistrict(input)
+    // The unchanged historical holes have2m gaps. They cannot be counted as
+    //2.4m tractor routes merely to recover the former13,000m² mass target.
+    expect(result.plots.length).toBeGreaterThan(0)
+    expect(result.diagnostics.workingLaneWidth).toBeGreaterThanOrEqual(2.4)
     expect(result.plots.length).toBeLessThanOrEqual(2048)
     for (const plot of result.plots) {
       expect(plot.polygon).toHaveLength(4)

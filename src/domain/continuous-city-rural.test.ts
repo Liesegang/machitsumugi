@@ -10,6 +10,20 @@ const demand: ContinuousCityDemand = { center: { x: 500, y: 500 }, regions: [], 
 const fixture = (): ContinuousCityRuralInput => ({ config: { name: '農村市', seed: 'connected-farm-frontage', type: 'post', terrain: 'plain', density: 50, forest: 0, railway: false, stations: 1, arterial: true, facilities: [] }, width: 2400, height: 2000, terrain: { areas: [], elevation: () => 10, slope: () => 0, waterAt: () => false, cultivable: () => true }, roads: [{ id: 'public', kind: 'local', role: 'collector', width: 8, builtYear: 1965, boundaryContinuation: true, points: [{ x: 200, y: -50 }, { x: 200, y: 2050 }] }], railways: [], reserves: [], demand })
 
 describe('continuous city real rural access', () => {
+  it('surveys a later peripheral public frontage before the first wide road exhausts the agricultural seed and family budgets', () => {
+    const base = fixture(), original = { ...base.roads[0]!, id: 'old-wide-trunk', width: 12, builtYear: 1650, points: [{ x: 400, y: -50 }, { x: 400, y: 3050 }] }
+    const connector = { ...base.roads[0]!, id: 'later-east-connection', boundaryContinuation: false, builtYear: 1975, points: [{ x: 400, y: 2600 }, { x: 3500, y: 2600 }] }
+    const peripheral = { ...connector, id: 'later-peripheral-lane', role: 'lane' as const, width: 5.6, points: [{ x: 3500, y: 1300 }, { x: 3500, y: 2900 }] }
+    const input = { ...base, width: 4000, height: 3000, roads: [original, connector, peripheral], demand: { ...demand, at: (p: { x: number }) => p.x < 1000 || p.x > 3000 ? 0 : 1 } }
+    const before = JSON.stringify(input), result = planContinuousCityRuralAccess(input)
+    const east = result.diagnostics.projects.filter(p => p.to.x > 3200), west = result.diagnostics.projects.filter(p => p.to.x < 1000)
+    expect(east.length).toBeGreaterThan(0)
+    expect(west.length).toBeGreaterThan(0)
+    expect(east.every(p => p.builtYear === 1975)).toBe(true)
+    expect(result.diagnostics.maximumNetworkDistance).toBeLessThanOrEqual(1200.000001)
+    expect(JSON.stringify(input)).toBe(before)
+  })
+
   it('serves a200m countryside belt from the actual urban-edge pavement without a400m frontier leap', () => {
     const base = fixture(), road = { ...base.roads[0]!, id: 'urban-edge', points: [{ x: -40, y: 600 }, { x: 1040, y: 600 }], builtYear: 1970 }
     const input = { ...base, width: 1000, height: 800, roads: [road], demand: { ...demand, at: (p: { y: number }) => p.y <= 600 ? 1 : 0 } }

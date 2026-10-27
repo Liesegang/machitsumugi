@@ -141,7 +141,7 @@ export function planContinuousCityRuralAccess(input: ContinuousCityRuralInput): 
     }
     return depth
   }
-  const frontier: Frontier[] = [], anchors: Point[] = []
+  const frontier: Frontier[] = [], anchors: Point[] = [], surveyed: { point: Point; parentRoadId: string; year: number; directions: { heading: number; depth: number }[] }[] = []
   const ordered = [...graph.roads].sort((a, b) => Number(b.role === 'farm') - Number(a.role === 'farm') || b.width - a.width || a.id.localeCompare(b.id))
   for (const road of ordered) {
     const year = opening.get(road.id) ?? Infinity
@@ -152,18 +152,30 @@ export function planContinuousCityRuralAccess(input: ContinuousCityRuralInput): 
       if (!bounded(point) || reserved(point) || input.terrain.waterAt(point) || input.terrain.slope(point) > .08) continue
       const a = pathPointAt(road.points, Math.max(0, t - 50 / Math.max(1, length))), b = pathPointAt(road.points, Math.min(1, t + 50 / Math.max(1, length))), bearing = turn(a, b)
       const directions = [-1, 1].map(side => ({ heading: bearing + side * Math.PI / 2, depth: depthAlong(point, bearing + side * Math.PI / 2, 660) })).filter(direction => direction.depth >= 96)
-      if (!directions.length || anchors.some(p => distance(p, point) < Math.min(260, Math.max(85, Math.max(...directions.map(direction => direction.depth)) * .55)))) continue
-      anchors.push(point)
-      for (const direction of directions.sort((a, b) => b.depth - a.depth)) frontier.push({ point, root: point, parentRoadId: road.id, year, travelled: 0, heading: direction.heading, generation: 0 })
-      if (anchors.length >= maxRoads * 2) break
+      if (!directions.length || surveyed.some(site => distance(site.point, point) < 85)) continue
+      surveyed.push({ point, parentRoadId: road.id, year, directions })
     }
-    if (anchors.length >= maxRoads * 2) break
+  }
+  // The first wide road must not exhaust the seed budget before the opposite
+  // bank's later public roads are considered. Spread surveyed roots over the
+  // actual available agricultural frontage, rather than painting a crop grid.
+  while (surveyed.length && anchors.length < maxRoads * 2) {
+    surveyed.sort((a, b) => {
+      const score = (site: typeof a) => (anchors.length ? Math.min(...anchors.map(p => distance(p, site.point))) : 180) * Math.min(1.5, Math.max(...site.directions.map(direction => direction.depth)) / 300)
+      return score(b) - score(a) || a.point.x - b.point.x || a.point.y - b.point.y
+    })
+    const site = surveyed.shift()!
+    if (anchors.some(p => distance(p, site.point) < 150)) continue
+    anchors.push(site.point)
+    for (const direction of site.directions.sort((a, b) => b.depth - a.depth)) frontier.push({ point: site.point, root: site.point, parentRoadId: site.parentRoadId, year: site.year, travelled: 0, heading: direction.heading, generation: 0 })
   }
   diagnostics.seeds = anchors.length
   const acquired = new Set<string>(), occupiedIds = new Set(input.roads.map(r => r.id))
+  const familyRoads = new Map<Point, number>(), familyBudget = Math.min(3, Math.max(2, Math.floor(maxRoads / 3)))
   let serial = 0
   for (let cursor = 0; cursor < frontier.length && acquired.size < maxRoads && diagnostics.attempts < maxAttempts; cursor++) {
     const node = frontier[cursor]!, remaining = maximumReach - node.travelled
+    if ((familyRoads.get(node.root) ?? 0) >= familyBudget) continue
     if (remaining < 80) continue
     // Dry-component labels belong to a fixed land-cost field. Reusing one
     // planner while changing the root mask would retain stale connectivity.
@@ -198,6 +210,7 @@ export function planContinuousCityRuralAccess(input: ContinuousCityRuralInput): 
       obstacles.push({ region: field, bounds: boundsOf(field.polygon) })
       fieldObstacles.push(...paving.map(region => ({ region, bounds: boundsOf(region.polygon) })))
       graph = staged; acquired.add(id); occupiedIds.add(id); planner.setRailwayRoadNetwork(graph.roads)
+      familyRoads.set(node.root, (familyRoads.get(node.root) ?? 0) + 1)
       diagnostics.accepted++; diagnostics.length += length; diagnostics.maximumNetworkDistance = Math.max(diagnostics.maximumNetworkDistance, travelled)
       diagnostics.projects.push({ id, parentRoadId: node.parentRoadId, root: node.root, from: road.points[0]!, to: end, builtYear: road.builtYear, length, networkDistance: travelled, workingField: field })
       if (node.generation < 2) {

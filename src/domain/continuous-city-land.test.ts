@@ -5,6 +5,7 @@ import type { CityConfig, Road } from './types'
 import { boundsOf, corridorPolygon, distanceToSegment, intersectRegions, pointInPolygon, polygonArea, polygonOverlapsRegion, polygonsOverlap, rectangle, regionArea, subtractRegions } from './geometry'
 import { buildingServiceYears } from './building-lifecycle'
 import { extractStreetBlocks, materializeRoadJunctions } from './road-graph'
+import { shoppingStreetHistory } from './commercial-history'
 
 const config: CityConfig = { name: '接道試験市', seed: 'whole-block-cadastre', type: 'post', terrain: 'plain', density: 90, forest: 0, railway: false, stations: 1, arterial: true, facilities: [], targetYear: 2025, settlement: 'metropolis' }
 const loop = (width = 120, height = 60): Road[] => [
@@ -146,6 +147,77 @@ describe('continuous city whole-block cadastre', () => {
       expect(title.createdYear).toBeGreaterThanOrEqual(road.builtYear??1650)
       expect(Math.min(...road.points.slice(1).map((b,i)=>distanceToSegment(title.access![0]!,road.points[i]!,b)))).toBeLessThan(.001)
     }
+  })
+
+  it('retains fine inherited frontages while later neighbourhoods acquire deeper garden sites and coherent house plans', () => {
+    const source=run().input,block={id:'neighbourhood-form',polygon:rectangle(20,20,320,84)}
+    const form=(year:number)=>run({roads:loop(320,84).map(road=>({...road,builtYear:year})),blocks:[block],demand:{...source.demand,center:{x:40,y:20},at:()=>.48,openingAt:()=>year}}).result
+    const inherited=form(1870),planned=form(1975)
+    const depth=(result:typeof inherited)=>result.parcels.filter(parcel=>parcel.roadId==='north').map(parcel=>{const b=boundsOf(parcel.polygon);return b.maxY-b.minY})
+    expect(median(depth(planned))).toBeGreaterThan(median(depth(inherited))*1.1)
+    expect(median(planned.parcels.map(parcel=>polygonArea(parcel.polygon)))).toBeGreaterThan(median(inherited.parcels.map(parcel=>polygonArea(parcel.polygon))))
+    expect(inherited.buildings.every(building=>building.polygon.length===4)).toBe(true)
+    expect(planned.buildings.some(building=>building.polygon.length===6)).toBe(true)
+    expect(planned.buildings.some(building=>building.polygon.length===4)).toBe(true)
+    expect(planned.metrics.openSpaceArea/planned.metrics.buildableArea).toBeLessThan(inherited.metrics.openSpaceArea/inherited.metrics.buildableArea)
+    for(const result of [inherited,planned]){
+      expect(result.metrics.partitionAreaError).toBeLessThan(.1)
+      expect(result.metrics.openSpaceArea/result.metrics.buildableArea).toBeLessThan(.1)
+      for(const building of result.buildings){
+        const title=result.parcels.find(parcel=>parcel.id===building.parcelId)!
+        expect(subtractRegions(building,[title]).reduce((sum,part)=>sum+regionArea(part),0)).toBeLessThan(.005)
+      }
+    }
+    expect(planned.parcels.every(parcel=>parcel.createdYear>=1975)).toBe(true)
+  })
+
+  it('acquires grouped apartment courts on a real later approach without filling reserved ground or turning every house into a block', () => {
+    const source=run().input,roads=loop(420,120).map(road=>({...road,width:5.6,role:'lane' as const,builtYear:1975})),water={id:'court-pond',kind:'water' as const,polygon:rectangle(300,65,30,24)},reserve={polygon:rectangle(180,72,34,24)}
+    const input={width:600,height:350,roads,blocks:[{id:'court-neighbourhood',polygon:rectangle(20,20,420,120)}],reserves:[reserve],terrain:{...source.terrain,areas:[water],waterAt:(p:{x:number;y:number})=>pointInPolygon(p,water.polygon)},demand:{...source.demand,center:{x:40,y:20},at:()=>.76,openingAt:()=>1975}}
+    const result=run(input).result,titles=new Map(result.parcels.map(parcel=>[parcel.id,parcel]))
+    const courts=result.buildings.filter(building=>building.kind==='residential'&&building.height>=3&&building.polygon.length===6&&polygonArea(building.polygon)>200)
+    expect(courts.length).toBeGreaterThan(1)
+    expect(result.metrics.courtyardLots).toBeGreaterThan(1)
+    expect(result.buildings.some(building=>building.kind==='residential'&&building.height<=2&&polygonArea(building.polygon)<180)).toBe(true)
+    for(const court of courts){
+      const title=titles.get(court.parcelId!)!
+      expect(polygonArea(title.polygon)).toBeGreaterThan(600)
+      expect(polygonArea(court.polygon)/polygonArea(title.polygon)).toBeLessThan(.5)
+      expect(court.builtYear!).toBeGreaterThanOrEqual(1975)
+    }
+    const pavement=roads.flatMap(road=>road.points.slice(1).map((b,i)=>({polygon:corridorPolygon(road.points[i]!,b,road.width/2+.25)})))
+    for(const building of result.buildings){
+      const title=titles.get(building.parcelId!)!
+      expect(subtractRegions(building,[title]).reduce((sum,part)=>sum+regionArea(part),0)).toBeLessThan(.005)
+      expect(polygonOverlapsRegion(building.polygon,water)).toBe(false)
+      expect(polygonOverlapsRegion(building.polygon,reserve)).toBe(false)
+      expect(pavement.every(row=>overlapArea(building,row)<.005)).toBe(true)
+    }
+    expect(result.metrics.partitionAreaError).toBeLessThan(.2)
+    // A marker on a separate public component grants no station quarter.
+    const remote=run({...input,demand:{...input.demand,center:{x:550,y:300}},roads:[...roads,{id:'separate-station',points:[{x:20,y:0},{x:440,y:0}],kind:'local' as const,width:6,builtYear:1975}],stations:[{id:'unconnected-court-station',point:{x:50,y:0},name:'別路線',builtYear:1975}]}).result
+    expect(remote.buildings.some(building=>building.height>=3&&building.polygon.length===6&&polygonArea(building.polygon)>200)).toBe(false)
+  })
+
+  it('reoffers a shallow apartment acquisition to ordinary ownership once instead of repeating the rejected court proposal', () => {
+    const source=run().input,roads=loop(420,24).map(road=>({...road,width:5.6,role:'lane' as const,builtYear:1975}))
+    const result=run({roads,blocks:[{id:'shallow-court',polygon:rectangle(20,20,420,24)}],demand:{...source.demand,center:{x:40,y:20},at:()=>.76,openingAt:()=>1975}}).result
+    expect(result.parcels.length).toBeGreaterThan(20)
+    expect(result.metrics.courtyardLots).toBe(0)
+    expect(result.metrics.partitionAreaError).toBeLessThan(.1)
+    expect(result.buildings.every(building=>building.polygon.every(point=>pointInPolygon(point,result.parcels.find(parcel=>parcel.id===building.parcelId)!.polygon)))).toBe(true)
+  }, 2000)
+
+  it.each(['mixed-court-0','mixed-court-2','mixed-court-11'])('keeps three surviving shop frontages when apartment acquisitions compete for the same approach (%s)', seed => {
+    const source=run().input,roads=loop(420,120).map(road=>({...road,width:road.id==='north'?6.8:5.6,role:road.id==='north'?'collector' as const:'lane' as const,builtYear:1975}))
+    const result=run({config:{...config,seed,facilities:['shop']},width:600,height:350,roads,blocks:[{id:'mixed-court-neighbourhood',polygon:rectangle(20,20,420,120)}],demand:{...source.demand,center:{x:40,y:20},at:()=>.76,openingAt:()=>1975}}).result
+    const history=shoppingStreetHistory({buildings:result.history.buildings,parcels:result.history.parcels,roads:roads.map(value=>({from:1975,value})),name:'商店街',throughYear:2025})
+    expect(history.some(version=>version.to===undefined)).toBe(true)
+    const titles=new Map(result.parcels.map(parcel=>[parcel.id,parcel])),shops=result.buildings.filter(building=>building.kind==='commercial'&&titles.get(building.parcelId!)?.roadId==='north')
+    expect(shops.length).toBeGreaterThanOrEqual(3)
+    expect(result.metrics.courtyardLots).toBeGreaterThan(0)
+    for(const building of result.buildings)expect(subtractRegions(building,[titles.get(building.parcelId!)!]).reduce((sum,part)=>sum+regionArea(part),0)).toBeLessThan(.005)
+    expect(result.metrics.partitionAreaError).toBeLessThan(.2)
   })
 
   it('uses actual public-network station access and its opening date, not a nearby disconnected railway landmark', () => {

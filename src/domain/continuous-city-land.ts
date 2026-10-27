@@ -8,14 +8,17 @@ import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { subtractContinuousCover } from './continuous-city-cover'
 import { streetHolding } from './street-holding'
 import type { HoldingProfile, StreetStock } from './street-holding'
+import { continuousLocalStreetForm } from './continuous-city-density'
+import { neighbourhoodHolding } from './continuous-city-parcel-form'
+import type { ParcelNeighbourhoodForm } from './continuous-city-parcel-form'
 
 interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds; chainage: number }
 interface Frontage { a: Point; b: Point; segment: Segment; length: number }
 interface Cell extends PolygonRegion { frontages: Frontage[] }
 type Stock = StreetStock
 interface RouteContext { distance: number; availableYear: number; formAvailableYear: number; source: 'center' | 'station' }
-interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext; holding?: HoldingProfile; holdingKey?: string }
-interface TitleProgramme { stock: Stock; frontage: number; depth: number; maximumArea: number; route: RouteContext; parking: boolean; holding: HoldingProfile; cuts: number[] }
+interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext; holding?: HoldingProfile; holdingKey?: string; court?: boolean; winged?: boolean; form?: ParcelNeighbourhoodForm }
+interface TitleProgramme { stock: Stock; frontage: number; depth: number; maximumArea: number; route: RouteContext; parking: boolean; holding: HoldingProfile; cuts: number[]; court: boolean; winged: boolean; inherited: boolean }
 const clamp = (n: number, low: number, high: number) => Math.max(low, Math.min(high, n))
 const commercialStock = (stock: Stock) => stock === 'mixed' || stock === 'office' || stock === 'retail'
 const businessStock = (stock: Stock) => stock === 'office' || stock === 'retail'
@@ -112,7 +115,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
   }
   const parcels: Parcel[] = [], buildings: Building[] = [], accessRoads: Road[] = [], openSpaces: Area[] = [], unassignedGround: PolygonRegion[] = [], events: GrowthEvent[] = []
   const history = { parcels: [] as TimelineVersion<Parcel>[], buildings: [] as TimelineVersion<Building>[], buildingStates: [] as BuildingState[] }
-  const metrics = { blocks: input.blocks.length, buildableArea: 0, parcelArea: 0, accessArea: 0, openSpaceArea: 0, unassignedArea: 0, partitionAreaError: 0, laneAttempts: 0, accessRoads: 0, privateReplacements: 0, lots: 0, oversizedLots: 0, frontageFailures: 0, formationFailures: 0, stock: {} as Record<Stock, { count: number; parcelArea: number; roofArea: number; parking: number }>, openReasons: {} as Record<string, { count: number; area: number }> }
+  const metrics = { blocks: input.blocks.length, buildableArea: 0, parcelArea: 0, accessArea: 0, openSpaceArea: 0, unassignedArea: 0, partitionAreaError: 0, laneAttempts: 0, accessRoads: 0, privateReplacements: 0, lots: 0, courtyardLots: 0, wingedRoofs: 0, oversizedLots: 0, frontageFailures: 0, formationFailures: 0, stock: {} as Record<Stock, { count: number; parcelArea: number; roofArea: number; parking: number }>, openReasons: {} as Record<string, { count: number; area: number }> }
   const obstacles = (region: PolygonRegion) => obstacleIndex.query(boundsOf(region.polygon))
   const frontages = (region: PolygonRegion): Frontage[] => {
     const bounds = boundsOf(region.polygon), near = roadIndex.query({ minX: bounds.minX - 18, minY: bounds.minY - 18, maxX: bounds.maxX + 18, maxY: bounds.maxY + 18 }).filter(segment => publicStreet(segment.road))
@@ -329,6 +332,27 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         if(to-from>.001)result.push({front,stock:band.stock,from,to,route})
       }
     }
+    // A later apartment group acquires a complete site and service court on
+    // an existing connected approach. Its neighbours retain their independent
+    // titles; a nearby but disconnected station cannot trigger acquisition.
+    for (const front of includeBusiness ? fronts : []) {
+      const route = network(front), road = front.segment.road, p = middle(front.a, front.b)
+      if (road.width < 5.2 || road.width >= 8 || intensity < .5 || regionArea(region) < 2800 || input.terrain.slope(p) > .065 || Math.max(road.builtYear ?? 1650, opening(p)) < 1955 || route.distance >= (route.source === 'station' ? 1100 : 700) || (frontageByRoad.get(road.id) ?? 0) < 34) continue
+      const segment = front.segment, run = distance(segment.a, segment.b), dx = (segment.b.x - segment.a.x) / run, dy = (segment.b.y - segment.a.y) / run
+      const start = segment.chainage + (front.a.x - segment.a.x) * dx + (front.a.y - segment.a.y) * dy, direction = ((front.b.x - front.a.x) * dx + (front.b.y - front.a.y) * dy) / front.length
+      const low = Math.min(start, start + front.length * direction), high = Math.max(start, start + front.length * direction), period = 340
+      const phase = seededRandom(`${input.config.seed}:${road.id}:apartment-sites`)() * period
+      for (let cycle = Math.floor((low - phase) / period); cycle <= Math.floor((high - phase) / period); cycle++) {
+        const left = Math.max(low, phase + cycle * period + 45), right = Math.min(high, phase + cycle * period + 135)
+        if (right - left < .001) continue
+        const a = (left - start) / direction, b = (right - start) / direction
+        let intervals=[{from:Math.max(0,Math.min(a,b)),to:Math.min(front.length,Math.max(a,b))}]
+        // A new apartment group must not replace the already specified shop
+        // approach. Clip its proposal before ownership runs are subdivided.
+        for(const trade of result.filter(plan=>plan.front===front&&commercialStock(plan.stock)))intervals=intervals.flatMap(interval=>trade.to<=interval.from||trade.from>=interval.to?[interval]:[{from:interval.from,to:Math.min(interval.to,trade.from)},{from:Math.max(interval.from,trade.to),to:interval.to}].filter(part=>part.to-part.from>.001))
+        for(const interval of intervals)result.push({front,stock:'walkup',...interval,route,court:true})
+      }
+    }
     // Acquisitions precede private cuts. Their widths and building programmes
     // follow an ordered sequence on each actual road side, rather than the
     // recursive subdivision serial or one globally repeated house width.
@@ -341,20 +365,23 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       const inward = pointInRegion({x:midpoint.x-tangent.y,y:midpoint.y+tangent.x},region)?1:-1
       const side = (-dy * -tangent.y + dx * tangent.x) * inward > 0 ? 'left' : 'right', key = `${segment.road.id}:${side}`
       const start = segment.chainage + (front.a.x-segment.a.x)*dx + (front.a.y-segment.a.y)*dy, direction = tangent.x*dx+tangent.y*dy
+      const slope = input.terrain.slope(midpoint), openingYear = opening(midpoint), frontageYear = segment.road.builtYear ?? 1650
+      const form: ParcelNeighbourhoodForm = slope > .055 ? 'hillside' : intensity < .38 ? 'edge' : Math.max(frontageYear, openingYear) < 1955 ? 'inherited' : 'planned'
+      const depthTarget = continuousLocalStreetForm({ intensity, openingYear, frontageYear, frontageDistance: 0, slope }).depth
       const acquired: FrontageProgramme[] = []
       for(let zone=1;zone<cuts.length;zone++){
         const from=cuts[zone-1]!,to=cuts[zone]!,mid=(from+to)/2,plan=plans.filter(plan=>plan.from<=mid&&plan.to>=mid).at(-1)!
-        const cohortLength=businessStock(plan.stock)?144:72,phase=seededRandom(`${input.config.seed}:${key}:holding-origin`)()*cohortLength
+        const cohortLength=businessStock(plan.stock)?144:plan.court?120:72,phase=seededRandom(`${input.config.seed}:${key}:holding-origin`)()*cohortLength
         const low=Math.min(start+from*direction,start+to*direction),high=Math.max(start+from*direction,start+to*direction)
         const group: FrontageProgramme[]=[]
         for(let cohort=Math.floor((low-phase)/cohortLength);cohort<=Math.floor((high-phase)/cohortLength);cohort++){
           const cohortKey=`${key}:${cohort}`,end=phase+(cohort+1)*cohortLength
           for(let position=phase+cohort*cohortLength,index=0;position<end-.001;index++){
-            const holding=streetHolding(input.config.seed,`${cohortKey}:${index}`,plan.stock,intensity,cohortKey)
+            const holding=neighbourhoodHolding(input.config.seed,`${cohortKey}:${index}`,plan.stock,intensity,cohortKey,form,plan.court,depthTarget)
             let width=Math.min(holding.frontage,end-position)
             if(end-position-width<5.25)width=end-position
             const left=Math.max(low,position),right=Math.min(high,position+width)
-            if(right-left>.001){const a=(left-start)/direction,b=(right-start)/direction;group.push({...plan,from:Math.max(from,Math.min(a,b)),to:Math.min(to,Math.max(a,b)),holding:{...holding,frontage:width},holdingKey:`${plan.stock}:${cohortKey}:${index}`})}
+            if(right-left>.001){const a=(left-start)/direction,b=(right-start)/direction;group.push({...plan,from:Math.max(from,Math.min(a,b)),to:Math.min(to,Math.max(a,b)),holding:{...holding,frontage:width},holdingKey:`${plan.stock}:${cohortKey}:${index}`,form,winged:plan.court || form==='planned' && seededRandom(`${input.config.seed}:${cohortKey}:house-plan`)()<.34})}
             position+=width
           }
         }
@@ -371,20 +398,31 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
   const programmeIndex=new WeakMap<FrontageProgramme[],{roads:Map<string,FrontageProgramme[]>;totalFrontage:number}>()
   const acquireBusiness = (region: PolygonRegion, plans: FrontageProgramme[]) => {
     const groups=new Map<string,FrontageProgramme[]>()
-    for(const plan of plans)if(businessStock(plan.stock)&&plan.holdingKey){const group=groups.get(plan.holdingKey)??[];group.push(plan);groups.set(plan.holdingKey,group)}
+    for(const plan of plans)if((businessStock(plan.stock)||plan.court)&&plan.holdingKey){const group=groups.get(plan.holdingKey)??[];group.push(plan);groups.set(plan.holdingKey,group)}
     let remaining:PolygonRegion[]=[region]
     const acquired:{region:PolygonRegion;plans:FrontageProgramme[];roadId:string}[]=[]
-    for(const group of [...groups.values()].sort((a,b)=>a[0]!.route.distance-b[0]!.route.distance||a[0]!.holdingKey!.localeCompare(b[0]!.holdingKey!))){
+    const shopApproaches=plans.filter(plan=>plan.stock==='mixed').map(plan=>{
+      const front=plan.front,u={x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length},a={x:front.a.x+u.x*plan.from,y:front.a.y+u.y*plan.from},b={x:front.a.x+u.x*plan.to,y:front.a.y+u.y*plan.to},p=middle(a,b)
+      let n={x:-u.y,y:u.x};if(!pointInRegion({x:p.x+n.x,y:p.y+n.y},region))n={x:-n.x,y:-n.y}
+      const depth=plan.holding!.depth
+      return {polygon:[{x:a.x-n.x*.1,y:a.y-n.y*.1},{x:b.x-n.x*.1,y:b.y-n.y*.1},{x:b.x+n.x*depth,y:b.y+n.y*depth},{x:a.x+n.x*depth,y:a.y+n.y*depth}]}
+    })
+    // Business acquisitions have priority. Their exact acquired ground and the
+    // surviving mixed-use approach also protect corner shops from a court
+    // proposed on a different side of the same block.
+    for(const group of [...groups.values()].sort((a,b)=>Number(!!a[0]!.court)-Number(!!b[0]!.court)||a[0]!.route.distance-b[0]!.route.distance||a[0]!.holdingKey!.localeCompare(b[0]!.holdingKey!))){
       const plan=group[0]!,holding=plan.holding!,roadId=plan.front.segment.road.id
       const points=group.flatMap(plan=>{const u={x:(plan.front.b.x-plan.front.a.x)/plan.front.length,y:(plan.front.b.y-plan.front.a.y)/plan.front.length};return [plan.from,plan.to].map(distance=>({x:plan.front.a.x+u.x*distance,y:plan.front.a.y+u.y*distance}))})
       const basis=group.slice().sort((a,b)=>b.to-b.from-(a.to-a.from))[0]!,u={x:(basis.front.b.x-basis.front.a.x)/basis.front.length,y:(basis.front.b.y-basis.front.a.y)/basis.front.length},origin=middle(points[0]!,points[1]!)
       let n={x:-u.y,y:u.x}
       if(!pointInRegion({x:origin.x+n.x,y:origin.y+n.y},region))n={x:-n.x,y:-n.y}
       const along=points.map(p=>(p.x-origin.x)*u.x+(p.y-origin.y)*u.y),across=points.map(p=>(p.x-origin.x)*n.x+(p.y-origin.y)*n.y),low=Math.min(...along),high=Math.max(...along),near=Math.min(...across)-.1,far=Math.max(...across)+holding.depth
-      if(high-low<24)continue
+      const minimumFrontage=plan.court?20:24,minimumArea=plan.court?500:600
+      if(high-low<minimumFrontage)continue
       const world=(a:number,b:number)=>({x:origin.x+u.x*a+n.x*b,y:origin.y+u.y*a+n.y*b})
       const mask={polygon:[world(low,near),world(high,near),world(high,far),world(low,far)]}
-      const pieces=remaining.flatMap(part=>intersectRegions(part,mask)).filter(part=>regionArea(part)>=600&&frontages(part).filter(front=>front.segment.road.id===roadId).reduce((sum,front)=>sum+front.length,0)>=24)
+      const candidate=remaining.flatMap(part=>intersectRegions(part,mask))
+      const pieces=(plan.court?candidate.flatMap(part=>subtractRegions(part,shopApproaches)):candidate).filter(part=>regionArea(part)>=minimumArea&&frontages(part).filter(front=>front.segment.road.id===roadId).reduce((sum,front)=>sum+front.length,0)>=minimumFrontage)
       if(!pieces.length)continue
       for(const part of pieces)acquired.push({region:part,plans:group,roadId})
       remaining=remaining.flatMap(part=>subtractRegions(part,pieces))
@@ -403,11 +441,12 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     })
     const plan = matches.at(-1), stock = plan?.stock ?? (intensity >= .72 ? 'compact' : intensity < .38 ? 'garden' : 'ordinary')
     const fallbackKey=`${front.segment.road.id}:${Math.floor(p.x/24)}:${Math.floor(p.y/24)}`,holding=plan?.holding??streetHolding(input.config.seed,fallbackKey,stock,intensity)
-    const meanDepth = regionArea(original) / Math.max(1, index.totalFrontage), acquiredBusiness=businessStock(stock)&&plans.every(plan=>businessStock(plan.stock)),depth = acquiredBusiness?holding.depth:Math.min(holding.depth,clamp(meanDepth*(businessStock(stock)?2.4:1.65),16,businessStock(stock)?58:40)),frontage=holding.frontage
+    const inherited = plan?.form === 'inherited' || !plan?.form && Math.max(front.segment.road.builtYear ?? 1650, opening(p)) < 1955
+    const meanDepth = regionArea(original) / Math.max(1, index.totalFrontage), acquiredBusiness=(businessStock(stock)||plan?.court)&&plans.every(plan=>businessStock(plan.stock)||plan.court),depth = acquiredBusiness?holding.depth:Math.min(holding.depth,clamp(meanDepth*(businessStock(stock)?2.4:inherited?1.65:2.1),inherited?16:20,businessStock(stock)?58:inherited?40:48)),frontage=holding.frontage
     const u={x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length},cuts:number[]=[]
     for(const candidate of alongRoad)if(distanceToSegment(p,candidate.front.a,candidate.front.b)<.02){const axis={x:(candidate.front.b.x-candidate.front.a.x)/candidate.front.length,y:(candidate.front.b.y-candidate.front.a.y)/candidate.front.length};for(const end of [candidate.from,candidate.to]){const q={x:candidate.front.a.x+axis.x*end,y:candidate.front.a.y+axis.y*end};if(distanceToSegment(q,front.a,front.b)<.02&&distance(q,front.a)>=5.25&&distance(q,front.b)>=5.25)cuts.push(q.x*u.x+q.y*u.y)}}
     const route = plan?.route ?? { distance: Infinity, availableYear: 2025, formAvailableYear: 2025, source: 'center' as const }
-    return { stock, frontage, depth, maximumArea: frontage * depth * 1.28, route, parking: stock === 'retail' || stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350, holding, cuts:[...new Set(cuts)] }
+    return { stock, frontage, depth, maximumArea: frontage * depth * 1.28, route, parking: !!plan?.court || stock === 'retail' || stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350, holding, cuts:[...new Set(cuts)], court:!!plan?.court, winged:!!plan?.winged, inherited }
   }
   const split = (cell: Cell, programme: TitleProgramme): Cell[] | null => {
     const front = cell.frontages[0]!, length = front.length, u = { x: (front.b.x - front.a.x) / length, y: (front.b.y - front.a.y) / length }, v = { x: -u.y, y: u.x }
@@ -416,7 +455,9 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     for (const { axis, low, high, target } of extents) {
       const count = Math.max(2, Math.round((high - low) / target)), acquisition = clamp(target * Math.max(1, Math.floor(count * .42)) / (high - low), .24, .68)
       const holdingCuts=Math.abs(axis.x*u.x+axis.y*u.y)>.99?programme.cuts.filter(cut=>cut>low+5.25&&cut<high-5.25).sort((a,b)=>Math.abs(a-(low+high)/2)-Math.abs(b-(low+high)/2)).map(cut=>(cut-low)/(high-low)):[]
-      for (const fraction of [...holdingCuts, acquisition, .5, .38, .62]) {
+      const isDepth=Math.abs(axis.x*v.x+axis.y*v.y)>.99,frontDatum=middle(front.a,front.b),datum=frontDatum.x*axis.x+frontDatum.y*axis.y
+      const inward=pointInRegion({x:frontDatum.x+axis.x,y:frontDatum.y+axis.y},cell)?1:-1,backLine=isDepth?(datum+inward*programme.depth-low)/(high-low):NaN
+      for (const fraction of [...holdingCuts, ...(!programme.inherited&&backLine>.15&&backLine<.85?[backLine]:[]), acquisition, .5, .38, .62]) {
       if (high - low < 11) continue
       const cut = low + (high - low) * fraction, normal = { x: -axis.y, y: axis.x }
       const point = (along: number, across: number): Point => ({ x: axis.x * along + normal.x * across, y: axis.y * along + normal.y * across })
@@ -461,7 +502,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     // surveyed parking bay. Roof depth follows that acquisition and usable
     // width, rather than every road getting the same12m-deep building band.
     const roofBudget = regionArea(cell) * programme.holding.coverage
-    const desiredWidth = clamp(Math.min(programme.frontage*programme.holding.widthRatio,Math.sqrt(roofBudget*programme.holding.aspect)),large?16:merged?10:4.8,large?52:merged?32:18)
+    const desiredWidth = clamp(Math.min(programme.frontage*programme.holding.widthRatio,Math.sqrt(roofBudget*programme.holding.aspect)),large?16:merged?10:4.8,large?52:programme.court?44:merged?32:18)
     const desiredDepth = clamp(roofBudget/Math.min(desiredWidth,availableWidth-(sideParking?4.2:1.3)),6,large?44:merged?24:20)
     const fullWidth = Math.min(desiredWidth, availableWidth - (sideParking ? 4.2 : merged ? 2.4 : 1.3)), fullDepth = Math.min(desiredDepth, Math.max(...vs) - frontGap - 1.1)
     const align = (sideParking ? -1.5 : 0) + programme.holding.sideBias*Math.max(0,availableWidth-fullWidth-1.3)
@@ -469,7 +510,10 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     for (const scale of [1, .9, .8, .7, .6]) for (const shift of [align, align - 1, align + 1]) {
       const width = fullWidth * scale, depth = fullDepth * scale
       if (width < 3.8 || depth < 5 || width * depth < 30) continue
-      const polygon = [world(shift - width / 2, frontGap), world(shift + width / 2, frontGap), world(shift + width / 2, frontGap + depth), world(shift - width / 2, frontGap + depth)].map(point => ({ x: Math.round(point.x * 10000) / 10000, y: Math.round(point.y * 10000) / 10000 }))
+      const winged=programme.winged&&width>8&&depth>9
+      const backWing = shift + width * (programme.court ? .05 : .22), frontWing = frontGap + depth * (programme.court ? .55 : .75)
+      const outline = winged ? [world(shift-width/2,frontGap),world(shift+width/2,frontGap),world(shift+width/2,frontWing),world(backWing,frontWing),world(backWing,frontGap+depth),world(shift-width/2,frontGap+depth)] : [world(shift - width / 2, frontGap), world(shift + width / 2, frontGap), world(shift + width / 2, frontGap + depth), world(shift - width / 2, frontGap + depth)]
+      const polygon = outline.map(point => ({ x: Math.round(point.x * 10000) / 10000, y: Math.round(point.y * 10000) / 10000 }))
       if (!containsPolygon(cell, polygon) || !physical(polygon)) continue
       const elevations = [...polygon, middle(polygon[0]!, polygon[2]!)].map(input.terrain.elevation)
       if (Math.max(...elevations) - Math.min(...elevations) > 2.4) continue
@@ -535,7 +579,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     // than replanning distant housing from the remainder's altered boundary.
     const businessSites:ReturnType<typeof acquireBusiness>['acquired']=[], ordinaryPlanning: { original: PolygonRegion; plans: FrontageProgramme[]; roadIds: Set<string> }[]=[]
     regions=regions.flatMap(region=>{
-      if(regionArea(region)<4500||input.demand.at(interior(region))<.6||!frontages(region).some(front=>front.segment.road.width>=8))return [region]
+      if(regionArea(region)<2800||input.demand.at(interior(region))<.5||!frontages(region).some(front=>front.segment.road.width>=5.2))return [region]
       const business=acquireBusiness(region,programmes(region));businessSites.push(...business.acquired)
       if(business.acquired.length){const plans=programmes(region,false);ordinaryPlanning.push({original:region,plans,roadIds:new Set(plans.map(plan=>plan.front.segment.road.id))})}
       return business.remaining
@@ -599,13 +643,13 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       // an awkward residual into a vacant campus or a house-sized skyscraper.
       // Re-offer unsuitable ground to ordinary frontage ownership with all of
       // the same physical and access checks.
-      if(businessStock(programme.stock)&&plans.every(plan=>businessStock(plan.stock))&&(!pad||polygonArea(pad.polygon)<Math.max(programme.stock==='office'?300:200,area*.2))){
-        pending.push({cell:{...cell,frontages:frontages(cell)},original:cell,plans:programmes(cell).filter(plan=>!businessStock(plan.stock)),depth:0})
+      if((businessStock(programme.stock)||programme.court)&&plans.every(plan=>businessStock(plan.stock)||plan.court)&&(!pad||polygonArea(pad.polygon)<Math.max(programme.stock==='office'?300:200,area*.2))){
+        pending.push({cell:{...cell,frontages:frontages(cell)},original:cell,plans:programmes(cell,false).filter(plan=>!businessStock(plan.stock)&&!plan.court),depth:0})
         continue
       }
 
       const merged = major || programme.stock === 'walkup'
-      const createdYear = Math.max(opening(p), ...(pad?.polygon ?? []).map(opening), (pad?.front ?? front).segment.road.builtYear ?? 1650, merged ? programme.route.availableYear : 1650,businessStock(programme.stock)?Math.max(programme.stock==='office'?1955:1970,programme.route.formAvailableYear):1650)
+      const createdYear = Math.max(opening(p), ...(pad?.polygon ?? []).map(opening), (pad?.front ?? front).segment.road.builtYear ?? 1650, merged ? programme.route.availableYear : 1650,businessStock(programme.stock)?Math.max(programme.stock==='office'?1955:1970,programme.route.formAvailableYear):programme.court?Math.max(1955,programme.route.formAvailableYear):1650)
       if (!pad || !Number.isFinite(createdYear) || createdYear > 2025) { metrics.formationFailures++; open(cell, String(cellSerial), pad ? '将来形成する接道地' : '形状・地形上の建築不適地'); continue }
       if (area > maximumArea * 2 && polygonArea(pad.polygon) / area < .2) {
         const origin = pad.entrance, served = pad.front, u = { x: (served.b.x - served.a.x) / served.length, y: (served.b.y - served.a.y) / served.length }
@@ -626,7 +670,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         metrics.formationFailures++; open(cell, String(cellSerial), '取得目的に対して過大な接道不成立地'); continue
       }
       const parcel: Parcel = { id: `cf-p-${cellSerial}`, polygon: cell.polygon, entrance: pad.entrance, access: [pad.attachment, pad.entrance], roadId: pad.front.segment.road.id, createdYear, developedYear: createdYear, use: major ? 'commercial' : 'residential' }
-      metrics.parcelArea += area; metrics.lots++; if (area > maximumArea) metrics.oversizedLots++
+      metrics.parcelArea += area; metrics.lots++; metrics.courtyardLots += Number(programme.court); metrics.wingedRoofs += Number(pad.polygon.length === 6); if (area > maximumArea) metrics.oversizedLots++
       const stockMetrics = metrics.stock[programme.stock] ?? { count: 0, parcelArea: 0, roofArea: 0, parking: 0 }; stockMetrics.count++; stockMetrics.parcelArea += area; stockMetrics.roofArea += polygonArea(pad.polygon); stockMetrics.parking += Number(pad.parking); metrics.stock[programme.stock] = stockMetrics
       const versions: TimelineVersion<Building>[] = []
       for (let year = createdYear, frame = 0; year <= 2025 && frame < 10; frame++) {

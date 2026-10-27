@@ -14,10 +14,12 @@ import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { regionQuery } from './region-query'
 import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { continuousRoadEndcapsClear } from './continuous-road-endcaps'
-import { continuousLocalStreetDepth } from './continuous-city-density'
+import { continuousLocalAccessProbes, continuousLocalStreetForm } from './continuous-city-density'
 import { continuousCollectorJoinCandidates } from './continuous-collector-join'
 import { planModernTransport } from './modern-transport'
 import { layoutMainCivilGuides, surveyLayoutMainCivilCrossings } from './layout-first-main-civil-bridges'
+import { datedExternalPublicRoadIds } from './continuous-city-access-repair'
+import { certifyLayoutAccess } from './layout-first-access'
 
 type CityRoad = Road & { surveyedBridgeSpans?: SurveyedBridgeSpan[] }
 export interface ContinuousRoadDiagnostics {
@@ -28,6 +30,7 @@ export interface ContinuousRoadDiagnostics {
   arterialNetwork?: { samples: number; servedBefore: number; servedAfter: number; attempted: number; routes: number; addedLength: number; maximumDryDistance: number; links: { from: Point; to: Point; via: Point; width: number; year: number; length: number; ratio: number }[] }
   regionalDistrictRoutes?: { attempted: number; routes: number; addedLength: number }
   unservedAccessIds: string[]; accessAttempts: { id: string; from: Point; endHeading?: number; found: boolean }[]
+  accessConnections: { id: string; roadId: string }[]
   modern: { requested: string[]; completed: string[]; unavailable: { kind: string; reason: string }[] }
   bridgeSpans: (SurveyedBridgeSpan & { roadId: string })[]
   trunkSurveys: { stage: string; milliseconds: number; from?: Point; to?: Point; via?: Point; candidates?: number; found?: boolean }[]
@@ -123,7 +126,7 @@ class ContinuousRoadDesign {
   graph = new PlanarRoadGraph()
   readonly planner: RoadPlanner
   readonly regional: RegionalRoadPlanner | null
-  readonly diagnostics: ContinuousRoadDiagnostics = { attempted: 0, accepted: 0, rejected: 0, streetLength: 0, boundaryConnections: 0, coarseFaces: 0, blocks: 0, demandSamples: 0, framedDemandSamples: 0, demandCoverage: 0, unservedAccessIds: [], accessAttempts: [], modern: { requested: [], completed: [], unavailable: [] }, bridgeSpans: [], trunkSurveys: [], phaseMilliseconds: {}, sharedExpansion: { anchors: 0, rungs: 0, links: 0, routeFailures: 0, bridgeSurveys: 0 }, largeFaceDetours: { faces: 0, attempted: 0, accepted: 0, parentAreas: [] }, districtStreets: { spines: 0, reorientations: 0, serviceLoops: 0, loopDryArea: 0, uncoveredRestarts: 0 }, normalizationRejectedCuts: 0, partitionRejections: [] }
+  readonly diagnostics: ContinuousRoadDiagnostics = { attempted: 0, accepted: 0, rejected: 0, streetLength: 0, boundaryConnections: 0, coarseFaces: 0, blocks: 0, demandSamples: 0, framedDemandSamples: 0, demandCoverage: 0, unservedAccessIds: [], accessAttempts: [], accessConnections: [], modern: { requested: [], completed: [], unavailable: [] }, bridgeSpans: [], trunkSurveys: [], phaseMilliseconds: {}, sharedExpansion: { anchors: 0, rungs: 0, links: 0, routeFailures: 0, bridgeSurveys: 0 }, largeFaceDetours: { faces: 0, attempted: 0, accepted: 0, parentAreas: [] }, districtStreets: { spines: 0, reorientations: 0, serviceLoops: 0, loopDryArea: 0, uncoveredRestarts: 0 }, normalizationRejectedCuts: 0, partitionRejections: [] }
   readonly environment: PlanningEnvironment
   private serial = 0
   private siteApproaches = new Map<string, SimulatedRoad>()
@@ -224,15 +227,15 @@ class ContinuousRoadDesign {
     if (this.input.railways.some(railway => railway.points.slice(1).some((b, i) => route.points.slice(1).some((d, j) => hit(railway.points[i]!, b, route.points[j]!, d))))) this.syncRail()
     return added
   }
-  private publicProjections(point: Point, year: number, count = 16): RoadProjection[] {
+  private publicProjections(point: Point, year: number, count = 16, rooted?: ReadonlySet<string>, minimumWidth = 4.6): RoadProjection[] {
     const hits: RoadProjection[] = []
     for (const road of this.graph.roads) {
-      if (road.builtYear > year || road.width < 4.6 || road.controlledAccess || (road.level ?? 0) !== 0) continue
+      if (road.builtYear > year || road.width < minimumWidth || road.controlledAccess || road.role==='farm' || (road.level ?? 0) !== 0 || rooted&&!rooted.has(road.id)) continue
       for (let i = 1; i < road.points.length; i++) { const a = road.points[i - 1]!, b = road.points[i]!, projection = projectOnRoadSegment(point, a, b); hits.push({ ...projection, point: projection.point, distance: distance(point, projection.point), road, a, b }) }
     }
     hits.sort((a, b) => a.distance - b.distance)
     const result: RoadProjection[] = []
-    for (const candidate of hits) { if (!this.planner.suitable(candidate.point, 5) || result.some(other => distance(other.point, candidate.point) < 100)) continue; result.push(candidate); if (result.length >= count) break }
+    for (const candidate of hits) { if (!this.planner.suitable(candidate.point, Math.min(5,minimumWidth)) || result.some(other => distance(other.point, candidate.point) < 100)) continue; result.push(candidate); if (result.length >= count) break }
     return result
   }
   trunks() {
@@ -539,18 +542,24 @@ class ContinuousRoadDesign {
     for (const cell of cells) if (cell.served) metrics.maximumDryDistance = Math.max(metrics.maximumDryDistance, cell.dryDistance)
     this.diagnostics.collectorReachability = metrics
   }
-  private gate(target: ContinuousCityAccessTarget) {
-    const candidates = this.publicProjections(target.point, target.builtYear, 24)
-    if (candidates.some(hit => hit.distance < EPS)) { this.graph.ensureJunction(target.point); return true }
-    const sectors = new Set<number>(), selected: RoadProjection[] = []
-    for (const candidate of candidates) { const sector = Math.floor((heading(target.point, candidate.point) + Math.PI) / (Math.PI / 4)); if (sectors.has(sector)) continue; sectors.add(sector); selected.push(candidate); if (selected.length === 4) break }
-    for (const mouth of [false, true]) {
-      if (mouth && target.endHeading === undefined) continue
+  private gate(target: ContinuousCityAccessTarget, recovery = false) {
+    const certify=()=>certifyLayoutAccess({width:this.environment.width,height:this.environment.height,roads:this.graph.roads,targets:[target]}).unserved.length===0
+    if(certify())return true
+    const rooted=datedExternalPublicRoadIds({width:this.environment.width,height:this.environment.height,roads:this.graph.roads},target.builtYear)
+    const candidates = this.publicProjections(target.point, target.builtYear, recovery?48:24, rooted, recovery?4:4.6)
+    if (candidates.some(hit => hit.distance < EPS) && this.graph.ensureJunction(target.point) && certify()) return true
+    const sectors = new Map<number,number>(), selected: RoadProjection[] = []
+    for (const candidate of candidates) { const sector = Math.floor((heading(target.point, candidate.point) + Math.PI) / (Math.PI / 4)),count=sectors.get(sector)??0; if (count>=(recovery?2:1)) continue; sectors.set(sector,count+1); selected.push(candidate); if (selected.length === (recovery?6:4)) break }
+    const widths=recovery?[5,4]:[5]
+    for(const width of widths)for (const mouth of target.endHeading===undefined?[false]:recovery?[true,false]:[false,true]) {
       for (const anchor of selected) {
-        const route = this.planner.plan(anchor.point, target.point, { role: 'access', width: 6.5, allowBridge: true, alignment: 'planned', maximumGrade: .13, maxNodes: 1800, ...(mouth ? { endHeading: target.endHeading } : {}) })
+        // A sub16m entrance is a real small public acquisition, rather than
+        // a reason to move the door or claim a geometric gap is connected.
+        const short=distance(anchor.point,target.point)<16
+        const route = short ? mouth&&target.endHeading!==undefined&&Math.abs(angleDifference(heading(anchor.point,target.point),target.endHeading))>.2?null:this.planner.cost([anchor.point,target.point],'access') : this.planner.plan(anchor.point, target.point, { role: 'access', width: width+1.5, allowBridge: true, alignment: 'planned', maximumGrade: .13, maxNodes: recovery?6000:1800, ...(mouth ? { endHeading: target.endHeading } : {}) })
         this.diagnostics.accessAttempts.push({ id: target.id, from: anchor.point, ...(mouth ? { endHeading: target.endHeading } : {}), found: !!route })
-        const added = this.accept(route, 5, 'access', target.builtYear, '取得済みの施設・駅入口と同時代の公道を結ぶ道路')
-        if (added) { this.siteApproaches.set(target.id, added); return true }
+        const added = this.accept(route, width, 'access', target.builtYear, '取得済みの施設・駅入口と同時代の公道を結ぶ道路')
+        if (added && certify()) { this.siteApproaches.set(target.id, added); this.diagnostics.accessConnections.push({id:target.id,roadId:added.id}); return true }
       }
     }
     return false
@@ -688,10 +697,16 @@ class ContinuousRoadDesign {
    * The field chooses a project, never supplies a painted grid/gradient line.
    * Every accepted street supplies new dry cells; only its neighbours update. */
   private growLocalNetwork() {
-    type Cell = { point: Point; intensity: number; target: number; distance: number; dryAnchor: number; served: boolean; attempts: number; totalAttempts: number; revivals: number; version: number }
+    type Cell = { point: Point; area: number; intensity: number; target: number; form: ReturnType<typeof continuousLocalStreetForm>; distance: number; dryAnchor: number; served: boolean; attempts: number; totalAttempts: number; revivals: number; version: number }
     // 64m probes alias an entire 60–100m back garden between streets. At 32m
     // spacing a dense plot's 18–25m usable depth can influence a new project.
     const cellSize = 32, cells: Cell[] = [], bins = new Map<string, number[]>(), { width, height } = this.environment, queue = new MinHeap<{ index: number; version: number }>()
+    const frame = this.graph.roads.filter(road => road.width >= 6.5 && !road.controlledAccess && (road.level ?? 0) === 0 && road.role !== 'farm')
+    const frontage = (point: Point) => {
+      let nearest = Infinity, year = 1995
+      for (const road of frame) for (let i = 1; i < road.points.length; i++) { const depth = distanceToSegment(point, road.points[i - 1]!, road.points[i]!); if (depth < nearest) { nearest = depth; year = road.builtYear } }
+      return { frontageYear: year, frontageDistance: nearest }
+    }
     const publicRoad = (road: Road) => road.width >= 4.6 && !road.controlledAccess && (road.level ?? 0) === 0 && road.role !== 'farm'
     const onRail = (point: Point) => (this.railCells.get(`${Math.floor(point.x / 100)}:${Math.floor(point.y / 100)}`) ?? []).some(segment => distanceToSegment(point, segment.a, segment.b) < 7)
     const usable = (point: Point) => this.input.demand.at(point) > 0 && !this.planner.waterAt(point) && !onRail(point) && Number.isFinite(this.environment.landCost?.(point) ?? 0) && (this.environment.terrain?.slope(point) ?? 0) <= .13
@@ -701,15 +716,15 @@ class ContinuousRoadDesign {
       return -(Math.min(250, depth) / cell.target * (1 + cell.intensity * 1.5 + (site ? .8 : 0)) / (.7 + depth / 130))
     }
     const enqueue = (index: number) => { const cell = cells[index]!; if (!cell.served && cell.attempts < 3 && cell.totalAttempts < 9 && cell.distance <= 240) queue.push({ index, version: cell.version }, priority(cell)) }
-    for (let y = cellSize / 2; y < height; y += cellSize) for (let x = cellSize / 2; x < width; x += cellSize) {
-      const point = { x, y }
+    for (const point of continuousLocalAccessProbes(width, height, cellSize)) {
       if (!usable(point)) continue
-      const intensity = this.input.demand.at(point), target = continuousLocalStreetDepth(intensity)
+      const intensity = this.input.demand.at(point), form = continuousLocalStreetForm({ intensity, openingYear: this.input.demand.openingAt(point), ...frontage(point), slope: this.environment.terrain?.slope(point) ?? 0 }), target = form.depth
       let near = this.graph.nearest(point)
       if (near && !publicRoad(near.road)) near = this.graph.projections(point, 240, 12).find(hit => publicRoad(hit.road)) ?? null
       const depth = near?.distance ?? Infinity, clear = !!near && this.dryAccessClear(point, near.point), served = clear && depth <= target, index = cells.length
-      cells.push({ point, intensity, target, distance: depth, dryAnchor: clear ? depth : Infinity, served, attempts: 0, totalAttempts: 0, revivals: 0, version: 0 })
-      const key = `${Math.floor(x / 100)}:${Math.floor(y / 100)}`, list = bins.get(key) ?? []; list.push(index); bins.set(key, list)
+      const area = Math.min(cellSize, width - Math.floor(point.x / cellSize) * cellSize) * Math.min(cellSize, height - Math.floor(point.y / cellSize) * cellSize)
+      cells.push({ point, area, intensity, target, form, distance: depth, dryAnchor: clear ? depth : Infinity, served, attempts: 0, totalAttempts: 0, revivals: 0, version: 0 })
+      const key = `${Math.floor(point.x / 100)}:${Math.floor(point.y / 100)}`, list = bins.get(key) ?? []; list.push(index); bins.set(key, list)
       enqueue(index)
     }
     const metrics = { cellSize, dryCells: cells.length, servedBefore: cells.filter(cell => cell.served).length, servedAfter: 0, attempted: 0, streets: 0, connectedEnds: 0, deadEnds: 0, revivedCells: 0, gainedAreaEstimate: 0, unservedAreaEstimate: 0 }
@@ -745,13 +760,16 @@ class ContinuousRoadDesign {
       for (const anchor of options) { if (selected.some(other => distance(other.point, anchor.point) < 35)) continue; selected.push(anchor); if (selected.length >= 3) break }
       let accepted = false
       for (const anchor of selected) {
-        const direction = heading(anchor.point, goal), travel = Math.min(160, Math.max(50, anchor.distance + 10)), raw = { x: anchor.point.x + Math.cos(direction) * travel, y: anchor.point.y + Math.sin(direction) * travel }, end = usable(raw) ? raw : goal
+        const direction = heading(anchor.point, goal), travel = Math.min(cell.form.maximumLength - 12, Math.max(cell.form.minimumLength, anchor.distance + 10)), raw = { x: anchor.point.x + Math.cos(direction) * travel, y: anchor.point.y + Math.sin(direction) * travel }, end = usable(raw) ? raw : goal
         if (distance(anchor.point, end) < 20 || distance(anchor.point, end) > 180) continue
         const advancesTarget = (points: Point[]) => { const hit = projection(cell.point, points); return this.dryAccessClear(cell.point, hit.point) && (hit.depth <= cell.target || hit.depth + 25 < distance(cell.point, anchor.point)) }
         let contact = this.graph.projections(end, 80, 12).find(other => publicRoad(other.road) && distance(other.point, anchor.point) >= 60 && distance(other.point, anchor.point) <= 180 && (other.road !== anchor.road || distance(other.point, anchor.point) > 100)), target = contact?.point ?? end
-        const startHeading = this.graph.junctionHeading(anchor.point, target)
+        // Inherited lanes may follow the actual missing frontage at a safe
+        // oblique T. Major roads and later planned quarters retain their square
+        // engineering junctions; a one-arm end still continues tangentially.
+        const startHeading = this.graph.junctionHeading(anchor.point, target, anchor.road.width < 6.5 && cell.form.width < 5.1 ? Math.PI / 10 : 0)
         if (startHeading === null) continue
-        const width = 4.8, role = 'lane' as const
+        const width = cell.form.width, role = 'lane' as const
         let route: PlannedRoute | null = this.planner.cost([anchor.point, target], role)
         const directPhysical = this.valid(route, width, role)
         if (Math.abs(angleDifference(heading(anchor.point, target), startHeading)) > .35) {
@@ -760,26 +778,26 @@ class ContinuousRoadDesign {
           else {
             if (Math.abs(angleDifference(heading(anchor.point, target), startHeading)) > Math.PI * .6) continue
             const lead = Math.min(60, distance(anchor.point, target) * .5), corner = { x: anchor.point.x + Math.cos(startHeading) * lead, y: anchor.point.y + Math.sin(startHeading) * lead }, elbow = this.planner.cost(roundedStreet([anchor.point, corner, target], 40, .45), role)
-            route = this.valid(elbow, width, role) ? elbow : !directPhysical ? this.planner.plan(anchor.point, target, { role, width, startHeading, allowBridge: false, alignment: 'planned', maximumGrade: .13, maxNodes: 300 }) : null
+            route = this.valid(elbow, width, role) ? elbow : !directPhysical ? this.planner.plan(anchor.point, target, { role, width, startHeading, allowBridge: false, alignment: 'planned', maximumGrade: .13, maxNodes: 120 }) : null
           }
         } else if (!directPhysical) {
-          route = this.planner.plan(anchor.point, target, { role, width, startHeading, allowBridge: false, alignment: 'planned', maximumGrade: .13, maxNodes: 300 })
+          route = this.planner.plan(anchor.point, target, { role, width, startHeading, allowBridge: false, alignment: 'planned', maximumGrade: .13, maxNodes: 120 })
         }
-        if (!route || route.length > 180 || !advancesTarget(route.points) || !gains(route.points).length) continue
+        if (!route || route.length > cell.form.maximumLength || !advancesTarget(route.points) || !gains(route.points).length) continue
         let actualGain: number[] = []
         const year = Math.max(anchor.road.builtYear, contact?.road.builtYear ?? 0, this.input.demand.openingAt(goal))
-        const road = this.accept(route, width, role, year, contact ? '実公道の不足する接道奥行を短いT字接続で補う生活街路' : '未接道の乾地需要へ実frontageから伸びる短い生活街路', false, true, undefined, points => { actualGain = gains(points); return advancesTarget(points) && actualGain.length * cellSize * cellSize >= Math.max(cellSize * cellSize * .75, roadLength(points) * 12) })
+        const road = this.accept(route, width, role, year, contact ? '実公道の不足する接道奥行を短いT字接続で補う生活街路' : '未接道の乾地需要へ実frontageから伸びる短い生活街路', false, true, undefined, points => { actualGain = gains(points); return advancesTarget(points) && actualGain.reduce((sum, index) => sum + cells[index]!.area, 0) >= Math.max(cell.area * .75, roadLength(points) * 12) })
         if (!road) continue
         metrics.streets++; if (contact) metrics.connectedEnds++; else metrics.deadEnds++
-        metrics.gainedAreaEstimate += actualGain.length * cellSize * cellSize; update(road.points); accepted = true; break
+        metrics.gainedAreaEstimate += actualGain.reduce((sum, index) => sum + cells[index]!.area, 0); update(road.points); accepted = true; break
       }
       if (!accepted && cell.attempts < 3 && cell.totalAttempts < 9) { cell.version++; enqueue(item.index) }
     }
-    metrics.servedAfter = cells.filter(cell => cell.served).length; metrics.unservedAreaEstimate = (metrics.dryCells - metrics.servedAfter) * cellSize * cellSize
+    metrics.servedAfter = cells.filter(cell => cell.served).length; metrics.unservedAreaEstimate = cells.filter(cell => !cell.served).reduce((sum, cell) => sum + cell.area, 0)
     this.diagnostics.localNetwork = metrics
   }
-  acquireAccess() {
-    for (const target of this.input.accessTargets ?? []) if (!this.gate(target)) this.diagnostics.unservedAccessIds.push(target.id)
+  acquireAccess(recovery = false) {
+    for (const target of this.input.accessTargets ?? []) if (!this.gate(target,recovery)) this.diagnostics.unservedAccessIds.push(target.id)
     return this.result()
   }
   build(localOnly = false, frameOnly = false) {
@@ -829,7 +847,7 @@ class ContinuousRoadDesign {
 export function surveyContinuousCityTrunks(input: ContinuousCityRoadInput) { const design = new ContinuousRoadDesign({ ...input, initialRoads: [] }); design.trunks(); const { roads, diagnostics } = design.result(); return { roads, diagnostics } }
 export function buildContinuousCityRoads(input: ContinuousCityRoadInput) { return new ContinuousRoadDesign(input).build() }
 /** Survey actual public approaches once before refining station/road demand. */
-export function surveyContinuousCityAccess(input: ContinuousCityRoadInput) { return new ContinuousRoadDesign(input).acquireAccess() }
+export function surveyContinuousCityAccess(input: ContinuousCityRoadInput, recovery = false) { return new ContinuousRoadDesign(input).acquireAccess(recovery) }
 /** The same acquisition stages used by the city generator, before local infill. */
 export function surveyContinuousCityRoadFrame(input:ContinuousCityRoadInput){return new ContinuousRoadDesign(input).build(false,true)}
 /** Local survey over already materialized roads from this generation. Also

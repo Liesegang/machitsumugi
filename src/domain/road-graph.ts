@@ -208,7 +208,7 @@ export class PlanarRoadGraph {
     return arms.length === 1 ? Math.atan2(Math.sin(arms[0]! + Math.PI), Math.cos(arms[0]! + Math.PI)) : undefined
   }
   /** Departure into a junction's free sector. Null means this node is crowded. */
-  junctionHeading(point: Point, toward: Point): number | null {
+  junctionHeading(point: Point, toward: Point, maximumObliquity = 0): number | null {
     const arms = this.headingsAt(point), desired = Math.atan2(toward.y - point.y, toward.x - point.x)
     if (!arms.length) return null
     if (arms.length === 1) return Math.atan2(Math.sin(arms[0]! + Math.PI), Math.cos(arms[0]! + Math.PI))
@@ -216,7 +216,10 @@ export class PlanarRoadGraph {
     const candidates = arms.flatMap(angle => [angle + Math.PI / 2, angle - Math.PI / 2])
       .filter(angle => arms.every(arm => difference(angle, arm) >= Math.PI * 70 / 180))
       .sort((a, b) => difference(a, desired) - difference(b, desired))
-    return candidates[0] ?? null
+    const square = candidates[0]
+    if (square === undefined) return null
+    if (maximumObliquity > 0 && difference(desired, square) <= Math.min(Math.PI / 9, maximumObliquity) && arms.every(arm => difference(desired, arm) >= Math.PI * 70 / 180)) return desired
+    return square
   }
   /** A new major street may not create a needle-shaped oblique crossing. */
   hasAcuteMajorCrossing(path: Point[], minimumDegrees = 50) {

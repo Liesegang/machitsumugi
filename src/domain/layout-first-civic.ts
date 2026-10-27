@@ -29,8 +29,11 @@ interface HospitalRepairReport {
   anchors: number; connectedAnchors: number; selectedAnchors: number; examinedSites: number; attemptedSites: number
   rejected: Record<string, number>; samples: { point: Point; reason: string }[]; adopted?: Point
 }
+export interface CivicRepairReport extends HospitalRepairReport { kind: FacilityKind; accessId: string; reason?: string }
 const hospitalRepairs = new WeakMap<LayoutFirstCivicResult, HospitalRepairReport>()
 export const hospitalRepairReport = (programme: LayoutFirstCivicResult) => hospitalRepairs.get(programme)
+const civicRepairs = new WeakMap<LayoutFirstCivicResult, CivicRepairReport[]>()
+export const civicRepairReport = (programme: LayoutFirstCivicResult, accessIdOrKind?: string) => civicRepairs.get(programme)?.findLast(report => !accessIdOrKind || report.accessId === accessIdOrKind || report.kind === accessIdOrKind)
 const names: Record<FacilityKind, string> = { castle: '城跡公園', shrine: '八幡神社', school: '第一小学校', hospital: '市民病院', police: '中央警察署', university: '地域大学', park: '中央公園', port: '港・魚市場', onsen: '共同浴場', shop: '中央商店街' }
 const openings: Record<FacilityKind, number> = { castle: 1650, shrine: 1650, school: 1875, hospital: 1920, police: 1880, university: 1965, park: 1955, port: 1920, onsen: 1650, shop: 1750 }
 const line = (...pairs: [number, number][]) => pairs.map(([x, y]) => ({ x, y }))
@@ -64,31 +67,56 @@ export function reserveLayoutFirstCivics(input: LayoutFirstCivicInput): LayoutFi
  * append the returned civic roads; no terrain/rail or other programme is rerun.
  * If no complete surveyed repair fits, return the previous programme intact. */
 export function resurveyLayoutFirstHospital(input: LayoutFirstCivicInput, previous: LayoutFirstCivicResult, roads: Road[], railways: Railway[] = [], protectedGround: readonly PolygonRegion[] = []): LayoutFirstCivicResult {
-  if (!input.config.facilities.includes('hospital')) return previous
-  return civicProgramme(input, { previous, roads, railways, protectedGround })
+  return resurveyLayoutFirstCivic(input, previous, roads, 'hospital', railways, protectedGround)
 }
 
-function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: LayoutFirstCivicResult; roads: Road[]; railways: Railway[]; protectedGround: readonly PolygonRegion[] }): LayoutFirstCivicResult {
-  const repairReport: HospitalRepairReport = { anchors: 0, connectedAnchors: 0, selectedAnchors: 0, examinedSites: 0, attemptedSites: 0, rejected: {}, samples: [] }
+/** Reacquire one failed institution beside a genuinely open same-era public
+ * route. All of its grounds, buildings, paths and gate move together before
+ * private land is adopted. No old road/date, terrain or other civic is changed.
+ * Shoreline ports retain their specialised dry-shore survey. Historic castles
+ * must be repaired by road survey rather than an ordinary campus template. */
+export function resurveyLayoutFirstCivic(input: LayoutFirstCivicInput, previous: LayoutFirstCivicResult, roads: Road[], accessIdOrKind: string, railways: Railway[] = [], protectedGround: readonly PolygonRegion[] = []): LayoutFirstCivicResult {
+  const kind = (Object.keys(names) as FacilityKind[]).find(kind => accessIdOrKind === kind || accessIdOrKind === `facility-access-${kind}` || accessIdOrKind.startsWith(`facility-access-${kind}-`))
+  if (!kind || !input.config.facilities.includes(kind)) return previous
+  const accessId = accessIdOrKind === kind ? `facility-access-${kind}` : accessIdOrKind
+  const suffix = accessId.slice(`facility-access-${kind}`.length), facility = previous.facilities.find(facility => facility.id === `facility-${kind}${suffix}`)
+  if (suffix && !facility) return previous
+  const target = previous.accessTargets.find(target => target.id === accessId)
+  if (kind === 'castle' || kind === 'shop') {
+    const report: CivicRepairReport = { kind, accessId, anchors: 0, connectedAnchors: 0, selectedAnchors: 0, examinedSites: 0, attemptedSites: 0, rejected: {}, samples: [], reason: '固有の歴史的用地・海岸・商業敷地を維持し、実道路の再測量で接続します。' }
+    civicRepairs.set(previous, [...civicRepairs.get(previous) ?? [], report])
+    return previous
+  }
+  return civicProgramme(input, { previous, roads, railways, protectedGround, kind, accessId, suffix, name: facility?.name, opening: target?.builtYear ?? openings[kind] })
+}
+
+function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: LayoutFirstCivicResult; roads: Road[]; railways: Railway[]; protectedGround: readonly PolygonRegion[]; kind: FacilityKind; accessId: string; suffix: string; name?: string; opening: number }): LayoutFirstCivicResult {
+  const repairReport: CivicRepairReport = { kind: repair?.kind ?? 'hospital', accessId: repair?.accessId ?? 'facility-access-hospital', anchors: 0, connectedAnchors: 0, selectedAnchors: 0, examinedSites: 0, attemptedSites: 0, rejected: {}, samples: [] }
+  const recordRepair = (programme: LayoutFirstCivicResult) => {
+    civicRepairs.set(programme, [...civicRepairs.get(repair!.previous) ?? [], repairReport])
+    if (repair!.kind === 'hospital') hospitalRepairs.set(programme, repairReport)
+  }
   let candidatePoint: Point | undefined
   const reject = (reason: string) => {
     if (repair) { repairReport.rejected[reason] = (repairReport.rejected[reason] ?? 0) + 1; if (candidatePoint && repairReport.samples.length < 40) repairReport.samples.push({ point: candidatePoint, reason }) }
     return false
   }
-  const isHospital = (id: string) => /^(?:facility-(?:lot|building|access)-hospital)(?:-|$)/.test(id) || id === 'facility-hospital'
-  const oldHospitalPolygons = repair?.previous.areas.filter(area => isHospital(area.id)).map(area => area.polygon) ?? []
+  const retainedOptional = repair?.previous.optionalProgrammes.filter(programme => programme.accessId !== repair.accessId) ?? []
+  const retainedAreaIds = new Set(retainedOptional.flatMap(programme => programme.areaIds)), retainedRoadIds = new Set(retainedOptional.flatMap(programme => programme.roadIds))
+  const isRepairEntity = (id: string) => !!repair && (id === `facility-${repair.kind}${repair.suffix}` || [`facility-lot-${repair.kind}${repair.suffix}`, `facility-building-${repair.kind}${repair.suffix}`, repair.accessId].some(prefix => id === prefix || id.startsWith(prefix + '-'))) && !retainedAreaIds.has(id) && !retainedRoadIds.has(id)
+  const oldRepairPolygons = repair?.previous.areas.filter(area => isRepairEntity(area.id)).map(area => area.polygon) ?? []
   const samePolygon = (a: Point[], b: Point[]) => a === b || a.length === b.length && a.every((p, i) => distance(p, b[i]!) < 1e-7)
   const result: LayoutFirstCivicResult = repair ? {
-    areas: repair.previous.areas.filter(area => !isHospital(area.id)), buildings: repair.previous.buildings.filter(building => !isHospital(building.id)),
-    facilities: repair.previous.facilities.filter(facility => !isHospital(facility.id)), roads: repair.previous.roads.filter(road => !isHospital(road.id)),
-    reserves: repair.previous.reserves.filter(region => !oldHospitalPolygons.some(polygon => samePolygon(polygon, region.polygon))),
-    accessTargets: repair.previous.accessTargets.filter(target => !isHospital(target.id)), unplacedFacilities: repair.previous.unplacedFacilities.filter(item => item.kind !== 'hospital'),
-    optionalAccessIds: [...repair.previous.optionalAccessIds], optionalProgrammes: [...repair.previous.optionalProgrammes],
+    areas: repair.previous.areas.filter(area => !isRepairEntity(area.id)), buildings: repair.previous.buildings.filter(building => !isRepairEntity(building.id)),
+    facilities: repair.previous.facilities.filter(facility => !isRepairEntity(facility.id)), roads: repair.previous.roads.filter(road => !isRepairEntity(road.id)),
+    reserves: repair.previous.reserves.filter(region => !oldRepairPolygons.some(polygon => samePolygon(polygon, region.polygon))),
+    accessTargets: repair.previous.accessTargets.filter(target => target.id !== repair.accessId), unplacedFacilities: repair.previous.unplacedFacilities.filter(item => item.kind !== repair.kind),
+    optionalAccessIds: repair.previous.optionalAccessIds.filter(id => id !== repair.accessId), optionalProgrammes: [...retainedOptional],
   } : { areas: [], buildings: [], facilities: [], roads: [], reserves: [], accessTargets: [], unplacedFacilities: [], optionalAccessIds: [], optionalProgrammes: [] }
   const boundary = (p: Point) => p.x >= 10 && p.y >= 10 && p.x <= input.width - 10 && p.y <= input.height - 10
   const waters = input.terrain.areas.filter(area => area.kind === 'water')
   const existingPaths: PolygonRegion[] = repair ? result.roads.flatMap(road => road.points.slice(1).flatMap((b, i) => distance(road.points[i]!, b) > .01 ? [{ polygon: corridorPolygon(road.points[i]!, b, road.width / 2 + .25) }] : [])) : []
-  const repairRoads = repair?.roads.filter(road => !isHospital(road.id)) ?? []
+  const repairRoads = repair?.roads.filter(road => !isRepairEntity(road.id)) ?? []
   const railMasks: PolygonRegion[] = repair?.railways.filter(railway => railway.mode !== 'subway').flatMap(railway => railway.points.slice(1).flatMap((b, i) => distance(railway.points[i]!, b) > .01 ? [{ polygon: corridorPolygon(railway.points[i]!, b, 10.5) }] : [])) ?? []
   const transportBins = new Map<string, { region: PolygonRegion; bounds: ReturnType<typeof boundsOf> }[]>()
   const fixedGround = [...railMasks, ...repair?.protectedGround ?? []]
@@ -125,9 +153,33 @@ function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: Layou
     for (const radius of [step, step * 1.8, step * 2.7, step * 3.5]) for (let i = 0; i < 8; i++) points.push({ x: input.center.x + Math.cos(phase + i * Math.PI / 4) * radius, y: input.center.y + Math.sin(phase + i * Math.PI / 4) * radius })
     return points.filter(boundary).slice(0, kind === 'castle' ? 7 : 36)
   }
-  const append = (kind: FacilityKind, center: Point, proposal: LocalPattern, angle: number, identity?: { suffix: string; name: string }) => {
+  const shorelineSites = (roots?: readonly Point[]) => {
+    const shoreline: { center: Point; angle: number; score: number }[] = []
+    for (const area of waters.filter(area => area.id.startsWith('sea'))) for (let i = 0; i < area.polygon.length; i++) {
+      const a = area.polygon[i]!, b = area.polygon[(i + 1) % area.polygon.length]!, span = distance(a, b)
+      if (span < .1) continue
+      const divisions = Math.max(1, Math.ceil(span / 80))
+      for (let division = 0; division < divisions; division++) for (const side of [1, -1]) {
+        const normal = { x: -(b.y - a.y) / span * side, y: (b.x - a.x) / span * side }, t = (division + .5) / divisions
+        const shore = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }, center = { x: shore.x - normal.x * 48, y: shore.y - normal.y * 48 }, wet = { x: shore.x + normal.x * 6, y: shore.y + normal.y * 6 }
+        if (!boundary(center) || !input.terrain.waterAt(wet) || input.terrain.waterAt(center) || input.terrain.elevation(shore) > 4 || input.terrain.elevation(center) > 6) continue
+        const near = Math.min(distance(center, input.center), ...preferredZones.map(zone => Math.max(0, distance(center, zone.center) - zone.radius * .6))), gate = { x: center.x - normal.x * 51, y: center.y - normal.y * 51 }
+        let wetApproach = 0
+        for (let j = 1; j < 12; j++) if (input.terrain.waterAt({ x: input.center.x + (gate.x - input.center.x) * j / 12, y: input.center.y + (gate.y - input.center.y) * j / 12 })) wetApproach++
+        let rootDistance = 0
+        if (roots?.length) { rootDistance = Infinity; for (const point of roots) rootDistance = Math.min(rootDistance, distance(point, gate)) }
+        shoreline.push({ center, angle: Math.atan2(normal.y, normal.x) - Math.PI / 2, score: near + distance(center, input.center) * .35 + wetApproach * 250 + rootDistance * 2 })
+      }
+    }
+    shoreline.sort((a, b) => a.score - b.score || a.center.x - b.center.x || a.center.y - b.center.y)
+    const distinct: typeof shoreline = []
+    for (const candidate of shoreline) { if (distinct.every(previous => distance(previous.center, candidate.center) >= 35)) distinct.push(candidate); if (distinct.length >= 48) break }
+    return distinct
+  }
+  const append = (kind: FacilityKind, center: Point, proposal: LocalPattern, angle: number, identity?: { suffix: string; name: string; builtYear?: number }) => {
     const suffix = identity?.suffix ?? ''
     const name = identity?.name ?? (kind === 'school' || kind === 'university' ? `${input.config.name.replace(/[市町村]$/, '')}${kind === 'school' ? '第一小学校' : '大学'}` : names[kind])
+    const opening = identity?.builtYear ?? openings[kind]
     const c = Math.cos(angle), s = Math.sin(angle), tr = (p: Point) => ({ x: center.x + c * p.x - s * p.y, y: center.y + s * p.x + c * p.y })
     const campus = rectangle(-proposal.width / 2, -proposal.depth / 2, proposal.width, proposal.depth).map(tr)
     if (!transportClear(campus)) return reject('campus-transport')
@@ -141,7 +193,7 @@ function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: Layou
       if (!ground(polygon, .16)) return reject('building-ground')
       const formation = surveyDevelopmentSite(input.terrain, center, polygon)
       if (!formation.viable) return reject('building-formation')
-      buildings.push({ id: `facility-building-${kind}${suffix}-${i}`, polygon, kind: shape.lodging ? 'commercial' : kind === 'port' ? 'industrial' : 'public', height: Math.min(shape.floors, formation.maximumFloors), builtYear: openings[kind] + i % 3 * 5,
+      buildings.push({ id: `facility-building-${kind}${suffix}-${i}`, polygon, kind: shape.lodging ? 'commercial' : kind === 'port' ? 'industrial' : 'public', height: Math.min(shape.floors, formation.maximumFloors), builtYear: opening + i % 3 * 5,
         name: shape.lodging ? shape.label : `${name} ${shape.label}`, ...(shape.lodging ? { use: 'lodging' as const, lodgingType: 'ryokan' as const, guestRooms: Math.round(shape.polygon.length * shape.floors * 2 + i * 3) } : {}) })
     }
     const paths = proposal.paths.map(path => path.map(tr)), masks = paths.flatMap(path => path.slice(1).map((b, i) => ({ polygon: corridorPolygon(path[i]!, b, 1.65) })))
@@ -155,8 +207,8 @@ function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: Layou
     result.buildings.push(...buildings)
     const grounds: Area = { id: `facility-lot-${kind}${suffix}`, polygon: campus, kind: kind === 'park' || kind === 'shrine' ? 'park' : 'field', ...(kind !== 'park' && kind !== 'shrine' ? { landUse: 'vacant' as const } : {}), name }
     result.areas.push(grounds, ...proposal.areas.filter(area => !(area.polygon.length === 4 && area.park && (kind === 'park' || kind === 'shrine'))).map((area, i): Area => ({ id: `facility-lot-${kind}${suffix}-${i}`, polygon: area.polygon.map(tr), kind: area.park ? 'park' : 'field', ...(!area.park ? { landUse: 'vacant' as const } : {}), ...(area.label ? { name: area.label } : {}) })))
-    result.roads.push(...paths.map((points, i): Road => ({ id: `facility-access-${kind}${suffix}-${i}`, points, kind: 'local', width: 2.8, role: 'access', builtYear: openings[kind], reason: `${name}の公道側の入口と構内を結ぶ通路` })))
-    result.accessTargets.push({ id: `facility-access-${kind}${suffix}`, point: gate, builtYear: openings[kind] })
+    result.roads.push(...paths.map((points, i): Road => ({ id: `facility-access-${kind}${suffix}-${i}`, points, kind: 'local', width: 2.8, role: 'access', builtYear: opening, reason: `${name}の公道側の入口と構内を結ぶ通路` })))
+    result.accessTargets.push({ id: `facility-access-${kind}${suffix}`, point: gate, builtYear: opening })
     return true
   }
   if (repair) {
@@ -165,49 +217,82 @@ function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: Layou
       if (!b) return [a]
       const count = Math.max(1, Math.ceil(distance(a, b) / 60))
       return Array.from({ length: count }, (_, j) => ({ x: a.x + (b.x - a.x) * j / count, y: a.y + (b.y - a.y) * j / count }))
-    }) }))), opening = openings.hospital
+    }) }))), opening = repair.opening
     type Anchor = { id: string; point: Point; tangent: Point; width: number; score: number }
-    const anchors: Anchor[] = [], oldCenter = repair.previous.facilities.find(facility => facility.kind === 'hospital')?.point ?? input.center
+    const anchors: Anchor[] = [], oldCenter = repair.previous.facilities.find(facility => facility.id === `facility-${repair.kind}${repair.suffix}`)?.point ?? input.center
     for (const road of normalized) {
-      if (controlledRoad(road) || (road.level ?? 0) !== 0 || road.bridge || road.role === 'farm' || road.role === 'bridge' || (road.builtYear ?? 1650) > opening) continue
+      if (controlledRoad(road) || (road.level ?? 0) !== 0 || road.width < 4.6 || road.role === 'farm' || (road.builtYear ?? 1650) > opening) continue
       let nextSample = 0, along = 0
       for (let i = 1; i + 1 < road.points.length; i++) {
         along += distance(road.points[i - 1]!, road.points[i]!)
         if (along < nextSample) continue
         nextSample = along + 60
         const point = road.points[i]!, span = distance(road.points[i - 1]!, road.points[i + 1]!)
-        if (!boundary(point) || span < .01) continue
-        anchors.push({ id: `hospital-repair-anchor-${anchors.length}`, point, tangent: { x: (road.points[i + 1]!.x - road.points[i - 1]!.x) / span, y: (road.points[i + 1]!.y - road.points[i - 1]!.y) / span }, width: road.width, score: distance(point, input.center) + distance(point, oldCenter) * .2 })
+        if (!boundary(point) || span < .01 || input.terrain.waterAt(point) || (road.surveyedBridgeSpans ?? []).some(deck => distanceToSegment(point, deck.bankA, deck.bankB) <= road.width / 2 + .75) || (road.bridge || road.role === 'bridge') && !road.surveyedBridgeSpans?.length) continue
+        anchors.push({ id: `civic-repair-anchor-${anchors.length}`, point, tangent: { x: (road.points[i + 1]!.x - road.points[i - 1]!.x) / span, y: (road.points[i + 1]!.y - road.points[i - 1]!.y) / span }, width: road.width, score: distance(point, input.center) + distance(point, oldCenter) * .2 })
       }
     }
     const certificate = certifyLayoutAccess({ width: input.width, height: input.height, roads: normalized, targets: anchors.map(anchor => ({ id: anchor.id, point: anchor.point, builtYear: opening })) })
     const rejected = new Set(certificate.unserved), sorted = anchors.filter(anchor => !rejected.has(anchor.id)).sort((a, b) => a.score - b.score || a.point.x - b.point.x || a.point.y - b.point.y)
     repairReport.anchors = anchors.length; repairReport.connectedAnchors = sorted.length
-    const proposal = pattern('hospital')
-    type Site = { anchor: Anchor; normal: Point; approachLength: number; gate: Point; center: Point; angle: number; approach: PolygonRegion }
+    const originalOptional = repair.previous.optionalProgrammes.find(programme => programme.accessId === repair.accessId)
+    const optionalGround = originalOptional?.reserves[0], optionalBounds = optionalGround && boundsOf(optionalGround.polygon)
+    const optionalPattern = optionalBounds ? (() => {
+      // Keep a small neighbourhood green small when reacquiring one satellite.
+      const width = Math.min(64, Math.hypot(optionalGround!.polygon[1]!.x - optionalGround!.polygon[0]!.x, optionalGround!.polygon[1]!.y - optionalGround!.polygon[0]!.y)), depth = Math.min(54, Math.hypot(optionalGround!.polygon[2]!.x - optionalGround!.polygon[1]!.x, optionalGround!.polygon[2]!.y - optionalGround!.polygon[1]!.y))
+      return { width, depth, buildings: [], areas: [], paths: [line([0, -depth / 2 - 6], [0, -depth * .3]), line([0, -depth * .3], [-width * .3, -depth * .23], [-width * .3, depth * .25], [width * .3, depth * .25], [width * .3, -depth * .23], [0, -depth * .3])] } satisfies LocalPattern
+    })() : undefined
+    const proposals = optionalPattern ? [optionalPattern] : repair.kind === 'university' ? [pattern(repair.kind), pattern(repair.kind, true)] : [pattern(repair.kind)]
+    type Site = { anchor: Anchor; normal: Point; approachLength: number; gate: Point; center: Point; angle: number; approach: PolygonRegion; proposal: LocalPattern }
     const selected: Site[] = []
     // A dense street grid cannot contain a 130 m campus. Test the known road,
     // institution and water masks before spending the bounded physical survey
     // budget; the nearest twenty centre-street anchors can all be impossible.
-    siteSelection: for (const anchor of sorted) for (const side of [1, -1]) {
+    if (repair.kind !== 'port') {
+    siteSelection: for (const anchor of sorted) for (const side of [1, -1]) for (const proposal of proposals) {
       const normal = { x: -anchor.tangent.y * side, y: anchor.tangent.x * side }, approachLength = anchor.width / 2 + 24
       const gate = { x: anchor.point.x + normal.x * approachLength, y: anchor.point.y + normal.y * approachLength }
-      const center = { x: gate.x + normal.x * 61, y: gate.y + normal.y * 61 }, approach = { polygon: corridorPolygon(anchor.point, gate, 3.25) }
+      const center = { x: gate.x + normal.x * (proposal.depth / 2 + 6), y: gate.y + normal.y * (proposal.depth / 2 + 6) }
+      // Survey the eventual5m road's square end caps as well as its shoulders.
+      const approach = { polygon: corridorPolygon({ x: anchor.point.x - normal.x * 2.5, y: anchor.point.y - normal.y * 2.5 }, { x: gate.x + normal.x * 2.5, y: gate.y + normal.y * 2.5 }, 3.25) }
       const angle = Math.atan2(normal.y, normal.x) - Math.PI / 2, c = Math.cos(angle), s = Math.sin(angle)
       const campus = rectangle(-proposal.width / 2, -proposal.depth / 2, proposal.width, proposal.depth)
         .map(p => ({ x: center.x + c * p.x - s * p.y, y: center.y + s * p.x + c * p.y }))
       candidatePoint = center; repairReport.examinedSites++
       if (!campus.every(boundary)) { reject('prefilter-campus-bounds'); continue }
+      if (originalOptional && (!input.zones.some(zone => zone.kind !== 'rural' && zone.kind !== 'industrial' && pointInRegion(center, zone)) || result.facilities.some(facility => facility.kind === 'park' && distance(facility.point, center) < 300))) { reject('prefilter-neighbourhood-context'); continue }
       if (!transportClear(campus)) { reject('prefilter-campus-transport'); continue }
       if ([...result.reserves, ...existingPaths].some(region => polygonOverlapsRegion(campus, region))) { reject('prefilter-campus-civic'); continue }
       if (waters.some(water => polygonOverlapsRegion(campus, water) || polygonOverlapsRegion(approach.polygon, water))) { reject('prefilter-water'); continue }
       if ([...result.reserves, ...fixedGround].some(region => polygonOverlapsRegion(approach.polygon, region))) { reject('prefilter-approach-protected'); continue }
-      if (selected.some(site => distance(site.center, center) < 65)) continue
-      selected.push({ anchor, normal, approachLength, gate, center, angle, approach })
+      if (selected.some(site => site.proposal === proposal && distance(site.center, center) < 65)) continue
+      selected.push({ anchor, normal, approachLength, gate, center, angle, approach, proposal })
       if (selected.length >= 40) break siteSelection
     }
+    } else {
+      // A port keeps the real low shoreline, market/warehouse and quayside
+      // programme. Only a short dry approach from an actually open public
+      // anchor is acquired; no water is filled or silently bridged.
+      const proposal = pattern('port')
+      portSelection: for (const { center, angle } of shorelineSites(sorted.map(anchor => anchor.point))) {
+        const c = Math.cos(angle), s = Math.sin(angle), gate = { x: center.x + s * (proposal.depth / 2 + 6), y: center.y - c * (proposal.depth / 2 + 6) }
+        const campus = rectangle(-proposal.width / 2, -proposal.depth / 2, proposal.width, proposal.depth).map(p => ({ x: center.x + c * p.x - s * p.y, y: center.y + s * p.x + c * p.y }))
+        candidatePoint = center; repairReport.examinedSites++
+        if (!campus.every(boundary)) { reject('prefilter-campus-bounds'); continue }
+        if (!transportClear(campus)) { reject('prefilter-campus-transport'); continue }
+        if ([...result.reserves, ...existingPaths].some(region => polygonOverlapsRegion(campus, region))) { reject('prefilter-campus-civic'); continue }
+        for (const anchor of sorted.map(anchor => ({ ...anchor, approachLength: distance(anchor.point, gate) })).filter(anchor => anchor.approachLength > 1e-7 && anchor.approachLength <= 400).sort((a, b) => a.approachLength - b.approachLength || a.score - b.score).slice(0, 3)) {
+          const approachLength = anchor.approachLength, normal = { x: (gate.x - anchor.point.x) / approachLength, y: (gate.y - anchor.point.y) / approachLength }
+          const approach = { polygon: corridorPolygon({ x: anchor.point.x - normal.x * 2.5, y: anchor.point.y - normal.y * 2.5 }, { x: gate.x + normal.x * 2.5, y: gate.y + normal.y * 2.5 }, 3.25) }
+          if (polygonOverlapsRegion(approach.polygon, { polygon: campus }) || waters.some(water => polygonOverlapsRegion(campus, water) || polygonOverlapsRegion(approach.polygon, water))) { reject('prefilter-port-water-or-campus'); continue }
+          if ([...result.reserves, ...fixedGround].some(region => polygonOverlapsRegion(approach.polygon, region))) { reject('prefilter-approach-protected'); continue }
+          selected.push({ anchor, normal, approachLength, gate, center, angle, approach, proposal })
+          if (selected.length >= 40) break portSelection
+        }
+      }
+    }
     repairReport.selectedAnchors = new Set(selected.map(site => site.anchor.id)).size
-    for (const { anchor, normal, approachLength, gate, center, angle, approach } of selected.slice(0, 40)) {
+    for (const { anchor, normal, approachLength, gate, center, angle, approach, proposal } of selected.slice(0, 40)) {
       candidatePoint = center; repairReport.attemptedSites++
       // Public paving may join its source road, but never cut through another
       // protected institution, water or railway to reach the new reservation.
@@ -219,12 +304,24 @@ function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: Layou
         if (Math.abs(input.terrain.elevation(a) - input.terrain.elevation(b)) > distance(a, b) * .13 + 1e-7) { viable = false; break }
       }
       if (!viable) { reject('approach-grade'); continue }
-      if (!append('hospital', center, proposal, angle)) continue
-      result.roads.push({ id: 'facility-access-hospital-public', points: [anchor.point, gate], width: 5, role: 'access', kind: 'local', builtYear: opening, reason: '実際に開通している公道に接続する病院用地の進入路' })
-      repairReport.adopted = center; hospitalRepairs.set(result, repairReport)
+      const before = { areas: result.areas.length, buildings: result.buildings.length, roads: result.roads.length, reserves: result.reserves.length, accessTargets: result.accessTargets.length, facilities: result.facilities.length, existingPaths: existingPaths.length }
+      const oldName = repair.name ?? (repair.kind === 'school' || repair.kind === 'university' ? `${input.config.name.replace(/[市町村]$/, '')}${repair.kind === 'school' ? '第一小学校' : '大学'}` : names[repair.kind])
+      if (!append(repair.kind, center, proposal, angle, { suffix: repair.suffix, name: oldName, builtYear: opening })) continue
+      result.roads.push({ id: `${repair.accessId}-public`, points: [anchor.point, gate], width: 5, role: 'access', kind: 'local', builtYear: opening, reason: `実際に開通している公道に接続する${oldName}用地の進入路` })
+      const connected = certifyLayoutAccess({ width: input.width, height: input.height, roads: materializeRoadJunctions([...repairRoads, ...result.roads]), targets: result.accessTargets.filter(target => target.id === repair.accessId) })
+      if (connected.unserved.length) {
+        for (const field of ['areas', 'buildings', 'roads', 'reserves', 'accessTargets', 'facilities'] as const) result[field].splice(before[field])
+        existingPaths.splice(before.existingPaths); reject('final-external-certificate'); continue
+      }
+      if (originalOptional) {
+        const programme = { accessId: repair.accessId, facilityId: `facility-${repair.kind}${repair.suffix}`, areaIds: result.areas.slice(before.areas).map(area => area.id), roadIds: result.roads.slice(before.roads).map(road => road.id), reserves: result.reserves.slice(before.reserves) }
+        result.optionalProgrammes.push(programme); result.optionalAccessIds.push(programme.accessId)
+      }
+      repairReport.adopted = center; recordRepair(result)
       return result
     }
-    hospitalRepairs.set(repair.previous, repairReport)
+    repairReport.reason = sorted.length ? '同年の外部道路に接する建物・用地・進入路を、保護地・水域・鉄道・地盤の条件下で再取得できませんでした。' : '開設時点に外部へ接続済みの公道がありません。'
+    recordRepair(repair.previous)
     return repair.previous
   }
   const order: FacilityKind[] = ['castle', 'university', 'school', 'hospital', 'park', 'onsen', 'shrine', 'police', 'port']
@@ -251,35 +348,7 @@ function civicProgramme(input: LayoutFirstCivicInput, repair?: { previous: Layou
         placed = true; break
       }
     } else if (kind === 'port') {
-      // Use existing low, dry shoreline ground. A selected checkbox cannot
-      // manufacture reclamation, or put a warehouse on a painted water mask.
-      const coast = waters.filter(area => area.id.startsWith('sea'))
-      const shoreline: { center: Point; angle: number; score: number }[] = []
-      for (const area of coast) for (let i = 0; i < area.polygon.length; i++) {
-        const a = area.polygon[i]!, b = area.polygon[(i + 1) % area.polygon.length]!, span = distance(a, b)
-        if (span < .1) continue
-        // Long straight shore segments need real candidate coverage as well;
-        // the starting vertex/order of a contour has no geographical meaning.
-        const divisions = Math.max(1, Math.ceil(span / 80))
-        for (let division = 0; division < divisions; division++) for (const side of [1, -1]) {
-          const normal = { x: -(b.y - a.y) / span * side, y: (b.x - a.x) / span * side }, t = (division + .5) / divisions
-          const shore = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
-          const center = { x: shore.x - normal.x * 48, y: shore.y - normal.y * 48 }, wet = { x: shore.x + normal.x * 6, y: shore.y + normal.y * 6 }
-          if (!boundary(center) || !input.terrain.waterAt(wet) || input.terrain.waterAt(center) || input.terrain.elevation(shore) > 4 || input.terrain.elevation(center) > 6) continue
-          const near = Math.min(distance(center, input.center), ...preferredZones.map(zone => Math.max(0, distance(center, zone.center) - zone.radius * .6)))
-          const gate = { x: center.x - normal.x * 51, y: center.y - normal.y * 51 }
-          let wetApproach = 0
-          for (let j = 1; j < 12; j++) if (input.terrain.waterAt({ x: input.center.x + (gate.x - input.center.x) * j / 12, y: input.center.y + (gate.y - input.center.y) * j / 12 })) wetApproach++
-          shoreline.push({ center, angle: Math.atan2(normal.y, normal.x) - Math.PI / 2, score: near + distance(center, input.center) * .35 + wetApproach * 250 })
-        }
-      }
-      shoreline.sort((a, b) => a.score - b.score || a.center.x - b.center.x || a.center.y - b.center.y)
-      const distinct: typeof shoreline = []
-      for (const candidate of shoreline) {
-        if (distinct.every(previous => distance(previous.center, candidate.center) >= 35)) distinct.push(candidate)
-        if (distinct.length >= 48) break
-      }
-      for (const site of distinct) if (append(kind, site.center, pattern(kind), site.angle)) { placed = true; break }
+      for (const site of shorelineSites()) if (append(kind, site.center, pattern(kind), site.angle)) { placed = true; break }
     } else {
       outer: for (const point of candidates(kind)) {
         const gx = input.terrain.elevation({ x: point.x + 8, y: point.y }) - input.terrain.elevation({ x: point.x - 8, y: point.y }), gy = input.terrain.elevation({ x: point.x, y: point.y + 8 }) - input.terrain.elevation({ x: point.x, y: point.y - 8 })

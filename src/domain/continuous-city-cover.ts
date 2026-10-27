@@ -329,7 +329,7 @@ function roadContacts(roads: readonly Road[]) {
 /** Rural components are cut only for bounded processing. A positive-length
  * shared tile edge transfers existing field access; a corner touch cannot.
  * Their coordinates and holes remain an explicit, disjoint partition. */
-function roadServedRuralPartition(parts: readonly PolygonRegion[], touches: (region: PolygonRegion) => boolean, tile: number) {
+function ruralPartitionComponents(parts: readonly PolygonRegion[], tile: number) {
   const parents = parts.map((_, i) => i), edges = new Map<string, { low: number; high: number; part: number }[]>()
   const root = (i: number): number => { while (parents[i] !== i) { parents[i] = parents[parents[i]!]!; i = parents[i]! } return i }
   for (const [i, part] of parts.entries()) for (const ring of [part.polygon, ...(part.holes ?? [])]) for (let j = 0; j < ring.length; j++) {
@@ -346,9 +346,99 @@ function roadServedRuralPartition(parts: readonly PolygonRegion[], touches: (reg
       if (values[i]!.part !== values[j]!.part && Math.min(values[i]!.high, values[j]!.high) - Math.max(values[i]!.low, values[j]!.low) > .0001) parents[root(values[i]!.part)] = root(values[j]!.part)
     }
   }
-  const served = new Set<number>()
-  for (const [i, part] of parts.entries()) if (touches(part)) served.add(root(i))
-  return parts.filter((_, i) => served.has(root(i)))
+  const groups = new Map<number, PolygonRegion[]>()
+  for (const [i, part] of parts.entries()) { const key = root(i), group = groups.get(key) ?? []; group.push(part); groups.set(key, group) }
+  return [...groups.values()]
+}
+function roadServedRuralPartition(parts: readonly PolygonRegion[], touches: (region: PolygonRegion) => boolean, tile: number) {
+  return ruralPartitionComponents(parts, tile).filter(group => group.some(touches)).flat()
+}
+/** An arbitrary500m sampling phase or a neighbouring site's Voronoi boundary
+ * cannot revoke real public frontage. Measure a positive-length contact on the
+ * remaining dry boundary; the farm survey separately certifies vehicle access.
+ */
+function remainingRuralFrontages(roads: readonly Road[]) {
+  const entries = roads.flatMap(road => road.points.slice(1).map((b, i) => {
+    const a = road.points[i]!, radius = road.width / 2 + .02, bounds = boundsOf([a, b])
+    return { road, a, b, radius, bounds: { minX: bounds.minX - radius, maxX: bounds.maxX + radius, minY: bounds.minY - radius, maxY: bounds.maxY + radius } }
+  }))
+  const bins = new Map<string, typeof entries>(), size = 100
+  for (const entry of entries) for (let x = Math.floor(entry.bounds.minX / size); x <= Math.floor(entry.bounds.maxX / size); x++) for (let y = Math.floor(entry.bounds.minY / size); y <= Math.floor(entry.bounds.maxY / size); y++) { const key = `${x}:${y}`, list = bins.get(key) ?? []; list.push(entry); bins.set(key, list) }
+  const nearby = (bounds: Bounds) => {
+    const found = new Set<(typeof entries)[number]>()
+    for (let x = Math.floor(bounds.minX / size); x <= Math.floor(bounds.maxX / size); x++) for (let y = Math.floor(bounds.minY / size); y <= Math.floor(bounds.maxY / size); y++) for (const entry of bins.get(`${x}:${y}`) ?? []) if (overlaps(bounds, entry.bounds)) found.add(entry)
+    return found
+  }
+  return (regions: readonly PolygonRegion[]) => {
+    const contacts = new Map<string, { road: Road; origin: Point; length: number; best: number }>()
+    for (const region of regions) {
+      for (const ring of [region.polygon, ...region.holes ?? []]) for (let i = 0; i < ring.length; i++) {
+        const p = ring[i]!, q = ring[(i + 1) % ring.length]!, edgeLength = distance(p, q)
+        if (edgeLength < .01) continue
+        for (const { road, a, b, radius } of nearby(boundsOf([p, q]))) {
+          const length = distance(a, b)
+          if (length < .01) continue
+          const ux = (b.x - a.x) / length, uy = (b.y - a.y) / length, x = (p.x - a.x) * ux + (p.y - a.y) * uy, y = -(p.x - a.x) * uy + (p.y - a.y) * ux
+          const dx = (q.x - p.x) * ux + (q.y - p.y) * uy, dy = -(q.x - p.x) * uy + (q.y - p.y) * ux
+          let low = 0, high = 1
+          for (const [start, delta, min, max] of [[x, dx, -radius, length + radius], [y, dy, -radius, radius]] as const) {
+            if (Math.abs(delta) < 1e-12) { if (start < min || start > max) { high = -1; break } }
+            else { const first = (min - start) / delta, last = (max - start) / delta; low = Math.max(low, Math.min(first, last)); high = Math.min(high, Math.max(first, last)) }
+          }
+          const contact = (high - low) * edgeLength
+          if (contact <= .01) continue
+          const t = (low + high) / 2, along = Math.max(0, Math.min(length, x + dx * t)), origin = { x: a.x + ux * along, y: a.y + uy * along }, old = contacts.get(road.id)
+          contacts.set(road.id, { road, origin: !old || contact > old.best ? origin : old.origin, length: (old?.length ?? 0) + contact, best: Math.max(old?.best ?? 0, contact) })
+        }
+      }
+    }
+    return [...contacts.values()].filter(contact => contact.length >= 2.4).sort((a, b) => Number(b.road.role === 'farm') - Number(a.road.role === 'farm') || b.length - a.length || a.road.id.localeCompare(b.road.id)).slice(0, 8)
+  }
+}
+
+/** Uncleared countryside is not automatically managed grass. After actual
+ * farming has acquired its holdings/working ground, regenerate only the
+ * remaining natural ground. Clearing distance, moisture and slope determine
+ * coherent habitat edges; the user's forest allocation limits their area.
+ * Neither working verges nor acquired/water/road ground enter this operation. */
+function ruralRegeneration(input: ContinuousCityCoverInput, remaining: readonly PolygonRegion[], cleared: readonly PolygonRegion[], existingForestArea: number) {
+  const forest = Math.max(0, Math.min(1, input.config.forest / 100)), sum = (parts: readonly PolygonRegion[]) => parts.reduce((n, part) => n + regionArea(part), 0)
+  const waterArea = sum(input.terrain.areas.filter(area => area.kind === 'water')), budget = Math.max(0, (input.width * input.height - waterArea) * forest - existingForestArea)
+  if (!forest || budget < 2500 || !remaining.length) return { woodland: [] as PolygonRegion[], meadow: [...remaining] }
+  const eligible = regionIndex(remaining), edges = regionIndex(cleared.flatMap(region => [region.polygon, ...region.holes ?? []].flatMap(ring => ring.map((p, i) => ({ polygon: [p, ring[(i + 1) % ring.length]!] })))), 100)
+  const cached = new Map<string, number>(), values: number[] = [], step = Math.max(48, Math.sqrt(input.width * input.height / 5000))
+  const suitability = (point: Point) => {
+    const key = `${point.x}:${point.y}`, known = cached.get(key)
+    if (known !== undefined) return known
+    const probe = { polygon: rectangle(point.x - .001, point.y - .001, .002, .002) }
+    let value = -1000
+    if (eligible(probe).some(region => pointInRegion(point, region)) && !input.terrain.waterAt(point)) {
+      const nearby = edges({ polygon: rectangle(point.x - 220, point.y - 220, 440, 440) })
+      const clearance = nearby.reduce((d, edge) => Math.min(d, distanceToSegment(point, edge.polygon[0]!, edge.polygon[1]!)), 220)
+      const moisture = input.terrain.wetness?.(point) ?? .2, slope = input.terrain.slope(point)
+      // Saturated flood grass remains open; dry low terraces can be wooded
+      // even when they never meet the mountain-forest elevation threshold.
+      value = Math.min(clearance - 24, (.68 - moisture) * 400, clearance - 75 + slope * 600 + Math.min(moisture, .45) * 30)
+    }
+    cached.set(key, value); values.push(value); return value
+  }
+  const smooth = (ring: Point[]) => {
+    for (let pass = 0; pass < 2; pass++) ring = ring.flatMap((p, i) => { const q = ring[(i + 1) % ring.length]!; return [{ x: p.x * .75 + q.x * .25, y: p.y * .75 + q.y * .25 }, { x: p.x * .25 + q.x * .75, y: p.y * .25 + q.y * .75 }] })
+    return ring
+  }
+  const select = (threshold: number) => {
+    const masks = contourLand(input.width, input.height, p => suitability(p) - threshold, step).map(region => ({ polygon: smooth(region.polygon), holes: region.holes?.map(smooth) })), partition = coverMaskPartition(masks)
+    return remaining.flatMap(part => partition(part).inside).filter(part => regionArea(part) >= 2500)
+  }
+  let woodland = select(0)
+  if (sum(woodland) > budget) {
+    let low = 0, high = Math.max(...values) + 1; woodland = []
+    // Exact clipped areas, rather than a sample-count quota, respect water
+    // holes and the user's forest budget. Sampling is cached across searches.
+    for (let i = 0; i < 9; i++) { const middle = (low + high) / 2, candidate = select(middle); if (sum(candidate) > budget) low = middle; else { high = middle; woodland = candidate } }
+  }
+  const partition = coverMaskPartition(woodland)
+  return { woodland, meadow: remaining.flatMap(part => partition(part).outside) }
 }
 
 /** Partitions every unacquired part of the crop. Urban vacancies stay explicit;
@@ -436,6 +526,9 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
     // their shared working verges rather than painting one enormous field.
     const served = partitionContinuousCover(roadServedRuralPartition(pieces, p => touchesRoad(p, site.road.id), tile))
     const holdings = subdivideContinuousFarmDistrict({ regions: served, road: site.road, origin: site.origin, seed: `${input.config.seed}:rural-${districtSerial}`, terrain: agricultureTerrain })
+    // A failed survey does not clear a district or acquire working verges.
+    // Its untouched habitat must remain eligible for natural regeneration.
+    if (!holdings.plots.length) continue
     for (const plot of holdings.plots) add([plot], 'field', plot.landUse)
     add(holdings.bunds, 'park', 'meadow', `land-continuous-farm-bund-${districtSerial}`)
     farmParts.push(...served)
@@ -446,9 +539,30 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
     if (i % 50 === 0) onProgress?.(`土地被覆:最終残地の除外 ${i + 1}/${ruralParts.length}…`)
     inaccessible.push(...subtractRegions(part, farmQuery(part)))
   }
-  onProgress?.(`土地被覆:最終自然残地の保持（${inaccessible.length}片）…`)
-  onGeometry?.('rural-final', inaccessible)
-  add(partitionContinuousCover(inaccessible), 'park', 'meadow')
+  // Reconsider only unacquired ground with its OWN real public frontage.
+  // Storage seams transfer positive-width access; a corner or a water hole
+  // does not. Whole plots must still pass soil, slope and working-lane tests.
+  const frontages = remainingRuralFrontages(publicRoads), naturalRemainder: PolygonRegion[] = []
+  for (const [i, group] of ruralPartitionComponents(inaccessible, tile).entries()) {
+    const contacts = frontages(group)
+    let acquired = false
+    if (contacts.length) {
+      const regions = group.length > 1 ? dissolveContinuousCover(group, { batchVertices: 3000 }) : group
+      for (const contact of contacts) {
+        const holdings = subdivideContinuousFarmDistrict({ regions, road: contact.road, origin: contact.origin, seed: `${input.config.seed}:rural-frontage-${i}`, terrain: agricultureTerrain })
+        if (!holdings.plots.length) continue
+        for (const plot of holdings.plots) add([plot], 'field', plot.landUse)
+        add(holdings.bunds, 'park', 'meadow', `land-continuous-farm-bund-frontage-${i}`)
+        acquired = true; break
+      }
+    }
+    if (!acquired) naturalRemainder.push(...group)
+  }
+  onProgress?.(`土地被覆:最終自然残地の保持（${naturalRemainder.length}片）…`)
+  onGeometry?.('rural-final', naturalRemainder)
+  const regeneration = ruralRegeneration(input, naturalRemainder, [...ground, ...input.reserves, ...input.parcels.filter(parcel => parcel.retiredYear === undefined).map(parcel => ({ polygon: parcel.polygon })), ...result.filter(area => area.kind === 'field')], naturalParts.reduce((sum, part) => sum + regionArea(part), 0))
+  add(partitionContinuousCover(regeneration.woodland), 'forest', 'woodland', 'land-continuous-rural-woodland')
+  add(partitionContinuousCover(regeneration.meadow), 'park', 'meadow')
   onProgress?.(`土地被覆:完了（${result.length}面・${water.length}水域）`)
   return [...result, ...water]
 }

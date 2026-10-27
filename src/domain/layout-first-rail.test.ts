@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { distance, distanceToSegment, pointInPolygon, polygonOverlapsRegion, rectangle, regionArea, subtractRegions } from './geometry'
-import { surveyLayoutFirstRail, surveyLayoutStationApproaches } from './layout-first-rail'
-import type { LayoutFirstRailInput } from './layout-first-rail'
+import { surveyLayoutFirstRail, surveyLayoutStationApproaches, resurveyLayoutFirstStation, stationAccessRepairReport } from './layout-first-rail'
+import type { LayoutFirstRailInput, LayoutFirstRailResult } from './layout-first-rail'
+import { stationFootprint } from './station-footprint'
+import { repairContinuousCityAccess } from './continuous-city-access-repair'
+import { surveyContinuousCityAccess } from './continuous-city-roads'
+import type { Road } from './types'
 
 function fixture(): LayoutFirstRailInput {
   return { config: { name: '試験市', seed: 'layout-rail-fixture', type: 'post', terrain: 'plain', density: 65, forest: 0, railway: true, stations: 2, arterial: true, facilities: [] },
@@ -9,6 +13,49 @@ function fixture(): LayoutFirstRailInput {
     zones: [{ id: 'old-town', kind: 'historic', center: { x: 1200, y: 900 }, radius: 1100, polygon: rectangle(100, 100, 2200, 1600), builtYear: 1750, density: .8, maximumFloors: 3 }],
     terrain: { areas: [], elevation: () => 20, waterAt: () => false, slope: () => 0 } }
 }
+
+function stationRepairFixture(){
+  const input=fixture();input.width=2000;input.height=1000;input.config={...input.config,stations:1};input.center={x:1000,y:500}
+  const water={id:'trapped-south',kind:'water' as const,polygon:rectangle(-10,600,2020,20)}
+  input.terrain={...input.terrain,areas:[water],waterAt:point=>pointInPolygon(point,water.polygon)}
+  const points=[{x:100,y:500},{x:1900,y:500}],footprint=stationFootprint({points,chain:[0,1800],along:900,side:1,config:input.config,main:true})!
+  const station={id:'station-0',name:'試験駅',point:footprint.point,entrance:footprint.entrance,buildingPolygon:footprint.building,platformPolygons:footprint.platforms,railwayId:'main',builtYear:1900}
+  const previous:LayoutFirstRailResult={railways:[{id:'main',name:'本線',points,elevations:[20,20],builtYear:1900}],stations:[station],stationGrounds:[{id:'station-forecourt-0',kind:'field',landUse:'vacant',polygon:footprint.forecourt},{id:'station-trackground-0',kind:'field',landUse:'vacant',polygon:footprint.trackGround}],accessTargets:[{id:'station-access-0',point:footprint.gate,builtYear:1900,endHeading:-Math.PI/2}],stationPaths:[{id:'station-access-0',points:[footprint.gate,footprint.entrance],width:3,role:'access',kind:'local',builtYear:1900}],diagnostics:{requestedStations:1,placedStations:1}}
+  const publicRoad:Road={id:'old-north-road',points:[{x:-50,y:250},{x:1000,y:250},{x:2050,y:250}],width:8,kind:'arterial',role:'collector',builtYear:1650,boundaryContinuation:true}
+  input.roads=[publicRoad,...previous.stationPaths]
+  const acquire=(candidate:LayoutFirstRailResult)=>repairContinuousCityAccess({config:input.config,center:input.center,environment:{width:input.width,height:input.height,core:null,areas:input.terrain.areas,terrain:{...input.terrain,bridgeSites:[]},bridgeSites:[]},reservedRegions:candidate.stationGrounds,railways:candidate.railways,initialRoads:[publicRoad,...candidate.stationPaths],accessTargets:candidate.accessTargets,demand:{center:input.center,regions:[],at:()=>.7,costAt:()=>1,openingAt:()=>1900,metrics:{cellSize:25,reachableLandArea:2000000,targetUrbanArea:1000000,selectedUrbanArea:1000000}}},surveyContinuousCityAccess)
+  return {input,previous,publicRoad,acquire}
+}
+
+describe('station approach reacquisition',()=>{
+  it('moves a trapped forecourt to the dry accessible side of the same railway and certifies its actual opening-date approach',()=>{
+    const {input,previous,acquire}=stationRepairFixture(),saved=JSON.stringify(previous)
+    let connected:ReturnType<typeof acquire>|undefined
+    const next=resurveyLayoutFirstStation(input,previous,'station-access-0',candidate=>{const result=acquire(candidate);if(result.access.unserved.length)return false;connected=result;return true})
+    expect(next).not.toBe(previous)
+    expect(next.railways).toBe(previous.railways)
+    expect(next.stations[0]!.point).toEqual(previous.stations[0]!.point)
+    expect(next.stations[0]!.entrance!.y).toBeLessThan(500)
+    expect(next.stations[0]!.name).toBe(previous.stations[0]!.name)
+    expect(next.stations[0]!.builtYear).toBe(1900)
+    expect(next.accessTargets[0]!.builtYear).toBe(1900)
+    expect(next.stationPaths[0]!.points).toEqual([next.accessTargets[0]!.point,next.stations[0]!.entrance])
+    expect(connected!.access.unserved).toEqual([])
+    expect(next.stationGrounds.every(ground=>!input.terrain.areas.some(water=>water.kind==='water'&&polygonOverlapsRegion(ground.polygon,water)))).toBe(true)
+    expect(JSON.stringify(previous)).toBe(saved)
+  })
+
+  it('keeps the original station unchanged when its only external street opens after the station',()=>{
+    const {input,previous,publicRoad,acquire}=stationRepairFixture(),saved=JSON.stringify(previous)
+    publicRoad.builtYear=1995
+    const next=resurveyLayoutFirstStation(input,previous,'station-access-0',candidate=>acquire(candidate).access.unserved.length===0)
+    expect(next).toBe(previous)
+    expect(stationAccessRepairReport(next)!.attempted).toBeLessThanOrEqual(6)
+    expect(stationAccessRepairReport(next)!.adopted).toBeUndefined()
+    expect(JSON.stringify(previous)).toBe(saved)
+    expect(publicRoad.builtYear).toBe(1995)
+  })
+})
 
 describe('layout-first regional railway', () => {
   it('rejects a forecourt trapped between its railway and parallel creek while surveying the open opposite side', () => {
