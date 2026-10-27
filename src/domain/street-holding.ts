@@ -1,6 +1,6 @@
 import { seededRandom } from './geometry'
 
-export type StreetStock = 'compact' | 'ordinary' | 'garden' | 'walkup' | 'mixed'
+export type StreetStock = 'compact' | 'ordinary' | 'garden' | 'walkup' | 'mixed' | 'office' | 'retail'
 export interface HoldingProfile {
   frontage: number
   depth: number
@@ -26,6 +26,8 @@ const programmes: Record<StreetStock, StockProgramme> = {
   garden: { frontage: [13, 29], frontagePower: 1.1, depth: [25, 40], coverage: [.28, .44], frontGap: [3, 8], aspect: [.8, 1.6] },
   walkup: { frontage: [18, 32], frontagePower: 1.35, depth: [21, 36], coverage: [.36, .59], frontGap: [2, 5], aspect: [1.35, 2.5] },
   mixed: { frontage: [15, 32], frontagePower: 1.28, depth: [20, 34], coverage: [.44, .65], frontGap: [.8, 2.5], aspect: [1.05, 2.1] },
+  office: { frontage: [36, 70], frontagePower: 1.12, depth: [34, 60], coverage: [.52, .7], frontGap: [2, 5], aspect: [.95, 1.6] },
+  retail: { frontage: [40, 76], frontagePower: 1.15, depth: [34, 62], coverage: [.4, .6], frontGap: [4, 9], aspect: [1.3, 2.2] },
 }
 const clamp = (value: number, low = 0, high = 1) => Math.max(low, Math.min(high, value))
 const between = ([low, high]: Range, fraction: number) => low + (high - low) * clamp(fraction)

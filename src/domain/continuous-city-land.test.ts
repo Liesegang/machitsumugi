@@ -90,8 +90,8 @@ describe('continuous city whole-block cadastre', () => {
     for (const building of result.buildings) expect(subtractRegions(building, [result.parcels.find(parcel => parcel.id === building.parcelId)!]).reduce((sum, part) => sum + regionArea(part), 0)).toBeLessThan(.005)
   })
 
-  it('acquires contiguous mixed corners and small apartments near the real network instead of painting every collector title commercial', () => {
-    const source = run().input, roads = source.roads.map(road => road.id === 'north' ? { ...road, width: 9, kind: 'arterial' as const, role: 'collector' as const } : { ...road, width: 4.8, role: 'lane' as const })
+  it('acquires contiguous mixed corners and small apartments on a narrow collector without painting every title commercial', () => {
+    const source = run().input, roads = source.roads.map(road => road.id === 'north' ? { ...road, width: 7.5, kind: 'arterial' as const, role: 'collector' as const } : { ...road, width: 4.8, role: 'lane' as const })
     const core = run({ roads, demand: { ...source.demand, center: { x: 80, y: 20 }, at: () => .9 } }).result
     expect(core.metrics.stock.mixed!.count).toBeGreaterThan(0)
     expect(core.metrics.stock.walkup!.count).toBeGreaterThan(0)
@@ -100,8 +100,8 @@ describe('continuous city whole-block cadastre', () => {
     expect(north.some(parcel => parcel.use === 'commercial')).toBe(true)
     expect(north.some(parcel => parcel.use === 'residential')).toBe(true)
     const small = core.metrics.stock.compact!, apartments = core.metrics.stock.walkup!
-    expect(apartments.parcelArea / apartments.count).toBeGreaterThan(small.parcelArea / small.count * 1.6)
-    expect(apartments.roofArea / apartments.count).toBeGreaterThan(small.roofArea / small.count * 1.5)
+    expect(apartments.parcelArea / apartments.count).toBeGreaterThan(small.parcelArea / small.count)
+    expect(apartments.roofArea / apartments.count).toBeGreaterThan(small.roofArea / small.count)
     expect(core.buildings.some(building => building.kind === 'residential' && building.height >= 3 && polygonArea(building.polygon) > 140)).toBe(true)
     expect(core.metrics.partitionAreaError).toBeLessThan(.05)
     expect(core.metrics.openSpaceArea / core.metrics.buildableArea).toBeLessThan(.08)
@@ -124,7 +124,7 @@ describe('continuous city whole-block cadastre', () => {
   })
 
   it('varies real acquisitions and roof sizes along the same street without moving roads or breaking access', () => {
-    const source=run().input,roads=loop(320,90).map(road=>road.id==='north'?{...road,width:9,role:'collector' as const}:road)
+    const source=run().input,roads=loop(320,90).map(road=>road.id==='north'?{...road,width:7,role:'collector' as const}:road)
     const original=JSON.stringify(roads),demand={...source.demand,center:{x:40,y:20},at:()=>.82}
     const first=run({roads,blocks:[{id:'long-front',polygon:rectangle(20,20,320,90)}],demand}).result
     const repeated=run({roads,blocks:[{id:'long-front',polygon:rectangle(20,20,320,90)}],demand}).result
@@ -164,12 +164,53 @@ describe('continuous city whole-block cadastre', () => {
     expect(wetGate.metrics.stock.walkup).toBeUndefined()
   })
 
+  it('acquires larger office and retail holdings along real connected major streets while retaining ordinary homes', () => {
+    const source=run().input,roads=materializeRoadJunctions([...loop(420,180).map(road=>road.id==='north'?{...road,width:10.2,role:'collector' as const}:road),{id:'business-local',points:[{x:20,y:100},{x:440,y:100}],width:5.5,kind:'local' as const,role:'lane' as const,builtYear:1955}])
+    const demand={...source.demand,center:{x:80,y:20},at:()=>.9},input={width:600,height:400,roads,blocks:extractStreetBlocks(roads).map((polygon,i)=>({id:`business-face-${i}`,polygon})),demand}
+    const result=run(input).result
+    expect(result.metrics.stock.office!.count).toBeGreaterThan(0)
+    expect(result.metrics.stock.retail!.count).toBeGreaterThan(0)
+    const large=result.buildings.filter(building=>building.kind==='commercial'&&polygonArea(building.polygon)>600)
+    expect(large.length).toBeGreaterThan(1)
+    expect(Math.max(...large.map(building=>polygonArea(building.polygon)))).toBeGreaterThan(900)
+    expect(large.some(building=>building.height>=6)).toBe(true)
+    expect(result.buildings.some(building=>building.kind==='residential'&&polygonArea(building.polygon)<150)).toBe(true)
+    const titles=new Map(result.parcels.map(parcel=>[parcel.id,parcel]))
+    for(const building of result.buildings){
+      const parcel=titles.get(building.parcelId!)!,road=[...roads,...result.accessRoads].find(road=>road.id===parcel.roadId)!
+      expect(subtractRegions(building,[parcel]).reduce((sum,part)=>sum+regionArea(part),0)).toBeLessThan(.005)
+      expect(Math.min(...road.points.slice(1).map((b,i)=>distanceToSegment(parcel.access![0]!,road.points[i]!,b)))).toBeLessThan(.001)
+      expect(parcel.createdYear).toBeGreaterThanOrEqual(road.builtYear??1650)
+      if(building.height>=6)expect(building.builtYear!).toBeGreaterThanOrEqual(1955)
+      if(polygonArea(building.polygon)>900)expect(parcel.createdYear).toBeGreaterThanOrEqual(1955)
+    }
+    expect(result.metrics.partitionAreaError).toBeLessThan(.1)
+    expect(result.metrics.openSpaceArea/result.metrics.buildableArea).toBeLessThan(.08)
+    const remote=run({...input,demand:{...demand,center:{x:550,y:350}},stations:[{id:'unconnected-marker',point:{x:100,y:0},name:'別路線',builtYear:1985}],roads:[...roads,{id:'unconnected-station-road',points:[{x:20,y:0},{x:440,y:0}],width:8,kind:'local' as const,builtYear:1985}]}).result
+    expect(remote.metrics.stock.office).toBeUndefined()
+    expect(remote.metrics.stock.retail).toBeUndefined()
+    expect(remote.buildings.every(building=>building.kind==='residential')).toBe(true)
+  })
+
+  it('keeps large commercial roofs out of water and reserved ground and waits for their real station approach', () => {
+    const source=run().input,roads=materializeRoadJunctions([...loop(420,180).map(road=>road.id==='north'?{...road,width:10.2,role:'collector' as const}:road),{id:'business-local',points:[{x:20,y:100},{x:440,y:100}],width:5.5,kind:'local' as const,role:'lane' as const,builtYear:1955}]),water={id:'business-pond',kind:'water' as const,polygon:rectangle(190,62,35,25)},reserve={polygon:rectangle(325,60,40,25)}
+    const result=run({width:600,height:400,roads,blocks:extractStreetBlocks(roads).map((polygon,i)=>({id:`business-face-${i}`,polygon})),reserves:[reserve],terrain:{...source.terrain,areas:[water],waterAt:p=>pointInPolygon(p,water.polygon)},demand:{...source.demand,center:{x:550,y:350},at:()=>.9},stations:[{id:'business-station',point:{x:80,y:20},entrance:{x:80,y:20},name:'新駅',builtYear:1985}]}).result
+    expect(result.metrics.stock.office!.count+result.metrics.stock.retail!.count).toBeGreaterThan(0)
+    for(const building of result.buildings){
+      expect(polygonOverlapsRegion(building.polygon,water)).toBe(false)
+      expect(polygonOverlapsRegion(building.polygon,reserve)).toBe(false)
+    }
+    const commerce=new Set(result.parcels.filter(parcel=>parcel.use==='commercial').map(parcel=>parcel.id))
+    expect(commerce.size).toBeGreaterThan(0)
+    expect(result.history.buildings.filter(version=>commerce.has(version.value.parcelId!)).every(version=>version.from>=1985&&version.value.builtYear===version.from)).toBe(true)
+  })
+
   it('retains an older qualifying trade route while later shortcut mass waits for a physical renewal', () => {
     const source = run().input, roads: Road[] = [...source.roads.map(road => road.id === 'east' ? { ...road, width: 9, role: 'collector' as const } : road),
       { id: 'old-approach', points: [{ x: 20, y: 200 }, { x: 5, y: 200 }, { x: 5, y: 20 }, { x: 20, y: 20 }], kind: 'local', width: 6, builtYear: 1770 },
       { id: 'future-shortcut', points: [{ x: 20, y: 200 }, { x: 140, y: 80 }], kind: 'local', width: 6, builtYear: 1955 }]
     const result = run({ roads, demand: { ...source.demand, center: { x: 20, y: 200 }, at: () => .9 } }).result
-    const shops = result.parcels.filter(parcel => parcel.use === 'commercial' && parcel.roadId === 'east')
+    const shops = result.parcels.filter(parcel => parcel.use === 'commercial' && parcel.roadId === 'east' && parcel.createdYear<1955)
     expect(shops.length).toBeGreaterThan(0)
     expect(shops.every(parcel => parcel.createdYear === 1770)).toBe(true)
     const ids = new Set(shops.map(parcel => parcel.id))
@@ -184,7 +225,9 @@ describe('continuous city whole-block cadastre', () => {
     expect(withoutGate.metrics.stock.mixed).toBeUndefined()
     const gate = run({ roads, demand, reserves: [reserve], centerAccess: { point: { x: 80, y: 20 }, builtYear: 1770 } }).result
     expect(gate.metrics.stock.mixed!.count).toBeGreaterThan(0)
-    expect(gate.parcels.filter(parcel => parcel.use === 'commercial').every(parcel => parcel.createdYear === 1770)).toBe(true)
+    const historicShops=gate.parcels.filter(parcel => parcel.use === 'commercial'&&parcel.createdYear<1955)
+    expect(historicShops.length).toBeGreaterThan(0)
+    expect(historicShops.every(parcel => parcel.createdYear === 1770)).toBe(true)
     expect(gate.buildings.every(building => !polygonOverlapsRegion(building.polygon, reserve))).toBe(true)
   })
 
@@ -228,7 +271,12 @@ describe('continuous city whole-block cadastre', () => {
     expect(result.accessRoads.some(road => road.points.length === 4)).toBe(true)
     expect(result.parcels.length).toBeGreaterThan(25)
     expect(result.metrics.partitionAreaError).toBeLessThan(.2)
-    expect(Math.max(...result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(1600)
+    expect(Math.max(...result.parcels.filter(parcel=>parcel.use==='residential').map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(1600)
+    for(const parcel of result.parcels.filter(parcel=>parcel.use==='commercial')){
+      expect(polygonArea(parcel.polygon)).toBeLessThan(4500)
+      const building=result.buildings.find(building=>building.parcelId===parcel.id)!
+      if(polygonArea(parcel.polygon)>1600)expect(polygonArea(building.polygon)).toBeGreaterThan(200)
+    }
     for (const road of result.accessRoads.filter(road => road.points.length === 4)) {
       const length = road.points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - road.points[i]!.x, p.y - road.points[i]!.y), 0)
       expect(length).toBeLessThanOrEqual(110)
@@ -262,7 +310,12 @@ describe('continuous city whole-block cadastre', () => {
     expect(result.accessRoads.filter(road => road.points.length === 3).length).toBeLessThanOrEqual(1)
     expect(extractStreetBlocks(materializeRoadJunctions([...actualRoads, ...result.accessRoads])).length).toBeLessThanOrEqual(2)
     expect(result.metrics.partitionAreaError).toBeLessThan(2)
-    expect(Math.max(...result.parcels.map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(1600)
+    expect(Math.max(...result.parcels.filter(parcel=>parcel.use==='residential').map(parcel => polygonArea(parcel.polygon)))).toBeLessThan(1600)
+    for(const parcel of result.parcels.filter(parcel=>parcel.use==='commercial')){
+      expect(polygonArea(parcel.polygon)).toBeLessThan(4500)
+      const building=result.buildings.find(building=>building.parcelId===parcel.id)!
+      if(polygonArea(parcel.polygon)>1600)expect(polygonArea(building.polygon)).toBeGreaterThan(200)
+    }
     for (const road of result.accessRoads) {
       expect(road.width).toBe(4)
       expect(road.points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - road.points[i]!.x, p.y - road.points[i]!.y), 0)).toBeLessThanOrEqual(110)

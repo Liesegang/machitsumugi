@@ -7,16 +7,18 @@ import { MinHeap } from './road-graph'
 import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { subtractContinuousCover } from './continuous-city-cover'
 import { streetHolding } from './street-holding'
-import type { HoldingProfile } from './street-holding'
+import type { HoldingProfile, StreetStock } from './street-holding'
 
 interface Segment { a: Point; b: Point; road: Road; polygon: Point[]; bounds: Bounds; chainage: number }
 interface Frontage { a: Point; b: Point; segment: Segment; length: number }
 interface Cell extends PolygonRegion { frontages: Frontage[] }
-type Stock = 'compact' | 'ordinary' | 'garden' | 'walkup' | 'mixed'
+type Stock = StreetStock
 interface RouteContext { distance: number; availableYear: number; formAvailableYear: number; source: 'center' | 'station' }
-interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext; holding?: HoldingProfile }
+interface FrontageProgramme { front: Frontage; stock: Stock; from: number; to: number; route: RouteContext; holding?: HoldingProfile; holdingKey?: string }
 interface TitleProgramme { stock: Stock; frontage: number; depth: number; maximumArea: number; route: RouteContext; parking: boolean; holding: HoldingProfile; cuts: number[] }
 const clamp = (n: number, low: number, high: number) => Math.max(low, Math.min(high, n))
+const commercialStock = (stock: Stock) => stock === 'mixed' || stock === 'office' || stock === 'retail'
+const businessStock = (stock: Stock) => stock === 'office' || stock === 'retail'
 const publicStreet = (road: Road) => !road.controlledAccess && road.role !== 'expressway' && road.role !== 'ramp' && road.role !== 'farm' && (road.level ?? 0) === 0
 const sumArea = (regions: readonly PolygonRegion[]) => regions.reduce((sum, region) => sum + regionArea(region), 0)
 // Translate tiny survey rings before summing so global coordinates do not
@@ -283,8 +285,10 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     }
     return null
   }
-  const programmes = (region: PolygonRegion): FrontageProgramme[] => {
+  const programmes = (region: PolygonRegion, includeBusiness = true): FrontageProgramme[] => {
     const fronts = frontages(region), intensity = clamp(input.demand.at(interior(region)), 0, 1)
+    const frontageByRoad=new Map<string,number>()
+    for(const front of fronts)frontageByRoad.set(front.segment.road.id,(frontageByRoad.get(front.segment.road.id)??0)+front.length)
     const ordinary: Stock = intensity >= .72 ? 'compact' : intensity < .38 ? 'garden' : 'ordinary'
     const result: FrontageProgramme[] = fronts.map(front => ({ front, stock: ordinary, from: 0, to: front.length, route: network(front) }))
     const core = (programme: FrontageProgramme) => programme.route.distance < (programme.route.source === 'station' ? 680 : 880)
@@ -299,6 +303,32 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       result.push({ ...programme, stock, from: first.distance <= last.distance ? 0 : front.length - length, to: first.distance <= last.distance ? length : front.length })
       for (const neighbour of result.slice(0, fronts.length)) if (neighbour !== programme && neighbour.front.segment.road.id === front.segment.road.id && neighbour.route.distance <= programme.route.distance + (stock === 'mixed' ? 38 : 42) && distance(middle(neighbour.front.a, neighbour.front.b), middle(front.a, front.b)) <= 42) result.push({ ...neighbour, stock })
     }
+    // A business district acquires actual larger holdings along a connected
+    // major street before housing subdivision. Continuous chainage bands
+    // survive survey segmentation and leave mixed/residential gaps between
+    // the office and retail clusters; geometry never spans a public street.
+    for (const front of includeBusiness ? fronts : []) {
+      const route = network(front), road = front.segment.road
+      if (road.width < 8 || intensity < .6 || regionArea(region) < 4500 || (frontageByRoad.get(road.id)??0)<45 || route.distance >= (route.source === 'station' ? 2400 : 2200)) continue
+      const segment = front.segment, run = distance(segment.a,segment.b), dx = (segment.b.x-segment.a.x)/run, dy = (segment.b.y-segment.a.y)/run
+      const tangent={x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length},p=middle(front.a,front.b),inward=pointInRegion({x:p.x-tangent.y,y:p.y+tangent.x},region)?1:-1
+      const depths=region.polygon.map(q=>(q.x-p.x)*-tangent.y+(q.y-p.y)*tangent.x)
+      if(Math.max(...depths)-Math.min(...depths)<18)continue
+      const side=(-dy*-tangent.y+dx*tangent.x)*inward>0?'left':'right',period=320,phase=seededRandom(`${input.config.seed}:${road.id}:${side}:business-bands`)()*period
+      const start=segment.chainage+(front.a.x-segment.a.x)*dx+(front.a.y-segment.a.y)*dy,direction=tangent.x*dx+tangent.y*dy,low=Math.min(start,start+front.length*direction),high=Math.max(start,start+front.length*direction)
+      const close=route.distance<(route.source==='station'?1300:1200),bands: {stock:'office'|'retail';from:number;to:number}[]=close?[{stock:'office',from:30,to:125},{stock:'retail',from:195,to:250}]:[{stock:'retail',from:80,to:170}]
+      for(let cycle=Math.floor((low-phase)/period);cycle<=Math.floor((high-phase)/period);cycle++)for(const band of bands){
+        const left=Math.max(low,phase+cycle*period+band.from),right=Math.min(high,phase+cycle*period+band.to)
+        if(right-left<.001)continue
+        const a=(left-start)/direction,b=(right-start)/direction
+        let from=Math.max(0,Math.min(a,b)),to=Math.min(front.length,Math.max(a,b))
+        // Retain the fine-grained established shop approach at a long corner.
+        // A tiny survey segment is not itself a separate protected street.
+        const shop=result.find(plan=>plan.front===front&&plan.stock==='mixed'&&plan.to-plan.from>=28)
+        if(shop){if(shop.from<.01)from=Math.max(from,shop.from+18);else to=Math.min(to,shop.to-18)}
+        if(to-from>.001)result.push({front,stock:band.stock,from,to,route})
+      }
+    }
     // Acquisitions precede private cuts. Their widths and building programmes
     // follow an ordered sequence on each actual road side, rather than the
     // recursive subdivision serial or one globally repeated house width.
@@ -310,28 +340,28 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       const tangent = {x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length}, midpoint = middle(front.a,front.b)
       const inward = pointInRegion({x:midpoint.x-tangent.y,y:midpoint.y+tangent.x},region)?1:-1
       const side = (-dy * -tangent.y + dx * tangent.x) * inward > 0 ? 'left' : 'right', key = `${segment.road.id}:${side}`
-      const phase = seededRandom(`${input.config.seed}:${key}:holding-origin`)()*72
       const start = segment.chainage + (front.a.x-segment.a.x)*dx + (front.a.y-segment.a.y)*dy, direction = tangent.x*dx+tangent.y*dy
       const acquired: FrontageProgramme[] = []
       for(let zone=1;zone<cuts.length;zone++){
         const from=cuts[zone-1]!,to=cuts[zone]!,mid=(from+to)/2,plan=plans.filter(plan=>plan.from<=mid&&plan.to>=mid).at(-1)!
+        const cohortLength=businessStock(plan.stock)?144:72,phase=seededRandom(`${input.config.seed}:${key}:holding-origin`)()*cohortLength
         const low=Math.min(start+from*direction,start+to*direction),high=Math.max(start+from*direction,start+to*direction)
         const group: FrontageProgramme[]=[]
-        for(let cohort=Math.floor((low-phase)/72);cohort<=Math.floor((high-phase)/72);cohort++){
-          const cohortKey=`${key}:${cohort}`,end=phase+(cohort+1)*72
-          for(let position=phase+cohort*72,index=0;position<end-.001;index++){
+        for(let cohort=Math.floor((low-phase)/cohortLength);cohort<=Math.floor((high-phase)/cohortLength);cohort++){
+          const cohortKey=`${key}:${cohort}`,end=phase+(cohort+1)*cohortLength
+          for(let position=phase+cohort*cohortLength,index=0;position<end-.001;index++){
             const holding=streetHolding(input.config.seed,`${cohortKey}:${index}`,plan.stock,intensity,cohortKey)
             let width=Math.min(holding.frontage,end-position)
             if(end-position-width<5.25)width=end-position
             const left=Math.max(low,position),right=Math.min(high,position+width)
-            if(right-left>.001){const a=(left-start)/direction,b=(right-start)/direction;group.push({...plan,from:Math.max(from,Math.min(a,b)),to:Math.min(to,Math.max(a,b)),holding:{...holding,frontage:width}})}
+            if(right-left>.001){const a=(left-start)/direction,b=(right-start)/direction;group.push({...plan,from:Math.max(from,Math.min(a,b)),to:Math.min(to,Math.max(a,b)),holding:{...holding,frontage:width},holdingKey:`${plan.stock}:${cohortKey}:${index}`})}
             position+=width
           }
         }
         group.sort((a,b)=>a.from-b.from)
         // A clipped end of a real run is part of its neighbouring holding,
         // never a fabricated sub-five-metre independent building title.
-        const minimumFrontage=plan.stock==='mixed'||plan.stock==='walkup'?12:5.8
+        const minimumFrontage=businessStock(plan.stock)?24:plan.stock==='mixed'||plan.stock==='walkup'?12:5.8
         for(let i=0;i<group.length;i++)if(group[i]!.to-group[i]!.from<minimumFrontage&&group.length>1){if(i){group[i-1]!.to=group[i]!.to;group.splice(i--,1)}else{group[1]!.from=group[0]!.from;group.shift();i--}}
         acquired.push(...group)
       }
@@ -339,6 +369,28 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     })
   }
   const programmeIndex=new WeakMap<FrontageProgramme[],{roads:Map<string,FrontageProgramme[]>;totalFrontage:number}>()
+  const acquireBusiness = (region: PolygonRegion, plans: FrontageProgramme[]) => {
+    const groups=new Map<string,FrontageProgramme[]>()
+    for(const plan of plans)if(businessStock(plan.stock)&&plan.holdingKey){const group=groups.get(plan.holdingKey)??[];group.push(plan);groups.set(plan.holdingKey,group)}
+    let remaining:PolygonRegion[]=[region]
+    const acquired:{region:PolygonRegion;plans:FrontageProgramme[];roadId:string}[]=[]
+    for(const group of [...groups.values()].sort((a,b)=>a[0]!.route.distance-b[0]!.route.distance||a[0]!.holdingKey!.localeCompare(b[0]!.holdingKey!))){
+      const plan=group[0]!,holding=plan.holding!,roadId=plan.front.segment.road.id
+      const points=group.flatMap(plan=>{const u={x:(plan.front.b.x-plan.front.a.x)/plan.front.length,y:(plan.front.b.y-plan.front.a.y)/plan.front.length};return [plan.from,plan.to].map(distance=>({x:plan.front.a.x+u.x*distance,y:plan.front.a.y+u.y*distance}))})
+      const basis=group.slice().sort((a,b)=>b.to-b.from-(a.to-a.from))[0]!,u={x:(basis.front.b.x-basis.front.a.x)/basis.front.length,y:(basis.front.b.y-basis.front.a.y)/basis.front.length},origin=middle(points[0]!,points[1]!)
+      let n={x:-u.y,y:u.x}
+      if(!pointInRegion({x:origin.x+n.x,y:origin.y+n.y},region))n={x:-n.x,y:-n.y}
+      const along=points.map(p=>(p.x-origin.x)*u.x+(p.y-origin.y)*u.y),across=points.map(p=>(p.x-origin.x)*n.x+(p.y-origin.y)*n.y),low=Math.min(...along),high=Math.max(...along),near=Math.min(...across)-.1,far=Math.max(...across)+holding.depth
+      if(high-low<24)continue
+      const world=(a:number,b:number)=>({x:origin.x+u.x*a+n.x*b,y:origin.y+u.y*a+n.y*b})
+      const mask={polygon:[world(low,near),world(high,near),world(high,far),world(low,far)]}
+      const pieces=remaining.flatMap(part=>intersectRegions(part,mask)).filter(part=>regionArea(part)>=600&&frontages(part).filter(front=>front.segment.road.id===roadId).reduce((sum,front)=>sum+front.length,0)>=24)
+      if(!pieces.length)continue
+      for(const part of pieces)acquired.push({region:part,plans:group,roadId})
+      remaining=remaining.flatMap(part=>subtractRegions(part,pieces))
+    }
+    return {acquired,remaining}
+  }
   const titleProgramme = (cell: Cell, original: PolygonRegion, plans: FrontageProgramme[]): TitleProgramme => {
     const front = cell.frontages[0]!, p = middle(front.a, front.b), intensity = clamp(input.demand.at(interior(cell)), 0, 1)
     let index=programmeIndex.get(plans)
@@ -351,11 +403,11 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     })
     const plan = matches.at(-1), stock = plan?.stock ?? (intensity >= .72 ? 'compact' : intensity < .38 ? 'garden' : 'ordinary')
     const fallbackKey=`${front.segment.road.id}:${Math.floor(p.x/24)}:${Math.floor(p.y/24)}`,holding=plan?.holding??streetHolding(input.config.seed,fallbackKey,stock,intensity)
-    const meanDepth = regionArea(original) / Math.max(1, index.totalFrontage), depth = Math.min(holding.depth,clamp(meanDepth*1.65,16,40)),frontage=holding.frontage
+    const meanDepth = regionArea(original) / Math.max(1, index.totalFrontage), acquiredBusiness=businessStock(stock)&&plans.every(plan=>businessStock(plan.stock)),depth = acquiredBusiness?holding.depth:Math.min(holding.depth,clamp(meanDepth*(businessStock(stock)?2.4:1.65),16,businessStock(stock)?58:40)),frontage=holding.frontage
     const u={x:(front.b.x-front.a.x)/front.length,y:(front.b.y-front.a.y)/front.length},cuts:number[]=[]
     for(const candidate of alongRoad)if(distanceToSegment(p,candidate.front.a,candidate.front.b)<.02){const axis={x:(candidate.front.b.x-candidate.front.a.x)/candidate.front.length,y:(candidate.front.b.y-candidate.front.a.y)/candidate.front.length};for(const end of [candidate.from,candidate.to]){const q={x:candidate.front.a.x+axis.x*end,y:candidate.front.a.y+axis.y*end};if(distanceToSegment(q,front.a,front.b)<.02&&distance(q,front.a)>=5.25&&distance(q,front.b)>=5.25)cuts.push(q.x*u.x+q.y*u.y)}}
     const route = plan?.route ?? { distance: Infinity, availableYear: 2025, formAvailableYear: 2025, source: 'center' as const }
-    return { stock, frontage, depth, maximumArea: frontage * depth * 1.28, route, parking: stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350, holding, cuts:[...new Set(cuts)] }
+    return { stock, frontage, depth, maximumArea: frontage * depth * 1.28, route, parking: stock === 'retail' || stock === 'garden' || stock === 'ordinary' && intensity < .64 || stock === 'walkup' && route.distance > 350, holding, cuts:[...new Set(cuts)] }
   }
   const split = (cell: Cell, programme: TitleProgramme): Cell[] | null => {
     const front = cell.frontages[0]!, length = front.length, u = { x: (front.b.x - front.a.x) / length, y: (front.b.y - front.a.y) / length }, v = { x: -u.y, y: u.x }
@@ -399,17 +451,18 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     if (!pointInRegion({ x: origin.x + normal.x, y: origin.y + normal.y }, cell)) normal = { x: -normal.x, y: -normal.y }
     const world = (u: number, v: number): Point => ({ x: origin.x + tangent.x * u + normal.x * v, y: origin.y + tangent.y * u + normal.y * v })
     const us = cell.polygon.map(p => (p.x - origin.x) * tangent.x + (p.y - origin.y) * tangent.y), vs = cell.polygon.map(p => (p.x - origin.x) * normal.x + (p.y - origin.y) * normal.y)
-    const stock = programme.stock, merged = stock === 'mixed' || stock === 'walkup', availableWidth = Math.max(...us) - Math.min(...us), sideParking = programme.parking && !merged && availableWidth >= 13.5
+    const stock = programme.stock, large=businessStock(stock), merged = commercialStock(stock) || stock === 'walkup', availableWidth = Math.max(...us) - Math.min(...us), sideParking = programme.parking && !merged && availableWidth >= 13.5
     const frontParking = programme.parking && !sideParking && Math.max(...vs) >= 15
     // The certified entrance strip has a1.1m end cap inside the title.
     // Its clearance is part of site fitting, not an overlap to waive.
-    const frontGap = Math.max(1.25,programme.holding.frontGap,frontParking?5.7:0)
+    const preferredGap = Math.max(1.25,programme.holding.frontGap,frontParking?5.7:0),siteDepth=Math.max(...vs)
+    const frontGap = siteDepth-preferredGap-1.1<5?Math.max(1.25,Math.min(preferredGap,siteDepth-7.1)):preferredGap
     // The programme reserves titled ground for its garden, service court or
     // surveyed parking bay. Roof depth follows that acquisition and usable
     // width, rather than every road getting the same12m-deep building band.
     const roofBudget = regionArea(cell) * programme.holding.coverage
-    const desiredWidth = clamp(Math.min(programme.frontage*programme.holding.widthRatio,Math.sqrt(roofBudget*programme.holding.aspect)),merged?10:4.8,merged?32:18)
-    const desiredDepth = clamp(roofBudget/Math.min(desiredWidth,availableWidth-(sideParking?4.2:1.3)),6,merged?24:20)
+    const desiredWidth = clamp(Math.min(programme.frontage*programme.holding.widthRatio,Math.sqrt(roofBudget*programme.holding.aspect)),large?16:merged?10:4.8,large?52:merged?32:18)
+    const desiredDepth = clamp(roofBudget/Math.min(desiredWidth,availableWidth-(sideParking?4.2:1.3)),6,large?44:merged?24:20)
     const fullWidth = Math.min(desiredWidth, availableWidth - (sideParking ? 4.2 : merged ? 2.4 : 1.3)), fullDepth = Math.min(desiredDepth, Math.max(...vs) - frontGap - 1.1)
     const align = (sideParking ? -1.5 : 0) + programme.holding.sideBias*Math.max(0,availableWidth-fullWidth-1.3)
     let acquiredAccess: { attachment: Point; access: Point[]; covered: boolean } | undefined
@@ -477,6 +530,16 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       }
     }
     regions = inDemand
+    // A new business holding changes only its acquired ground. Keep the
+    // surrounding streets' ownership runs and depth reference stable rather
+    // than replanning distant housing from the remainder's altered boundary.
+    const businessSites:ReturnType<typeof acquireBusiness>['acquired']=[], ordinaryPlanning: { original: PolygonRegion; plans: FrontageProgramme[]; roadIds: Set<string> }[]=[]
+    regions=regions.flatMap(region=>{
+      if(regionArea(region)<4500||input.demand.at(interior(region))<.6||!frontages(region).some(front=>front.segment.road.width>=8))return [region]
+      const business=acquireBusiness(region,programmes(region));businessSites.push(...business.acquired)
+      if(business.acquired.length){const plans=programmes(region,false);ordinaryPlanning.push({original:region,plans,roadIds:new Set(plans.map(plan=>plan.front.segment.road.id))})}
+      return business.remaining
+    })
     let blockAccessArea = 0, throughAccesses = 0
     // Missing neighbourhood streets belong to transport, not a second street
     // generator hidden in cadastre. Only a few rear acquisitions are allowed.
@@ -497,7 +560,13 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       if (!acquired) break
     }
     metrics.accessArea += blockAccessArea
-    const pending: { cell: Cell; original: PolygonRegion; plans: FrontageProgramme[]; depth: number }[] = regions.map(region => ({ cell: { ...region, frontages: frontages(region) }, original: region, plans: programmes(region), depth: 0 }))
+    const pending: { cell: Cell; original: PolygonRegion; plans: FrontageProgramme[]; depth: number }[] = [...businessSites.map(site=>({cell:{...site.region,frontages:frontages(site.region).sort((a,b)=>Number(b.segment.road.id===site.roadId)-Number(a.segment.road.id===site.roadId)||b.length-a.length)},original:site.region,plans:site.plans,depth:0})),...regions.map(region=>{
+      const prior=ordinaryPlanning.find(plan=>pointInRegion(interior(region),plan.original))
+      if(prior){const added=programmes(region,false).filter(plan=>!prior.roadIds.has(plan.front.segment.road.id));return {cell:{...region,frontages:frontages(region)},original:prior.original,plans:[...prior.plans,...added],depth:0}}
+      const intensity=clamp(input.demand.at(interior(region)),0,1),ordinary:Stock=intensity>=.72?'compact':intensity<.38?'garden':'ordinary'
+      const plans=programmes(region).map(plan=>businessStock(plan.stock)?{...plan,stock:ordinary,holding:streetHolding(input.config.seed,plan.holdingKey??plan.front.segment.road.id,ordinary,intensity)}:plan)
+      return {cell:{...region,frontages:frontages(region)},original:region,plans,depth:0}
+    })]
     // A network-first coarse face can contain many real local trees while
     // remaining a single topological face. Budget its private cuts by ground
     // area/minimum48m² title, not the former tiny closed-street-block count.
@@ -513,7 +582,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         continue
       }
       if (!cell.frontages.length) { metrics.frontageFailures++; open(cell, String(cellSerial), '実接道を確保できない街区内地'); continue }
-      const front = cell.frontages[0]!, programme = titleProgramme(cell, original, plans), major = programme.stock === 'mixed', maximumArea = programme.maximumArea
+      const front = cell.frontages[0]!, programme = titleProgramme(cell, original, plans), major = commercialStock(programme.stock), maximumArea = programme.maximumArea
       if ((area > maximumArea || programme.cuts.length || cell.holes?.length) && depth < 20 && processed++ < processingBudget) {
         const children = split(cell, programme)
         if (children) { for (const child of children) pending.push({ cell: child, original, plans, depth: depth + 1 }); continue }
@@ -526,8 +595,17 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
         tried.add(key); pad = buildingPad(cell, contact, programme)
         if (pad || tried.size >= 8) break
       }
+      // A surveyed business acquisition is a proposal, not permission to turn
+      // an awkward residual into a vacant campus or a house-sized skyscraper.
+      // Re-offer unsuitable ground to ordinary frontage ownership with all of
+      // the same physical and access checks.
+      if(businessStock(programme.stock)&&plans.every(plan=>businessStock(plan.stock))&&(!pad||polygonArea(pad.polygon)<Math.max(programme.stock==='office'?300:200,area*.2))){
+        pending.push({cell:{...cell,frontages:frontages(cell)},original:cell,plans:programmes(cell).filter(plan=>!businessStock(plan.stock)),depth:0})
+        continue
+      }
+
       const merged = major || programme.stock === 'walkup'
-      const createdYear = Math.max(opening(p), ...(pad?.polygon ?? []).map(opening), (pad?.front ?? front).segment.road.builtYear ?? 1650, merged ? programme.route.availableYear : 1650)
+      const createdYear = Math.max(opening(p), ...(pad?.polygon ?? []).map(opening), (pad?.front ?? front).segment.road.builtYear ?? 1650, merged ? programme.route.availableYear : 1650,businessStock(programme.stock)?Math.max(programme.stock==='office'?1955:1970,programme.route.formAvailableYear):1650)
       if (!pad || !Number.isFinite(createdYear) || createdYear > 2025) { metrics.formationFailures++; open(cell, String(cellSerial), pad ? '将来形成する接道地' : '形状・地形上の建築不適地'); continue }
       if (area > maximumArea * 2 && polygonArea(pad.polygon) / area < .2) {
         const origin = pad.entrance, served = pad.front, u = { x: (served.b.x - served.a.x) / served.length, y: (served.b.y - served.a.y) / served.length }
@@ -552,7 +630,7 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
       const stockMetrics = metrics.stock[programme.stock] ?? { count: 0, parcelArea: 0, roofArea: 0, parking: 0 }; stockMetrics.count++; stockMetrics.parcelArea += area; stockMetrics.roofArea += polygonArea(pad.polygon); stockMetrics.parking += Number(pad.parking); metrics.stock[programme.stock] = stockMetrics
       const versions: TimelineVersion<Building>[] = []
       for (let year = createdYear, frame = 0; year <= 2025 && frame < 10; frame++) {
-        const random = seededRandom(`${input.config.seed}:${parcel.id}:${year}:frame`), height = year < 1955 || year < programme.route.formAvailableYear ? 1 + Number(random() < .45) : major ? 3 + Math.floor(random() * (programme.route.distance < 350 ? 4 : 2)) : programme.stock === 'walkup' ? 3 + Math.floor(random() * 2) : programme.stock === 'compact' && programme.route.distance < 650 && intensity >= .85 ? 3 : 1 + Number(random() < .85)
+        const random = seededRandom(`${input.config.seed}:${parcel.id}:${year}:frame`), height = year < 1955 || year < programme.route.formAvailableYear ? 1 + Number(random() < .45) : programme.stock==='office'?6+Math.floor(random()*7):programme.stock==='retail'?2+Math.floor(random()*3): major ? 3 + Math.floor(random() * (programme.route.distance < 350 ? 4 : 2)) : programme.stock === 'walkup' ? 3 + Math.floor(random() * 2) : programme.stock === 'compact' && programme.route.distance < 650 && intensity >= .85 ? 3 : 1 + Number(random() < .85)
         const building: Building = { id: `cf-b-${cellSerial}-${year}-${frame}`, polygon: pad.polygon.map(point => ({ ...point })), kind: major ? 'commercial' : 'residential', height, parcelId: parcel.id, builtYear: year, occupancy: 'occupied', occupiedHouseholds: major ? 0 : programme.stock === 'walkup' ? Math.max(2, Math.floor(polygonArea(pad.polygon) * height / 60)) : 1 }
         const next = year + buildingServiceYears(input.config.seed, building)
         versions.push({ from: year, ...(next <= 2025 ? { to: next } : {}), value: building }); year = next

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { streetHolding } from './street-holding'
 import type { StreetStock } from './street-holding'
 
-const stocks: StreetStock[] = ['compact', 'ordinary', 'garden', 'walkup', 'mixed']
+const stocks = ['compact', 'ordinary', 'garden', 'walkup', 'mixed'] as const satisfies readonly StreetStock[]
 const percentile = (values: number[], fraction: number) => values.slice().sort((a, b) => a - b)[Math.floor((values.length - 1) * fraction)]!
 const samples = (stock: StreetStock) => Array.from({ length: 600 }, (_, i) => streetHolding('holding-study', `holding-${i}`, stock, .85, `street-side-${Math.floor(i / 6)}`))
 
@@ -58,6 +58,20 @@ describe('street acquisition profiles', () => {
       expect(profile.widthRatio).toBeGreaterThanOrEqual(.65)
       expect(profile.widthRatio).toBeLessThanOrEqual(.9)
       expect(Math.abs(profile.sideBias)).toBeLessThanOrEqual(.13)
+    }
+  })
+
+  it('acquires distinct larger business sites instead of enlarging every ordinary house', () => {
+    const homes=samples('ordinary'),offices=samples('office'),retail=samples('retail')
+    expect(percentile(offices.map(p=>p.frontage*p.depth*p.coverage),.5)).toBeGreaterThan(percentile(homes.map(p=>p.frontage*p.depth*p.coverage),.5)*4)
+    expect(percentile(retail.map(p=>p.frontage),.5)).toBeGreaterThan(35)
+    for(const stock of ['office','retail'] as const)for(const profile of samples(stock)){
+      expect(profile.frontage).toBeGreaterThanOrEqual(30)
+      expect(profile.frontage).toBeLessThanOrEqual(76)
+      expect(profile.depth).toBeGreaterThanOrEqual(32)
+      expect(profile.depth).toBeLessThanOrEqual(62)
+      expect(profile.coverage).toBeGreaterThanOrEqual(.38)
+      expect(profile.coverage).toBeLessThanOrEqual(.7)
     }
   })
 })
