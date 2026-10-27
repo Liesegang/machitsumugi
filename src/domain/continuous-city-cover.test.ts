@@ -45,16 +45,16 @@ describe('continuous city residual cover', () => {
       { id: 'east-west', kind: 'local', role: 'farm', width: 4, points: [{ x: 0, y: 300 }, { x: 2200, y: 300 }] },
       { id: 'diagonal', kind: 'local', role: 'farm', width: 4, points: [{ x: 1500, y: 550 }, { x: 2200, y: 1100 }] },
     ]
-    const result = run({ width: 2400, height: 1200, roads }), farms = result.filter(a => a.kind === 'field')
-    expect(farms.length).toBeGreaterThan(5)
-    expect(sum(farms)).toBeGreaterThan(2500000)
-    expect(Math.max(...farms.map(regionArea))).toBeGreaterThan(200000)
+    const result = run({ width: 2400, height: 1200, roads }), farms = result.filter(a => a.kind === 'field'), farmGround = result.filter(a => a.kind === 'field' || a.id.startsWith('land-continuous-farm-bund-'))
+    expect(farms.length).toBeGreaterThan(100)
+    expect(sum(farmGround)).toBeGreaterThan(2500000)
+    expect(Math.max(...farms.map(regionArea))).toBeLessThan(12000)
     expect(new Set(farms.flatMap(f => f.polygon.map((a, i) => { const b = f.polygon[(i + 1) % f.polygon.length]!; return Math.round(Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI / 10) }))).size).toBeGreaterThan(4)
     expect(farms.every(farm => farm.landUse === 'dry-field')).toBe(true)
     // Storage pieces can be remote from a road; each connected agricultural
     // holding must still reach real frontage across positive-width tile seams.
-    for (const holding of dissolveContinuousCover(farms)) expect(roads.some(r => r.points.slice(1).some((b, i) => holding.polygon.some(p => distanceToSegment(p, r.points[i]!, b) <= r.width / 2 + .65)))).toBe(true)
-    expect(result.some(a => a.kind === 'field' && pointInRegion({ x: 400, y: 1000 }, a))).toBe(true)
+    for (const holding of dissolveContinuousCover(farmGround)) expect(roads.some(r => r.points.slice(1).some((b, i) => holding.polygon.some(p => distanceToSegment(p, r.points[i]!, b) <= r.width / 2 + .65)))).toBe(true)
+    expect(farmGround.some(a => pointInRegion({ x: 400, y: 1000 }, a))).toBe(true)
     expect(sum(result)).toBeGreaterThan(2800000)
   })
   it('keeps steep woodland continuous and gives disconnected dry land no invented farm access', () => {
@@ -145,8 +145,9 @@ describe('continuous city residual cover', () => {
   }, 10000)
   it('does not transfer rural access across a point-only contact between processing tiles', () => {
     const result = run({ width: 1800, height: 1800, roads: [{ id: 'farm-road', kind: 'local', width: 4, points: [{ x: 0, y: 400 }, { x: 800, y: 400 }] }], reserves: [{ polygon: rectangle(900, 0, 900, 900) }, { polygon: rectangle(0, 900, 900, 900) }] })
-    expect(result.some(a => a.kind === 'field' && pointInRegion({ x: 400, y: 200 }, a))).toBe(true)
+    expect(result.some(a => (a.kind === 'field' || a.id.startsWith('land-continuous-farm-bund-')) && pointInRegion({ x: 400, y: 200 }, a))).toBe(true)
     expect(result.some(a => a.kind === 'field' && pointInRegion({ x: 1200, y: 1200 }, a))).toBe(false)
+    expect(result.some(a => a.id.startsWith('land-continuous-farm-bund-') && pointInRegion({ x: 1200, y: 1200 }, a))).toBe(false)
     expect(result.some(a => a.landUse === 'meadow' && pointInRegion({ x: 1200, y: 1200 }, a))).toBe(true)
     expect(result.filter(a => a.kind !== 'water').every(a => a.id.startsWith('land-continuous-'))).toBe(true)
   })

@@ -5,7 +5,7 @@ import type { Point, Road } from './types'
 import { corridorPolygon, distance, distanceToSegment, polygonOverlapsRegion, rectangle } from './geometry'
 import { certifyLayoutAccess } from './layout-first-access'
 
-function fixture(arterial = true, width = 3000, height = 2400): ContinuousCityRoadInput {
+function fixture(arterial = true, width = 3000, height = 2400, regional = false): ContinuousCityRoadInput {
   const center = { x: width / 2, y: height / 2 }
   const plain = { elevation: () => 12, slope: () => 0, waterAt: () => false, seaAt: () => false }
   const initialRoads: Road[] = [
@@ -14,7 +14,7 @@ function fixture(arterial = true, width = 3000, height = 2400): ContinuousCityRo
   ]
   return {
     config: { name: '地区幹線試験市', seed: 'major-neighbourhood-network', type: 'newtown', terrain: 'plain', density: 100, forest: 0, railway: false, stations: 1, arterial, facilities: [], settlement: 'metropolis', targetYear: 2025 },
-    environment: { width, height, areas: [], core: null, terrain: { ...plain, bridgeSites: [], continuationTerrain: plain } },
+    environment: { width, height, areas: [], core: null, terrain: { ...plain, bridgeSites: [], ...(regional ? { continuationTerrain: plain } : {}) } },
     center, initialRoads, reservedRegions: [], railways: [],
     demand: { center, regions: [{ polygon: rectangle(0, 0, width, height) }], at: p => p.x > 0 && p.x < width && p.y > 0 && p.y < height ? 1 : 0, costAt: p => p.x < 0 || p.x > width || p.y < 0 || p.y > height ? Infinity : 0, openingAt: () => 1955, metrics: { cellSize: 60, reachableLandArea: width * height, targetUrbanArea: width * height, selectedUrbanArea: width * height } },
   }
@@ -101,7 +101,7 @@ describe('continuous neighbourhood arterial frame', () => {
   }, 15000)
 
   it('surveys additional regional outlets for a large developed basin using actual surrounding terrain', () => {
-    const input = fixture(true, 6000, 4500), before = JSON.stringify(input.initialRoads), result = surveyContinuousCityRoadFrame(input)
+    const input = fixture(true, 6000, 4500, true), before = JSON.stringify(input.initialRoads), result = surveyContinuousCityRoadFrame(input)
     const added = result.roads.filter(road => road.boundaryContinuation && !input.initialRoads!.some(old => old.id === road.id))
     expect(result.diagnostics.regionalDistrictRoutes!.routes).toBeGreaterThan(0)
     expect(added.length).toBeGreaterThan(0)

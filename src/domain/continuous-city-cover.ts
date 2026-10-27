@@ -6,8 +6,9 @@ import type { Bounds, PolygonRegion } from './geometry'
 import type { TerrainModel } from './terrain'
 import type { ContinuousCityDemand } from './continuous-city-types'
 import { boundsOf, distance, distanceToSegment, intersectRegions, overlaps, pathPointAt, pointInRegion, rectangle, regionArea, subtractRegions } from './geometry'
-import { agriculturalUse, contourLand } from './land-use'
+import { contourLand } from './land-use'
 import { PROJECT_GEOMETRY_LIMITS } from './project'
+import { subdivideContinuousFarmDistrict } from './continuous-city-farm-plots'
 
 const { difference, union } = polygonClipping
 
@@ -366,8 +367,8 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
   const steep = contourLand(width, height, p => terrain.slope(p) - .16, Math.max(60, Math.sqrt(width * height / 9000)))
   onProgress?.(`土地被覆:森林と斜面境界を結合中（${steep.length}斜面）…`)
   const woodland = dissolveContinuousCover([...terrain.areas.filter(a => a.kind === 'forest' || a.landUse === 'woodland'), ...steep]), woodlandPartition = coverMaskPartition(woodland)
-  const result: Area[] = [], add = (regions: PolygonRegion[], kind: Area['kind'], landUse?: Area['landUse']) => {
-    for (const region of regions) if (regionArea(region) > .0001) result.push({ id: `land-continuous-${result.length}`, ...region, kind, ...(landUse ? { landUse } : {}) })
+  const result: Area[] = [], add = (regions: PolygonRegion[], kind: Area['kind'], landUse?: Area['landUse'], identity = 'land-continuous') => {
+    for (const region of regions) if (regionArea(region) > .0001) result.push({ id: `${identity}-${result.length}`, ...region, kind, ...(landUse ? { landUse } : {}) })
   }
   // Tiles have disjoint interiors; woodland has been truly unioned, and the
   // demand contour consists of disjoint regions. Subtraction/intersection thus
@@ -430,12 +431,14 @@ export function buildContinuousCityCover(input: ContinuousCityCoverInput): Area[
     onProgress?.(`土地被覆:農地区の地盤交差 ${districtSerial}/${sites.length}（${nearby.length}残地）…`)
     const pieces = nearby.flatMap(remainder => intersectRegions(district, remainder))
     onProgress?.(`土地被覆:農地区の連続接道 ${districtSerial}/${sites.length}（${pieces.length}片）…`)
-    for (const part of partitionContinuousCover(roadServedRuralPartition(pieces, p => touchesRoad(p, site.road.id), tile))) {
-      // Water, a reserve or a disconnected island can sever an ownership cell.
-      // A severed component gets no fictitious farm access.
-      add([part], 'field', agriculturalUse(part.polygon, agricultureTerrain))
-      farmParts.push(part)
-    }
+    // Water, a reserve or a disconnected island can sever an ownership cell.
+    // Keep only districts with real access, then survey field holdings and
+    // their shared working verges rather than painting one enormous field.
+    const served = partitionContinuousCover(roadServedRuralPartition(pieces, p => touchesRoad(p, site.road.id), tile))
+    const holdings = subdivideContinuousFarmDistrict({ regions: served, road: site.road, origin: site.origin, seed: `${input.config.seed}:rural-${districtSerial}`, terrain: agricultureTerrain })
+    for (const plot of holdings.plots) add([plot], 'field', plot.landUse)
+    add(holdings.bunds, 'park', 'meadow', `land-continuous-farm-bund-${districtSerial}`)
+    farmParts.push(...served)
   }
   onProgress?.(`土地被覆:最終残地から農地を除外中（${ruralParts.length}残地・${farmParts.length}農地区）…`)
   const farmQuery = regionIndex(farmParts), inaccessible: PolygonRegion[] = []

@@ -14,6 +14,8 @@ import { surveyedRoadGradeAllowed } from './surveyed-road-profile'
 import { regionQuery } from './region-query'
 import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { continuousRoadEndcapsClear } from './continuous-road-endcaps'
+import { continuousLocalStreetDepth } from './continuous-city-density'
+import { continuousCollectorJoinCandidates } from './continuous-collector-join'
 import { planModernTransport } from './modern-transport'
 import { layoutMainCivilGuides, surveyLayoutMainCivilCrossings } from './layout-first-main-civil-bridges'
 
@@ -28,7 +30,7 @@ export interface ContinuousRoadDiagnostics {
   unservedAccessIds: string[]; accessAttempts: { id: string; from: Point; endHeading?: number; found: boolean }[]
   modern: { requested: string[]; completed: string[]; unavailable: { kind: string; reason: string }[] }
   bridgeSpans: (SurveyedBridgeSpan & { roadId: string })[]
-  trunkSurveys: { stage: string; milliseconds: number; from?: Point; to?: Point; candidates?: number; found?: boolean }[]
+  trunkSurveys: { stage: string; milliseconds: number; from?: Point; to?: Point; via?: Point; candidates?: number; found?: boolean }[]
   phaseMilliseconds: Record<string, number>
   sharedExpansion: { anchors: number; rungs: number; links: number; routeFailures: number; bridgeSurveys: number }
   largeFaceDetours: { faces: number; attempted: number; accepted: number; parentAreas: number[] }
@@ -310,7 +312,7 @@ class ContinuousRoadDesign {
    * terminate a new major corridor at the edge or invent outside elevations. */
   private regionalDistrictStreets(samples: Point[]) {
     const { config, demand } = this.input, regional = this.regional
-    const budget = Math.min(config.settlement === 'metropolis' ? 5 : 3, Math.floor(demand.metrics.selectedUrbanArea / 12_000_000))
+    const budget = Math.min(config.settlement === 'metropolis' ? 5 : 3, Math.floor(demand.metrics.selectedUrbanArea / 4_500_000))
     if (!regional || !config.arterial || !budget || config.settlement === 'village' || config.settlement === 'rural-town') return
     const width = config.settlement === 'metropolis' ? 10.2 : 9
     const major = () => this.graph.roads.filter(road => road.width >= 8 && !road.controlledAccess && (road.level ?? 0) === 0 && !['access', 'farm', 'ramp'].includes(road.role))
@@ -318,6 +320,7 @@ class ContinuousRoadDesign {
       let best: { point: Point; road: SimulatedRoad; distance: number } | undefined
       for (const road of major()) for (let i = 1; i < road.points.length; i++) {
         const q = projectOnRoadSegment(point, road.points[i - 1]!, road.points[i]!).point, depth = distance(point, q)
+        if (!this.planner.suitable(q, width)) continue
         if (!best || depth < best.distance) best = { point: q, road, distance: depth }
       }
       return best
@@ -335,8 +338,24 @@ class ContinuousRoadDesign {
       for (const portal of regional.boundaryPortals(goal, { width, direction, maxCandidates: 2 })) {
         if (distance(portal, goal) < 200 || distance(portal, anchor.point) < 1400) continue
         metrics.attempted++
-        const started = performance.now(), route = regional.plan(anchor.point, portal, { role: 'collector', width, allowBridge: true, through: goal, alignment: 'planned', maximumGrade: .09, maxNodes: 4200, avoidRepeatedRiverCrossings: true })
-        this.diagnostics.trunkSurveys.push({ stage: 'district-regional-alignment', milliseconds: performance.now() - started, from: anchor.point, to: portal, found: !!route })
+        const started = performance.now(), terrain = this.environment.terrain!
+        // An outlet in another district has a different bearing from the
+        // original main. Survey its actual banks before the regional search;
+        // inherited bridge candidates alone can leave a dry district isolated.
+        const civil = terrain.channelAt ? surveyLayoutMainCivilCrossings({
+          guides: [[anchor.point, goal, portal]], width,
+          waterRegions: this.environment.areas.filter(area => area.kind === 'water'), terrain,
+          rowAllows: (points, pavement) => this.rowAllows(points, pavement),
+          railwayAllows: (points, pavement) => this.planner.railwayWidthAllows(points, .01, pavement, 'collector'),
+          bridgeAllows: (points, pavement) => regional.validate(points, pavement, true), maximumCandidates: 12,
+        }) : []
+        let planner = regional
+        if (civil.length) {
+          planner = new RegionalRoadPlanner({ ...this.environment, terrain: { ...terrain, bridgeCandidates: [...(terrain.bridgeCandidates ?? []), ...civil] } })
+          planner.setRailwayCorridors(this.input.railways); planner.setRailwayRoadNetwork(this.graph.roads)
+        }
+        const route = planner.plan(anchor.point, portal, { role: 'collector', width, allowBridge: true, through: goal, alignment: 'planned', maximumGrade: .09, maxNodes: 4200, avoidRepeatedRiverCrossings: true })
+        this.diagnostics.trunkSurveys.push({ stage: 'district-regional-alignment', milliseconds: performance.now() - started, from: anchor.point, via: goal, to: portal, candidates: civil.length, found: !!route })
         if (!route || route.length > distance(anchor.point, portal) * 1.65 || !continuousCityRoadGradeAllowed(route, .09, this.elevation)) continue
         const year = Math.max(1955, anchor.road.builtYear, ...resampleAlignment(route.points, 120).filter(point => demand.at(point) > 0).map(point => demand.openingAt(point)))
         if (!Number.isFinite(year) || year > 2025) continue
@@ -416,8 +435,9 @@ class ContinuousRoadDesign {
           // survey must not leave an arterial stub at the first district.
           const first=this.surveyCollector(a.point,goal,width),last=first&&this.surveyCollector(goal,b.point,width)
           if(!first||!last)continue
-          const turn=roundedStreet([first.points.at(-2)!,goal,last.points[1]!],120,.42),points=[...first.points.slice(0,-2),...turn,...last.points.slice(2)]
-          route={...first,points,length:roadLength(points),cost:first.cost+last.cost,bridgeLength:first.bridgeLength+last.bridgeLength,surveyedBridgeSpans:[...first.surveyedBridgeSpans??[],...last.surveyedBridgeSpans??[]]}
+          const spans=[...first.surveyedBridgeSpans??[],...last.surveyedBridgeSpans??[]]
+          route=continuousCollectorJoinCandidates(first.points,last.points).map(points=>({...first,points,length:roadLength(points),cost:first.cost+last.cost,bridgeLength:first.bridgeLength+last.bridgeLength,surveyedBridgeSpans:spans})).find(candidate=>bankOnPath(candidate.points,spans)&&this.valid(candidate,width,'collector')&&continuousCityRoadGradeAllowed(candidate,.09,this.elevation))??null
+          if(!route)continue
         }
         const spans=route.surveyedBridgeSpans??[]
         if(route.length/direct>1.65||!bankOnPath(route.points,spans)||!continuousCityRoadGradeAllowed(route,.09,this.elevation))continue
@@ -684,7 +704,7 @@ class ContinuousRoadDesign {
     for (let y = cellSize / 2; y < height; y += cellSize) for (let x = cellSize / 2; x < width; x += cellSize) {
       const point = { x, y }
       if (!usable(point)) continue
-      const intensity = this.input.demand.at(point), target = 20 + (1 - intensity) * 12
+      const intensity = this.input.demand.at(point), target = continuousLocalStreetDepth(intensity)
       let near = this.graph.nearest(point)
       if (near && !publicRoad(near.road)) near = this.graph.projections(point, 240, 12).find(hit => publicRoad(hit.road)) ?? null
       const depth = near?.distance ?? Infinity, clear = !!near && this.dryAccessClear(point, near.point), served = clear && depth <= target, index = cells.length
@@ -758,6 +778,10 @@ class ContinuousRoadDesign {
     metrics.servedAfter = cells.filter(cell => cell.served).length; metrics.unservedAreaEstimate = (metrics.dryCells - metrics.servedAfter) * cellSize * cellSize
     this.diagnostics.localNetwork = metrics
   }
+  acquireAccess() {
+    for (const target of this.input.accessTargets ?? []) if (!this.gate(target)) this.diagnostics.unservedAccessIds.push(target.id)
+    return this.result()
+  }
   build(localOnly = false, frameOnly = false) {
     const majorRoads=this.graph.roads.filter(road=>road.width>=8&&!road.controlledAccess&&(road.level??0)===0),outsideSides=new Set<string>()
     for(const road of majorRoads.filter(road=>road.boundaryContinuation))for(const point of [road.points[0]!,road.points.at(-1)!]){if(point.x<0)outsideSides.add('west');if(point.x>this.environment.width)outsideSides.add('east');if(point.y<0)outsideSides.add('north');if(point.y>this.environment.height)outsideSides.add('south')}
@@ -804,6 +828,8 @@ class ContinuousRoadDesign {
 
 export function surveyContinuousCityTrunks(input: ContinuousCityRoadInput) { const design = new ContinuousRoadDesign({ ...input, initialRoads: [] }); design.trunks(); const { roads, diagnostics } = design.result(); return { roads, diagnostics } }
 export function buildContinuousCityRoads(input: ContinuousCityRoadInput) { return new ContinuousRoadDesign(input).build() }
+/** Survey actual public approaches once before refining station/road demand. */
+export function surveyContinuousCityAccess(input: ContinuousCityRoadInput) { return new ContinuousRoadDesign(input).acquireAccess() }
 /** The same acquisition stages used by the city generator, before local infill. */
 export function surveyContinuousCityRoadFrame(input:ContinuousCityRoadInput){return new ContinuousRoadDesign(input).build(false,true)}
 /** Local survey over already materialized roads from this generation. Also

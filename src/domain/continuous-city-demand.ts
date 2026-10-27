@@ -1,14 +1,18 @@
-import type { CityConfig, Point } from './types'
+import type { CityConfig, Point, Road, Station } from './types'
 import type { TerrainModel } from './terrain'
 import type { ContinuousCityDemand } from './continuous-city-types'
-import { distance, seededRandom } from './geometry'
+import { distance, projectPoint, seededRandom } from './geometry'
 import type { PolygonRegion } from './geometry'
-import { MinHeap } from './road-graph'
+import { materializeRoadJunctions, MinHeap } from './road-graph'
 import { regionQuery } from './region-query'
 import { contourLand } from './land-use'
 
 type DemandTerrain = Pick<TerrainModel, 'cityOrigin' | 'areas' | 'waterAt' | 'slope' | 'elevation'> & Partial<Pick<TerrainModel, 'channelAt' | 'standingWaterAt'>>
-export interface ContinuousDemandInput { config: CityConfig; width: number; height: number; terrain: DemandTerrain }
+export interface ContinuousDemandInput {
+  config: CityConfig; width: number; height: number; terrain: DemandTerrain
+  /** Acquired public geometry only. An unconnected station is not a free town. */
+  access?: { roads: readonly Road[]; stations?: readonly Pick<Station, 'id' | 'point' | 'entrance' | 'builtYear'>[] }
+}
 
 /** Indexed exact shoreline crossings. Sampling an edge's midpoint misses a
  * channel narrower than a demand cell. Holes belong to their parent water body,
@@ -55,7 +59,7 @@ function standingWaterBarrier(regions: readonly PolygonRegion[], contains: (p: P
  * Rivers may carry development pressure to the opposite bank, but sea, lakes
  * and steep terrain do not. This is demand ONLY, never a bridge certificate.
  * Density changes the developed footprint, not random missing houses per lot. */
-export function planContinuousCityDemand({config,width,height,terrain}: ContinuousDemandInput): ContinuousCityDemand {
+export function planContinuousCityDemand({config,width,height,terrain,access}: ContinuousDemandInput): ContinuousCityDemand {
   const cellSize = Math.max(40, Math.min(80, Math.min(width,height)/60))
   const columns = Math.ceil(width/cellSize), rows = Math.ceil(height/cellSize), count = columns*rows
   const sx=width/columns, sy=height/rows, area=sx*sy
@@ -99,6 +103,62 @@ export function planContinuousCityDemand({config,width,height,terrain}: Continuo
   for(const id of shortlist){const p=point(id),score=broadDry(id)*2-distance(p,landCenter)/Math.min(width,height)*1.3-distance(p,terrain.cityOrigin)/Math.hypot(width,height)*.18+random()*.015;if(score>best){best=score;origin=id}}
   const center=point(origin), costs=new Float64Array(count).fill(Infinity), queue=new MinHeap<number>()
   costs[origin]=0;queue.push(origin,0)
+  if(access?.roads.length){
+    type Edge={a:Point;b:Point;from:number;to:number;length:number;factor:number;road:Road}
+    const nodes:Point[]=[],ids=new Map<string,number>(),edges:Edge[]=[],adjacent:{to:number;cost:number}[][]=[]
+    const node=(p:Point)=>{const key=`${Math.round(p.x*10000)}:${Math.round(p.y*10000)}`;let id=ids.get(key);if(id===undefined){id=nodes.length;ids.set(key,id);nodes.push(p);adjacent.push([])}return id}
+    const croppedEdge=(a:Point,b:Point):[Point,Point]|null=>{
+      let from=0,to=1
+      for(const [start,delta,maximum]of [[a.x,b.x-a.x,width],[a.y,b.y-a.y,height]]){
+        if(Math.abs(delta!)<1e-12){if(start!<0||start!>maximum!)return null;continue}
+        const first=-start!/delta!,last=(maximum!-start!)/delta!
+        from=Math.max(from,Math.min(first,last));to=Math.min(to,Math.max(first,last));if(from>to)return null
+      }
+      const at=(t:number)=>({x:Math.max(0,Math.min(width,a.x+(b.x-a.x)*t)),y:Math.max(0,Math.min(height,a.y+(b.y-a.y)*t))})
+      return [at(from),at(to)]
+    }
+    const landLink=(a:Point,b:Point,allowChannel=false)=>{
+      if(crossesStanding(a,b))return false
+      const steps=Math.max(1,Math.ceil(distance(a,b)/12))
+      for(let step=0;step<=steps;step++){const p={x:a.x+(b.x-a.x)*step/steps,y:a.y+(b.y-a.y)*step/steps};if(!passable(p)||!allowChannel&&terrain.waterAt(p))return false}
+      return true
+    }
+    const publicRoads=access.roads.filter(road=>!road.controlledAccess&&road.role!=='expressway'&&road.role!=='ramp'&&road.role!=='farm'&&(road.level??0)===0&&(road.builtYear??1650)<=2025)
+    for(const road of materializeRoadJunctions(publicRoads).sort((a,b)=>a.id.localeCompare(b.id)))for(let index=1;index<road.points.length;index++){
+      const section=croppedEdge(road.points[index-1]!,road.points[index]!)
+      if(!section)continue
+      const [a,b]=section,length=distance(a,b)
+      // A drawn line across standing water is not an acquired approach. The
+      // terrain market can cross identified channels; this network discount
+      // additionally needs the road's actual crossing certificate.
+      if(length<.01||!landLink(a,b,!!road.bridge||!!road.surveyedBridgeSpans?.length))continue
+      const from=node(a),to=node(b),factor=road.width>=4.6?.32:.85
+      edges.push({a,b,from,to,length,factor,road});adjacent[from]!.push({to,cost:length*factor});adjacent[to]!.push({to:from,cost:length*factor})
+    }
+    const approaches=edges.map(edge=>{const attachment=projectPoint(center,edge.a,edge.b);return {edge,attachment,distance:distance(center,attachment)}}).filter(hit=>landLink(center,hit.attachment)).sort((a,b)=>a.distance-b.distance||a.edge.road.id.localeCompare(b.edge.road.id))
+    const approach=approaches[0]
+    if(approach){
+      const network=new Float64Array(nodes.length).fill(Infinity),roadQueue=new MinHeap<number>()
+      const seedNode=(id:number,cost:number)=>{if(cost<network[id]!){network[id]=cost;roadQueue.push(id,cost)}}
+      seedNode(approach.edge.from,approach.distance+distance(approach.attachment,approach.edge.a)*approach.edge.factor)
+      seedNode(approach.edge.to,approach.distance+distance(approach.attachment,approach.edge.b)*approach.edge.factor)
+      while(roadQueue.size){const current=roadQueue.pop()!;if(current.priority>network[current.value]!+1e-7)continue;for(const next of adjacent[current.value]!)seedNode(next.to,current.priority+next.cost)}
+      const routeCost=(edge:Edge,p:Point)=>Math.min(network[edge.from]!+distance(edge.a,p)*edge.factor,network[edge.to]!+distance(edge.b,p)*edge.factor,edge===approach.edge?approach.distance+distance(approach.attachment,p)*edge.factor:Infinity)
+      const seedGround=(p:Point,cost:number)=>{
+        if(!Number.isFinite(cost)||!passable(p)||terrain.waterAt(p))return
+        const x=Math.floor(p.x/sx),y=Math.floor(p.y/sy)
+        for(let dx=-1;dx<=1;dx++)for(let dy=-1;dy<=1;dy++){const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=columns||ny>=rows)continue;const id=ny*columns+nx,q=point(id);if(!dry[id]||!landLink(p,q))continue;const value=cost+distance(p,q)*resistance[id]!;if(value<costs[id]!){costs[id]=value;queue.push(id,value)}}
+      }
+      for(const edge of edges){if(!Number.isFinite(network[edge.from])&&!Number.isFinite(network[edge.to]))continue;const steps=Math.max(1,Math.ceil(edge.length/(cellSize*.7)));for(let step=0;step<=steps;step++){const p={x:edge.a.x+(edge.b.x-edge.a.x)*step/steps,y:edge.a.y+(edge.b.y-edge.a.y)*step/steps};seedGround(p,routeCost(edge,p)+70)}}
+      for(const station of [...access.stations??[]].sort((a,b)=>a.id.localeCompare(b.id))){
+        if((station.builtYear??1900)>2025)continue
+        const entrance=station.entrance??station.point
+        const contacts=edges.map(edge=>{const attachment=projectPoint(entrance,edge.a,edge.b);return {edge,attachment,distance:distance(entrance,attachment)}}).filter(hit=>hit.distance<=Math.max(4,hit.edge.road.width/2+2)&&landLink(entrance,hit.attachment)&&Number.isFinite(routeCost(hit.edge,hit.attachment))).sort((a,b)=>a.distance-b.distance||a.edge.road.id.localeCompare(b.edge.road.id))
+        const contact=contacts[0]
+        if(contact)seedGround(entrance,routeCost(contact.edge,contact.attachment)*.72+contact.distance+90)
+      }
+    }
+  }
   const neighbors=[[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]] as const
   while(queue.size){
     const current=queue.pop()!;if(current.priority>costs[current.value]!+1e-7)continue
@@ -127,7 +187,7 @@ export function planContinuousCityDemand({config,width,height,terrain}: Continuo
   const at=(p:Point)=>{
     const cost=costAt(p)
     if(cost>threshold||terrain.waterAt(p)||terrain.slope(p)>.19)return 0
-    return .12+.88*Math.pow(Math.max(0,1-cost/threshold),.65)
+    return Math.pow(Math.max(0,1-cost/threshold),.72)
   }
   const openingAt=(p:Point)=>{const ratio=costAt(p)/Math.max(1,threshold);return ratio<.08?1650:ratio<.25?1900:ratio<.52?1955:ratio<.75?1975:1995}
   const regions=contourLand(width,height,p=>at(p)>0?threshold-costAt(p):-cellSize,cellSize)
