@@ -237,7 +237,15 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
       const junction = r.junction === undefined ? undefined : object(r.junction, '鉄道の分岐')
       return { id, points: path, name: string(r.name, '路線名', 200), ...(r.mode === undefined ? {} : { mode: choice(r.mode, ['surface', 'subway'] as const, '鉄道の運行方式') }), ...(elevations ? { elevations } : {}), ...(structures ? { structures } : {}), ...(junction ? { junction: { parentId: string(junction.parentId, '分岐元の路線', 128), point: point(junction.point, '分岐点') } } : {}), ...(r.builtYear === undefined ? {} : { builtYear: year(r.builtYear, '鉄道開通年') }) }
     }
-  const readStation = (s: Record<string, unknown>, id: string) => ({ id, point: point(s.point, '駅の位置'), name: string(s.name, '駅名', 200), ...(s.mode === undefined ? {} : { mode: choice(s.mode, ['surface', 'subway'] as const, '駅の方式') }), ...(s.railwayId === undefined ? {} : { railwayId: string(s.railwayId, '駅の所属路線', 128) }), ...(s.builtYear === undefined ? {} : { builtYear: year(s.builtYear, '駅開業年') }), ...(s.entrance === undefined ? {} : { entrance: point(s.entrance, '駅の地上出入口') }), ...(s.buildingPolygon === undefined ? {} : { buildingPolygon: points(s.buildingPolygon, '駅舎の敷地', true, 32) }) })
+  const readStation = (s: Record<string, unknown>, id: string) => ({
+    id, point: point(s.point, '駅の位置'), name: string(s.name, '駅名', 200),
+    ...(s.mode === undefined ? {} : { mode: choice(s.mode, ['surface', 'subway'] as const, '駅の方式') }),
+    ...(s.railwayId === undefined ? {} : { railwayId: string(s.railwayId, '駅の所属路線', 128) }),
+    ...(s.builtYear === undefined ? {} : { builtYear: year(s.builtYear, '駅開業年') }),
+    ...(s.entrance === undefined ? {} : { entrance: point(s.entrance, '駅の地上出入口') }),
+    ...(s.buildingPolygon === undefined ? {} : { buildingPolygon: points(s.buildingPolygon, '駅舎の敷地', true, 32) }),
+    ...(s.platformPolygons === undefined ? {} : { platformPolygons: array(s.platformPolygons, '駅ホーム', 8).map(polygon => points(polygon, '駅ホームの形', true, 256)) }),
+  })
   const readFacility = (f: Record<string, unknown>, id: string) => ({ id, point: point(f.point, '施設の位置'), name: string(f.name, '施設名', 200), kind: choice(f.kind, FACILITIES, '施設の種類') })
   const readDistrict = (d: Record<string, unknown>, id: string) => ({
       id, point: point(d.point, '地区の位置'), name: string(d.name, '地区名', 200),

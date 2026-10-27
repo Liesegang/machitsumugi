@@ -2,9 +2,10 @@ import type { Area, CityConfig, Point, Railway, Road, Station } from './types'
 import type { PolygonRegion } from './geometry'
 import type { LayoutFirstZone } from './layout-first-types'
 import type { TerrainModel } from './terrain'
-import { corridorPolygon, distance, distanceToSegment, pointInRegion, polygonOverlapsRegion, rectangle, segmentsCross } from './geometry'
+import { corridorPolygon, distance, distanceToSegment, pointInRegion, polygonOverlapsRegion, segmentsCross } from './geometry'
 import { planRailway } from './railway-planner'
 import type { RailwayPlan } from './railway-planner'
+import { stationFootprint } from './station-footprint'
 
 type RailTerrain = Pick<TerrainModel, 'areas' | 'elevation' | 'slope' | 'waterAt'> & Partial<Pick<TerrainModel, 'channelAt'>>
 export interface LayoutFirstRailInput {
@@ -42,6 +43,9 @@ interface StationCandidate {
   forecourt: Point[]
   entrance: Point
   gate: Point
+  platforms: Point[][]
+  trackGround: Point[]
+  main: boolean
 }
 const MINIMUM_SPACING = 650
 const nearestDistance = (point: Point, points: Point[]) => Math.min(...points.slice(1).map((b, i) => distanceToSegment(point, points[i]!, b)))
@@ -110,21 +114,19 @@ export function surveyLayoutFirstRail(input: LayoutFirstRailInput): LayoutFirstR
     if (zones.length && !zones.some(zone => distance(zone.center, point) <= zone.radius + 350)) continue
     const span = distance(previous, next), tangent = { x: (next.x - previous.x) / span, y: (next.y - previous.y) / span }
     if (!Number.isFinite(tangent.x + tangent.y)) continue
-    for (const side of [1, -1]) {
-      const transform = (x: number, y: number) => ({ x: point.x + tangent.x * x - tangent.y * y * side, y: point.y + tangent.y * x + tangent.x * y * side })
-      const building = rectangle(-15, 9, 30, 10).map(p => transform(p.x, p.y))
-      const forecourt = rectangle(-25, 8, 50, 34).map(p => transform(p.x, p.y))
-      const gate = transform(0, 47)
-      const publicGatePad = rectangle(-4, 43, 8, 8).map(p => transform(p.x, p.y))
-      const samples = [...forecourt, ...building, ...publicGatePad, gate, transform(0, 26), ...forecourt.map((p, n) => ({ x: (p.x + forecourt[(n + 1) % forecourt.length]!.x) / 2, y: (p.y + forecourt[(n + 1) % forecourt.length]!.y) / 2 }))]
-      if (reserved(forecourt) || reserved(publicGatePad) || samples.some(p => !bounded(p) || input.terrain.waterAt(p) || input.terrain.slope(p) > .12)) continue
-      if (input.terrain.areas.some(area => area.kind === 'water' && (polygonOverlapsRegion(forecourt, area) || polygonOverlapsRegion(publicGatePad, area)))) continue
-      if (input.roads?.some(road => forecourt.some((p, n) => road.points.slice(1).some((b, j) => segmentsCross(p, forecourt[(n + 1) % forecourt.length]!, road.points[j]!, b) || distanceToSegment(p, road.points[j]!, b) < road.width / 2)))) continue
+    for (const main of [true, false]) for (const side of [1, -1]) {
+      const footprint = stationFootprint({ points: plan.points, chain, along: chain[i]!, side, config: input.config, main })
+      if (!footprint) continue
+      const { building, forecourt, gate, publicGatePad, platforms, trackGround, entrance, gateDistance } = footprint
+      const acquired = [forecourt, publicGatePad, trackGround]
+      const samples = [...acquired.flat(), ...building, gate, entrance, ...forecourt.map((p, n) => ({ x: (p.x + forecourt[(n + 1) % forecourt.length]!.x) / 2, y: (p.y + forecourt[(n + 1) % forecourt.length]!.y) / 2 }))]
+      if (acquired.some(reserved) || samples.some(p => !bounded(p) || input.terrain.waterAt(p) || input.terrain.slope(p) > .12)) continue
+      if (input.terrain.areas.some(area => area.kind === 'water' && acquired.some(polygon => polygonOverlapsRegion(polygon, area)))) continue
+      if (input.roads?.some(road => road.points.slice(1).some((b, j) => acquired.some(polygon => polygonOverlapsRegion(polygon, { polygon: corridorPolygon(road.points[j]!, b, road.width / 2 + .5) }))))) continue
       const levels = samples.map(input.terrain.elevation)
       if (!levels.every(Number.isFinite) || Math.max(...levels) - Math.min(...levels) > 2) continue
       // A forecourt must not sit across another bend of its own railway.
-      if (forecourt.some(p => nearestDistance(p, plan.points) < 6)) continue
-      const entrance = transform(0, 22)
+      if (forecourt.some(p => nearestDistance(p, plan.points) < 8.5) || polygonOverlapsRegion(forecourt, { polygon: trackGround })) continue
       const targetDistance = Math.min(distance(point, input.center), ...zones.map(zone => distance(point, zone.center)))
       const roadDistance = input.roads?.length ? Math.min(...input.roads.filter(road => !road.controlledAccess).map(road => nearestDistance(entrance, road.points))) : 0
       // The two banks of the railway are distinct acquisition choices. A tie
@@ -132,12 +134,12 @@ export function surveyLayoutFirstRail(input: LayoutFirstRailInput): LayoutFirstR
       // sometimes leaving the entrance across the track from every old street.
       // Prefer the town-facing forecourt before any new crossing is proposed.
       const townApproach = distance(gate, input.center)
-      const approaches = surveyLayoutStationApproaches({ gate, outward: { x: (gate.x - point.x) / 47, y: (gate.y - point.y) / 47 }, railPoints: plan.points, terrain: input.terrain, reserves: input.reserves, width: input.width, height: input.height })
+      const approaches = surveyLayoutStationApproaches({ gate, outward: { x: (gate.x - point.x) / gateDistance, y: (gate.y - point.y) / gateDistance }, railPoints: plan.points, terrain: input.terrain, reserves: input.reserves, width: input.width, height: input.height })
       // Prefer a broad usable side without banning a confined mountain or
       // valley station whose single narrower access can still be certified by
       // the road stage. The acquired pad/ROW checks above remain mandatory.
       const confinement = (5 - approaches.length) * 180
-      candidates.push({ point, along: chain[i]!, tangent, building, forecourt, entrance, gate, score: targetDistance + townApproach * .5 + confinement + Math.min(1500, roadDistance) * .4 + input.terrain.slope(point) * 2000 })
+      candidates.push({ point, along: chain[i]!, tangent, building, forecourt, entrance, gate, platforms, trackGround, main, score: targetDistance + townApproach * .5 + confinement + Math.min(1500, roadDistance) * .4 + input.terrain.slope(point) * 2000 })
     }
   }
   const count = Math.min(requested, Math.max(1, Math.floor((length - 320) / MINIMUM_SPACING) + 1))
@@ -145,11 +147,12 @@ export function surveyLayoutFirstRail(input: LayoutFirstRailInput): LayoutFirstR
   const targets = Array.from({ length: count }, (_, i) => length * (i + 1) / (count + 1))
   // Serve the main existing/proposed centre first, then separated portions of
   // the same line. Fixed sort ties and IDs make independent reruns reproducible.
-  const central = [...candidates].sort((a, b) => a.score - b.score || a.along - b.along)[0]
+  const mainCandidates = candidates.filter(site => site.main)
+  const central = [...(mainCandidates.length ? mainCandidates : candidates)].sort((a, b) => a.score - b.score || a.along - b.along)[0]
   if (central) selected.push(central)
   for (const target of targets.sort((a, b) => Math.abs(b - (central?.along ?? length / 2)) - Math.abs(a - (central?.along ?? length / 2)))) {
     if (selected.length >= count) break
-    const candidate = candidates.filter(c => selected.every(s => Math.abs(s.along - c.along) >= MINIMUM_SPACING && !polygonOverlapsRegion(c.forecourt, { polygon: s.forecourt })))
+    const candidate = candidates.filter(c => !c.main && selected.every(s => Math.abs(s.along - c.along) >= MINIMUM_SPACING && !polygonOverlapsRegion(c.forecourt, { polygon: s.forecourt })))
       .sort((a, b) => Math.abs(a.along - target) + a.score * .25 - Math.abs(b.along - target) - b.score * .25 || a.along - b.along)[0]
     if (candidate) selected.push(candidate)
   }
@@ -159,10 +162,10 @@ export function surveyLayoutFirstRail(input: LayoutFirstRailInput): LayoutFirstR
   const stations: Station[] = selected.map((site, index) => {
     const dx = site.point.x - central!.point.x, dy = site.point.y - central!.point.y
     const direction = Math.abs(dx) > Math.abs(dy) ? dx < 0 ? '西' : '東' : dy < 0 ? '北' : '南'
-    return { id: `station-${index}`, name: index === centralIndex ? `${base}駅` : `${direction}${base}${selected.length > 3 ? index + 1 : ''}駅`, point: site.point, railwayId: 'railway-main', builtYear: 1900, entrance: site.entrance, buildingPolygon: site.building }
+    return { id: `station-${index}`, name: index === centralIndex ? `${base}駅` : `${direction}${base}${selected.length > 3 ? index + 1 : ''}駅`, point: site.point, railwayId: 'railway-main', builtYear: 1900, entrance: site.entrance, buildingPolygon: site.building, platformPolygons: site.platforms }
   })
   return { railways: [{ id: 'railway-main', name: `${base}線`, points: plan.points, elevations: plan.elevations, structures: plan.structures, builtYear: 1900 }], stations,
-    stationGrounds: selected.map((site, i) => ({ id: `station-forecourt-${i}`, kind: 'field', landUse: 'vacant', polygon: site.forecourt, name: `${stations[i]!.name}前広場` })),
+    stationGrounds: [...selected.map((site, i): Area => ({ id: `station-forecourt-${i}`, kind: 'field', landUse: 'vacant', polygon: site.forecourt, name: `${stations[i]!.name}前広場` })), ...selected.map((site, i): Area => ({ id: `station-trackground-${i}`, kind: 'field', landUse: 'vacant', polygon: site.trackGround }))],
     accessTargets: selected.map((site, i) => ({ id: `station-access-${i}`, point: site.gate, builtYear: 1900, endHeading: Math.atan2(site.entrance.y - site.gate.y, site.entrance.x - site.gate.x) })),
     stationPaths: selected.map((site, i) => ({ id: `station-access-${i}`, points: [site.gate, site.entrance], width: 3, role: 'access', kind: 'local', builtYear: 1900, reason: '駅前の公道から駅舎の入口に至る歩行者動線' })),
     diagnostics: { requestedStations: requested, placedStations: stations.length, alignment: plan.diagnostics, ...(stations.length < requested ? { reason: '駅間隔と駅舎・駅前広場の地盤条件を満たす地点に駅を絞りました。' } : {}) } }

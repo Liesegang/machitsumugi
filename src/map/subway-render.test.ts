@@ -8,6 +8,22 @@ afterEach(() => vi.unstubAllGlobals())
 const map: CityMap = { width: 2100, height: 1600, config: { name: '地下鉄都市', seed: 'metro', type: 'newtown', terrain: 'plain', density: 80, forest: 0, railway: false, stations: 1, arterial: true, subway: true, facilities: [] }, description: '', roads: [], buildings: [], areas: [], facilities: [], districts: [], railways: [{ id: 'subway', name: '本線', mode: 'subway', builtYear: 1965, points: [{ x: 100, y: 500 }, { x: 2000, y: 500 }] }], stations: [{ id: 'stop', name: '中央駅', mode: 'subway', railwayId: 'subway', point: { x: 1000, y: 500 }, entrance: { x: 1000, y: 515 }, buildingPolygon: [{ x: 997, y: 512 }, { x: 1003, y: 512 }, { x: 1003, y: 515 }, { x: 997, y: 515 }], builtYear: 1965 }] }
 
 describe('subway map and portable exports', () => {
+  it('draws acquired metric surface platforms in the canvas and SVG without enlarging their coordinates', async () => {
+    const platforms = [[{ x: 890, y: 504 }, { x: 1110, y: 504 }, { x: 1110, y: 508 }, { x: 890, y: 508 }]]
+    const city: CityMap = { ...map, railways: [{ ...map.railways[0]!, mode: 'surface' }], stations: [{ ...map.stations[0]!, mode: 'surface', platformPolygons: platforms }] }
+    let active: { x: number; y: number }[] = []
+    const fills: typeof active[] = [], state: Record<string, unknown> = { beginPath: () => { active = [] }, moveTo: (x: number, y: number) => active.push({ x, y }), lineTo: (x: number, y: number) => active.push({ x, y }), fill: () => fills.push([...active]), measureText: (s: string) => ({ width: s.length * 8 }) }
+    const ctx = new Proxy(state, { get: (target, key: string) => target[key] ?? (() => {}) }) as unknown as CanvasRenderingContext2D
+    const options = { layers: DEFAULT_LAYERS, style: 'standard' as const, scale: 1, annotations: [], showSecrets: false }
+    renderMap(ctx, city, options)
+    expect(fills).toContainEqual(platforms[0])
+    let svg: Blob | undefined
+    vi.stubGlobal('URL', { createObjectURL: (value: Blob) => { svg = value; return 'blob:svg' } })
+    vi.stubGlobal('document', { createElement: () => ({ click: () => {}, remove: () => {} }), body: { appendChild: () => {} } })
+    vi.stubGlobal('window', { setTimeout: () => {} })
+    exportMapSvg(city, options)
+    expect(await svg!.text()).toContain('data-station-platform="stop" d="M890.00 504.00 L1110.00 504.00 L1110.00 508.00 L890.00 508.00 Z"')
+  })
   it('uses the same subway width/dash/colour in the canvas used by PNG and the SVG, rather than surface railway ties', async () => {
     const strokes: { ink: unknown; width: unknown; dash: number[] }[] = [], labels: string[] = []
     let dash: number[] = []

@@ -93,6 +93,7 @@ export function traceRegion(ctx: DrawingContext, region: Pick<Area, 'polygon' | 
 
 export function areaColor(area: Area, style: MapStyle): string {
   if (area.id === 'harbor-yard') return style === 'standard' ? '#deded8' : style === 'mono' ? '#e2e2e2' : '#48504c'
+  if (area.id.startsWith('station-trackground-')) return style === 'standard' ? '#d5d6cd' : style === 'mono' ? '#dddddd' : '#48504c'
   if (area.id.startsWith('castle-wall-')) return style === 'standard' ? '#b5b9aa' : style === 'mono' ? '#b7b7b7' : '#627066'
   if (area.id.startsWith('castle-courtyard-')) return style === 'standard' ? '#e2dfce' : style === 'mono' ? '#e5e5e5' : '#4b5146'
   if (!area.landUse || area.landUse === 'farmland') return PALETTES[style][area.kind]
@@ -290,6 +291,9 @@ export function renderMap(ctx: DrawingContext, map: CityMap, options: RenderOpti
   }
 
   if (layers.railway) {
+    for (const station of map.stations) if (station.mode !== 'subway') for (const polygon of station.platformPolygons ?? []) {
+      tracePath(ctx, polygon, true); ctx.fillStyle = colors.public; ctx.fill(); ctx.strokeStyle = colors.buildingEdge; ctx.lineWidth = .5 / scale; ctx.stroke()
+    }
     if (layers.buildings) for (const station of map.stations) if (station.buildingPolygon) {
       tracePath(ctx, station.buildingPolygon, true); ctx.fillStyle = colors.public; ctx.fill(); ctx.strokeStyle = colors.buildingEdge; ctx.lineWidth = .6 / scale; ctx.stroke()
     }

@@ -102,7 +102,18 @@ export function castleLayout(origin: Point, seed: string, riverTangent?: Point, 
     corridorPolygon({ x: outerGateX - 14, y: outerGateY - 36 }, { x: outerGateX - 14, y: outerGateY }, 1.75),
     corridorPolygon({ x: outerGateX + 14, y: outerGateY - 36 }, { x: outerGateX + 14, y: outerGateY }, 1.75),
   ]
+  // The spaces between the three baileys belong to the defended precinct as
+  // well. Reserving only their walls and narrow gate bridges left these courts
+  // available to the residential subdivision, creating houses inside the castle.
+  // Follow the inherited bailey offsets; the outer western and northern
+  // re-entrants remain outside rather than filling a hull or a bounding box.
+  const connectingCourt = shape([[h.left+20,h.bottom-28],[h.right-22,h.bottom-28],
+    [n.left+36,n.top+30],[n.left+36,n.bottom-28],[n.right-25,n.bottom-28],
+    [s.right-50,s.top+18],[s.right-50,s.bottom-25],[s.left+25,s.bottom-25],
+    [s.left+25,s.top+22],[h.left+20,s.top+22]])
+  const connectingGrounds = subtractRegions({ polygon: connectingCourt }, [...moat, ...ditches, ...[honmaru, ninomaru, sannomaru].map(polygon => ({ polygon }))])
   const grounds: Area[] = [
+    ...connectingGrounds.map((region, i): Area => ({ id: `castle-courtyard-connecting-${i}`, kind: 'field', landUse: 'vacant', polygon: region.polygon.map(transform), ...(region.holes ? { holes: region.holes.map(ring => ring.map(transform)) } : {}) })),
     { id: 'castle-courtyard-honmaru', kind: 'field', landUse: 'vacant', polygon: honmaru.map(transform) },
     { id: 'castle-courtyard-ninomaru', kind: 'field', landUse: 'vacant', polygon: ninomaru.map(transform) },
     { id: 'castle-courtyard-sannomaru', kind: 'field', landUse: 'vacant', polygon: sannomaru.map(transform) },
@@ -120,7 +131,7 @@ export function castleLayout(origin: Point, seed: string, riverTangent?: Point, 
     route('castle-path-guardhouse', [[outerGateX,outerGateY-12],[outerGateX+14,outerGateY-12],[outerGateX+22,outerGateY-12],[outerGateX+22,outerGateY-19]], 2.8),
   ]
   const ditchBanks = [hDitch, outerDitch].flatMap(polygon => polygon.map((a, i) => corridorPolygon(a, polygon[(i + 1) % polygon.length]!, 10)))
-  const coreLocal = reservedOutline([honmaru, ninomaru, sannomaru, hDitch, outerDitch, ...ditchBanks,
+  const coreLocal = reservedOutline([honmaru, ninomaru, sannomaru, connectingCourt, hDitch, outerDitch, ...ditchBanks,
     corridorPolygon({ x: h.right - 16, y: hGateY }, { x: n.left + 18, y: hGateY }, 12),
     corridorPolygon({ x: northSouthGateX, y: n.bottom - 16 }, { x: northSouthGateX, y: s.top + 16 }, 13),
     corridorPolygon({ x: outerGateX, y: outerGateY - 12 }, { x: outerGateX, y: outerGateY + 24 }, 10),

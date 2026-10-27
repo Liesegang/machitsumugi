@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { distance, distanceToSegment, pointInPolygon, polygonOverlapsRegion, rectangle } from './geometry'
+import { distance, distanceToSegment, pointInPolygon, polygonOverlapsRegion, rectangle, regionArea, subtractRegions } from './geometry'
 import { surveyLayoutFirstRail, surveyLayoutStationApproaches } from './layout-first-rail'
 import type { LayoutFirstRailInput } from './layout-first-rail'
 
@@ -46,6 +46,9 @@ describe('layout-first regional railway', () => {
       expect(station.railwayId).toBe(line.id)
       expect(Math.min(...line.points.slice(1).map((b, i) => distanceToSegment(station.point, line.points[i]!, b)))).toBeLessThan(1e-7)
       expect(station.buildingPolygon).toHaveLength(4)
+      expect(station.platformPolygons).toHaveLength(2)
+      const acquired = result.stationGrounds.find(ground => ground.id === `station-trackground-${index}`)!
+      for (const polygon of station.platformPolygons!) expect(subtractRegions({ polygon }, [acquired]).reduce((sum, region) => sum + regionArea(region), 0)).toBeLessThan(.01)
       expect(pointInPolygon(station.entrance!, station.buildingPolygon!)).toBe(false)
       expect(pointInPolygon(station.entrance!, result.stationGrounds[index]!.polygon)).toBe(true)
       expect(pointInPolygon(result.accessTargets[index]!.point, result.stationGrounds[index]!.polygon)).toBe(false)
@@ -56,6 +59,25 @@ describe('layout-first regional railway', () => {
       expect(result.stationGrounds[index]!.polygon.every(p => !input.terrain.waterAt(p) && input.terrain.slope(p) <= .12)).toBe(true)
     }
     expect(result.stations[0]!.name).not.toBe(result.stations[1]!.name)
+  }, 15_000)
+
+  it('acquires different real main and neighbourhood station scales and does not occupy a small off-track water patch', () => {
+    const input = fixture(); input.config.settlement = 'metropolis'
+    const first = surveyLayoutFirstRail(input), main = first.stations.find(station => station.name === '試験駅')!, local = first.stations.find(station => station !== main)!
+    const edges = (polygon: { x: number; y: number }[]) => polygon.map((p, i) => distance(p, polygon[(i + 1) % polygon.length]!))
+    expect(Math.max(...edges(main.buildingPolygon!))).toBeCloseTo(84)
+    expect(Math.min(...edges(main.buildingPolygon!))).toBeCloseTo(24)
+    expect(Math.max(...edges(local.buildingPolygon!))).toBeCloseTo(42)
+    const edgeLength = (polygon: { x: number; y: number }[]) => polygon.slice(1, polygon.length / 2).reduce((n, p, i) => n + distance(p, polygon[i]!), 0)
+    expect(edgeLength(main.platformPolygons![0]!)).toBeGreaterThan(208)
+    expect(edgeLength(local.platformPolygons![0]!)).toBeGreaterThan(150)
+    const platform = main.platformPolygons![0]!, p = platform[3]!, q = platform[4]!, far = platform.at(-4)!
+    const wet = { id: 'narrow-off-track-water', kind: 'water' as const, polygon: rectangle((p.x + q.x + far.x) / 3 - .5, (p.y + q.y + far.y) / 3 - .5, 1, 1) }
+    input.terrain = { ...input.terrain, areas: [wet], waterAt: point => pointInPolygon(point, wet.polygon) }
+    const revised = surveyLayoutFirstRail(input)
+    expect(revised.stations).toHaveLength(2)
+    expect(revised.stations.every(station => station.platformPolygons!.every(polygon => !polygonOverlapsRegion(polygon, wet)))).toBe(true)
+    expect(revised.stationGrounds.every(ground => !polygonOverlapsRegion(ground.polygon, wet))).toBe(true)
   }, 15_000)
 
   it('keeps reserved civic land clear and never disguises an impossible all-water region as a railway', () => {

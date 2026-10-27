@@ -67,6 +67,15 @@ describe('batched landmark architecture', () => {
     expect(layout.platforms.length).toBe(2)
     expect(footprintFrame(layout.platforms[0]!)!.length).toBeLessThan(70)
   })
+  it('uses acquired platform polygons without replacing them with shorter renderer geometry', () => {
+    const city = map(), platforms = [rectangle(90, 204, 220, 4), rectangle(90, 192, 220, 4)]
+    city.stations[0]!.platformPolygons = platforms
+    const layout = stationArchitectureLayout(city, city.stations[0]!, elevation)!
+    expect(layout.platforms).toEqual(platforms)
+    const decks = stationArchitecture(layout, elevation).filter(triangle => triangle.color === '#d6d0b9')
+    expect(Math.min(...decks.flatMap(triangle => triangle.points).map(point => point.x))).toBe(90)
+    expect(Math.max(...decks.flatMap(triangle => triangle.points).map(point => point.x))).toBe(310)
+  })
   it('uses station line identity when underground and surface routes cross', () => {
     const city = map()
     city.railways.push({ id: 'metro', name: '地下線', mode: 'subway', points: [{ x: 200, y: 0 }, { x: 200, y: 400 }] })

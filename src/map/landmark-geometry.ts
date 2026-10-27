@@ -171,7 +171,10 @@ export function stationArchitectureLayout(map: CityMap, station: StationDetails,
   }
   const building = station.buildingPolygon
   const platforms: Point[][] = []
-  if (!subway) for (const side of [-1, 1]) {
+  if (!subway && station.platformPolygons) platforms.push(...station.platformPolygons)
+  // Older saved maps have no acquired platform geometry; retain their bounded
+  // procedural fallback without replacing new surveyed decks at render time.
+  if (!subway && !station.platformPolygons) for (const side of [-1, 1]) {
     let platformLength = frame.length
     while (platformLength >= 28) {
       const candidate = rectangle(frame, platformLength, 3.2, 0, side * 4.6)
@@ -204,16 +207,21 @@ export function stationArchitecture(layout: StationArchitectureLayout, elevation
     }
   }
   for (const polygon of platforms) {
-    const pf = footprintFrame(polygon)!, base = trackElevation + .75, deck = trackElevation + 1.35, canopy = deck + 3.15
+    const base = trackElevation + .75, deck = trackElevation + 1.35, canopy = deck + 3.15
     model.prism(polygon, base, deck, '#9d9d8d', '#d6d0b9')
-    // Roof and columns are real separated surfaces, so the platform remains lit.
-    const roofLength = pf.length * .72, roofDepth = pf.depth * .9
-    model.box(pf, roofLength, roofDepth, canopy, canopy + .18, '#6d7c74', '#9eaaa0')
-    const columns = Math.max(2, Math.floor(roofLength / 14))
-    for (let i = 0; i < columns; i++) model.box(pf, .18, .18, deck, canopy, '#647366', '#647366', (i / (columns - 1) - .5) * (roofLength - 3))
-    // Tactile paving is deliberately raised 2cm instead of sharing deck depth.
-    const towardTrack = dot({ x: pf.center.x - f.center.x, y: pf.center.y - f.center.y }, pf.across) > 0 ? -1 : 1
-    model.box(pf, pf.length * .97, .36, deck + .01, deck + .03, '#d9bf64', '#d9bf64', 0, towardTrack * (pf.depth / 2 - .45))
+    const count = polygon.length / 2
+    const roofSections = polygon.length === 4 ? [polygon] : Array.from({ length: count - 1 }, (_, i) => [polygon[i]!, polygon[i + 1]!, polygon[polygon.length - 2 - i]!, polygon[polygon.length - 1 - i]!])
+    for (const section of roofSections) {
+      const pf = footprintFrame(section)!
+      // Roof and columns follow the acquired deck, including curved platforms.
+      const roofLength = pf.length * .72, roofDepth = pf.depth * .9
+      model.box(pf, roofLength, roofDepth, canopy, canopy + .18, '#6d7c74', '#9eaaa0')
+      const columns = Math.max(2, Math.floor(roofLength / 14))
+      for (let i = 0; i < columns; i++) model.box(pf, .18, .18, deck, canopy, '#647366', '#647366', (i / (columns - 1) - .5) * (roofLength - 3))
+      // Tactile paving is deliberately raised 2cm instead of sharing deck depth.
+      const towardTrack = dot({ x: pf.center.x - f.center.x, y: pf.center.y - f.center.y }, pf.across) > 0 ? -1 : 1
+      model.box(pf, pf.length * .97, .36, deck + .01, deck + .03, '#d9bf64', '#d9bf64', 0, towardTrack * (pf.depth / 2 - .45))
+    }
   }
   if (!subway && platforms.length === 2 && building) {
     // A town stop has a modest footbridge; a tunnel station gets no surface span.

@@ -45,6 +45,19 @@ it('varies compound plans and moat proportions beyond a global affine copy acros
   expect(wetBoundaryCoverage.filter(coverage => coverage < .9).length).toBeGreaterThanOrEqual(2)
 })
 
+it('protects the dry courts between baileys while leaving land beyond the outer precinct available', () => {
+  for (const seed of ['castle-0', 'castle-7', 'castle-14']) {
+    const castle = castleLayout({ x: 1000, y: 1000 }, seed, undefined, { angle: 0, scaleX: 1, scaleY: 1 })
+    const court = { x: 870, y: 1050 }, outside = { x: 770, y: 1050 }
+    expect(pointInRegion(court, { polygon: castle.core })).toBe(true)
+    expect(castle.grounds.some(ground => pointInRegion(court, ground))).toBe(true)
+    expect(pointInRegion(outside, { polygon: castle.core })).toBe(false)
+    for (const ground of castle.grounds.filter(ground => ground.id.startsWith('castle-courtyard-connecting-'))) {
+      for (const water of castle.areas) expect(intersectRegions(ground, water).reduce((sum, region) => sum + regionArea(region), 0)).toBeLessThan(.01)
+    }
+  }
+})
+
 it('connects the outer compound to an actual founding street without inventing water crossings or future access', () => {
   const castle = castleLayout({ x: 800, y: 700 }, 'castle-approach'), gate = castle.gate.outside
   const roads = [{ id: 'old-street', points: [{ x: gate.x - 250, y: gate.y + 100 }, { x: gate.x + 250, y: gate.y + 100 }], kind: 'local' as const, width: 6, builtYear: 1650 }]

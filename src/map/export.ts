@@ -153,6 +153,7 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
   }
   if (layers.railway) for (const station of map.stations) {
     const { x, y } = station.point
+    if (station.mode !== 'subway') for (const polygon of station.platformPolygons ?? []) parts.push(`<path data-station-platform="${escapeXml(station.id)}" d="${path(polygon, true)}" fill="${c.public}" stroke="${c.buildingEdge}" stroke-width="${.5 * px}"/>`)
     if (layers.buildings && station.buildingPolygon) parts.push(`<path d="${path(station.buildingPolygon, true)}" fill="${c.public}" stroke="${c.buildingEdge}" stroke-width="${.6 * px}"/>`)
     if (station.mode === 'subway') {
       parts.push(`<circle data-mode="subway" cx="${x}" cy="${y}" r="${6 * px}" fill="${c.halo}" stroke="${subwayInk(options.style)}" stroke-width="${2 * px}"/>`)

@@ -37,6 +37,18 @@ const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
+  it('preserves acquired station platform geometry in current and dated saved maps', () => {
+    const project = withSnapshot(), map = project.snapshot!, station = map.stations[0]!
+    station.platformPolygons = [[{ x: 1004, y: 1390 }, { x: 1008, y: 1390 }, { x: 1008, y: 1610 }, { x: 1004, y: 1610 }]]
+    map.timeline = createCityTimeline(map)
+    for (const text of [JSON.stringify(portableProject(project)), serializeProject(project)]) {
+      const restored = parseProject(text).snapshot!
+      expect(restored.stations[0]!.platformPolygons).toEqual(station.platformPolygons)
+      expect(restored.timeline!.stations[0]!.value.platformPolygons).toEqual(station.platformPolygons)
+    }
+    station.platformPolygons = [[]]
+    expect(() => validateProject(project)).toThrow()
+  })
   it('preserves the actual native12 positive subthreshold land triangle in current and dated wire forms', () => {
     // Exact IEEE dyadic area=2.9244600933667242e-8m². This is real positive
     // source fill, not a collinear/retraced contour or a rounding tolerance.
