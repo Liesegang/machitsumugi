@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import polygonClipping from 'polygon-clipping'
 import { readFileSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
 import { buildContinuousCityCover, continuousCoverDiagnostics, continuousRoadGround, dissolveContinuousCover, partitionContinuousCover, subtractContinuousCover } from './continuous-city-cover'
@@ -17,6 +18,19 @@ const overlap = (a: PolygonRegion, b: PolygonRegion) => sum(intersectRegions(a, 
 const parcel: Parcel = { id: 'title', polygon: rectangle(100, 120, 70, 80), entrance: { x: 135, y: 120 }, roadId: 'road', createdYear: 1955, use: 'residential' }
 
 describe('continuous city residual cover', () => {
+  it('recovers a final SweepLine failure without losing acquired land or a dry island', () => {
+    const subject={polygon:rectangle(10800,4900,100,100)},cut={polygon:rectangle(10820,4920,60,60),holes:[rectangle(10840,4940,20,20)]}
+    const before=JSON.stringify({subject,cut}),count=continuousCoverDiagnostics.canonicalizationFallbacks
+    const sweep=vi.spyOn(polygonClipping,'difference').mockImplementation(()=>{throw Error('Unable to find segment #18121423 in SweepLine tree.')})
+    try {
+      const result=subtractContinuousCover(subject,Array.from({length:512},()=>cut))
+      expect(sum(result)).toBeCloseTo(6800,4)
+      expect(result.some(part=>pointInRegion({x:10850,y:4950},part))).toBe(true)
+      expect(result.some(part=>pointInRegion({x:10830,y:4930},part))).toBe(false)
+      expect(continuousCoverDiagnostics.canonicalizationFallbacks).toBeGreaterThan(count)
+      expect(JSON.stringify({subject,cut})).toBe(before)
+    } finally {sweep.mockRestore()}
+  })
   it('preserves exact water metadata and holes, including dry islands, and partitions the crop', () => {
     const lake: Area = { id: 'lake', kind: 'water', name: '島の湖', waterLevel: 10, polygon: rectangle(200, 100, 300, 350), holes: [rectangle(310, 230, 80, 80)] }
     const result = run({ terrain: { areas: [lake], elevation: () => 20, slope: () => 0, waterAt: p => pointInRegion(p, lake) } })

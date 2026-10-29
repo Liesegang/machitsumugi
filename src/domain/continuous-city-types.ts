@@ -1,9 +1,9 @@
-import type { CityConfig, Point, Road, Railway, Station } from './types'
+import type { Area, Building, CityConfig, Parcel, Point, Road, Railway, Station } from './types'
 import type { PolygonRegion } from './geometry'
 import type { PlanningEnvironment } from './road-planner'
 import type { TerrainModel } from './terrain'
 
-export const CONTINUOUS_GENERATOR_VERSION = '2.7.0-continuous.6'
+export const CONTINUOUS_GENERATOR_VERSION = '2.7.0-continuous.7'
 
 /** Development is a continuous accessibility field. Its contours are never
  * street boundaries or privately owned neighbourhood stamps. */
@@ -41,4 +41,6 @@ export interface ContinuousCityLandInput {
   centerAccess?: { point: Point; builtYear: number }
   reserves: readonly PolygonRegion[]
   terrain: Pick<TerrainModel, 'areas' | 'elevation' | 'slope' | 'waterAt'>
+  /** Valid acquired stock only; used to retain progress on a later failure. */
+  onCheckpoint?: (stock: { parcels: Parcel[]; buildings: Building[]; openSpaces: Area[] }) => void
 }

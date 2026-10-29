@@ -208,9 +208,20 @@ export function renderMap(ctx: DrawingContext, map: CityMap, options: RenderOpti
       }
     }
     const water = waterGeometry(map.areas)
+    // Paint the connected water body once. Independently antialiased river
+    // sections expose internal joins as pale cuts at high magnification.
+    ctx.beginPath()
+    for (const region of water.shorelines) for (const ring of [region.polygon, ...region.holes ?? []]) {
+      if (!ring.length) continue
+      ctx.moveTo(ring[0]!.x, ring[0]!.y)
+      for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i]!.x, ring[i]!.y)
+      ctx.closePath()
+    }
+    ctx.fillStyle = colors.water; ctx.fill('evenodd')
     for (const area of water.surfaces) {
-      traceRegion(ctx, area); ctx.fillStyle = areaColor(area, style); ctx.fill('evenodd')
+      if (area.landUse) { traceRegion(ctx, area); ctx.fillStyle = areaColor(area, style); ctx.fill('evenodd') }
       if (map.terrainSurface && (area.id === 'sea' || area.id.startsWith('sea-'))) {
+        traceRegion(ctx, area)
         ctx.save(); ctx.clip('evenodd'); ctx.imageSmoothingEnabled = true
         const s = map.terrainSurface
         ctx.drawImage(seaDepthRaster(s, style), -s.cellSize / 2, -s.cellSize / 2, s.columns * s.cellSize, s.rows * s.cellSize)

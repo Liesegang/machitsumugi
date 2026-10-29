@@ -106,10 +106,11 @@ export function exportMapSvg(map: CityMap, options: RenderOptions): void {
       }
     }
     const water = waterGeometry(map.areas)
+    parts.push(`<path d="${water.shorelines.flatMap(region => [region.polygon, ...(region.holes ?? [])]).map(ring => path(ring, true)).join(' ')}" fill="${c.water}" fill-rule="evenodd"/>`)
     let seaSerial = 0
     for (const area of water.surfaces) {
       const d = [area.polygon, ...(area.holes ?? [])].map(ring => path(ring, true)).join(' ')
-      parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
+      if (area.landUse) parts.push(`<path d="${d}" fill="${areaColor(area, options.style)}" fill-rule="evenodd"/>`)
       if (map.terrainSurface && (area.id === 'sea' || area.id.startsWith('sea-'))) {
         const surface = map.terrainSurface, id = `sea-depth-${seaSerial++}`
         const canvas = seaDepthRaster(surface, options.style)

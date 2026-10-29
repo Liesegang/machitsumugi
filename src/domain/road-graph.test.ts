@@ -6,6 +6,16 @@ const metadata = (id: string): RoadMetadata => ({ id, builtYear: 1700, phase: 'o
 const point = (x: number, y: number) => ({ x, y })
 
 describe('incremental planar road graph', () => {
+  it('finds every incident road at a shared non-integer endpoint without depending on a segment intersection',()=>{
+    const p=point(1920.043193333875,6318.233490472898),graph=new PlanarRoadGraph()
+    graph.add([point(p.x-200,p.y),p,point(p.x+200,p.y)],{...metadata('through'),kind:'arterial',role:'highway',width:12},false)
+    graph.add([p,point(p.x+130,p.y+200)],{...metadata('district'),kind:'arterial',role:'collector',width:10},true)
+    const before=JSON.stringify(graph.roads),contacts=graph.contacts(p)
+    expect(new Set(contacts.map(hit=>hit.road.id))).toEqual(new Set(['through','district']))
+    expect(contacts.every(hit=>Math.hypot(hit.point.x-p.x,hit.point.y-p.y)<1e-6)).toBe(true)
+    expect(graph.openEndHeading(p)).toBeUndefined()
+    expect(JSON.stringify(graph.roads)).toBe(before)
+  })
   it('permits a measured oblique local T only within a safe free sector while retaining square defaults and end tangents', () => {
     const graph = new PlanarRoadGraph()
     graph.add([point(0, 0), point(200, 0)], metadata('old-lane'), false)

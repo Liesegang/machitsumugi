@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { CONTINUOUS_PROJECT_ENTITY_LIMITS, CONTINUOUS_PROJECT_POINT_LIMIT, LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
+import { CONTINUOUS_PROJECT_ENTITY_LIMITS, CONTINUOUS_PROJECT_POINT_LIMIT, LEGACY_STORAGE_KEY, loadProject, loadProjectArchive, MAX_PROJECT_JSON_LENGTH, parseProject, persistProject, persistProjectArchive, persistRecoveryArchive, PROJECT_GEOMETRY_LIMITS, STORAGE_KEY, validateProject } from './project'
 import type { Project } from './project'
 import type { CityMap } from './types'
 import { createCityTimeline } from './timeline'
@@ -37,6 +37,40 @@ const withSnapshot = (): Project => ({ ...sample(), snapshot: geometry() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('saved projects', () => {
+  it('retains incomplete stock separately, restores its unfinished marker, and clears it only on a successful complete save', async () => {
+    const saved = new Map<string, unknown>()
+    const database = {
+      close: vi.fn(),
+      transaction: () => {
+        const tx = { oncomplete: undefined as (()=>void)|undefined, objectStore: () => ({
+          put: (project: Project, key: string) => saved.set(key, structuredClone(project)),
+          delete: (key: string) => saved.delete(key),
+          get: (key: string) => { const request={result:saved.get(key),onsuccess:undefined as (()=>void)|undefined}; queueMicrotask(()=>request.onsuccess?.()); return request },
+        }) }
+        queueMicrotask(()=>queueMicrotask(()=>tx.oncomplete?.()))
+        return tx
+      },
+    }
+    vi.stubGlobal('indexedDB',{open:()=>{const request={result:database,onsuccess:undefined as (()=>void)|undefined};queueMicrotask(()=>request.onsuccess?.());return request}})
+    const complete=withSnapshot(),partial=withSnapshot()
+    partial.config={...partial.config,seed:'failed-city'}
+    partial.snapshot={...partial.snapshot!,config:partial.config,previewPhase:'development'}
+    expect(await persistProjectArchive(complete)).toBe(true)
+    const original=structuredClone(saved.get('current'))
+    expect(await persistRecoveryArchive(partial)).toBe(true)
+    expect(saved.get('current')).toEqual(original)
+    expect(await persistProjectArchive(partial)).toBe(false)
+    const restored=await loadProjectArchive()
+    expect(restored?.snapshot?.previewPhase).toBe('development')
+    expect(restored?.snapshot?.buildings).toEqual(partial.snapshot.buildings)
+    expect(restored?.config.seed).toBe('failed-city')
+    expect(saved.get('current')).toEqual(original)
+    expect(await persistProjectArchive(complete)).toBe(true)
+    expect(saved.has('recovery')).toBe(false)
+    expect((await loadProjectArchive())?.config.seed).toBe(complete.config.seed)
+    saved.set('recovery',{version:'corrupt'})
+    expect((await loadProjectArchive())?.snapshot?.previewPhase).toBeUndefined()
+  })
   it('preserves acquired station platform geometry in current and dated saved maps', () => {
     const project = withSnapshot(), map = project.snapshot!, station = map.stations[0]!
     station.platformPolygons = [[{ x: 1004, y: 1390 }, { x: 1008, y: 1390 }, { x: 1008, y: 1610 }, { x: 1004, y: 1610 }]]
@@ -541,7 +575,7 @@ describe('saved projects', () => {
       transaction: () => {
         const tx = {
           oncomplete: undefined as (() => void) | undefined,
-          objectStore: () => ({ put: (project: Project) => { written.push(project); queueMicrotask(() => tx.oncomplete?.()) } }),
+          objectStore: () => ({ put: (project: Project) => { written.push(project); queueMicrotask(() => tx.oncomplete?.()) }, delete: vi.fn() }),
         }
         return tx
       },

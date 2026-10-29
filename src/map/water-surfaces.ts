@@ -1,4 +1,4 @@
-import polygonClipping from 'polygon-clipping'
+import { unionWaterContours } from '../domain/channel-footprint'
 import type { Area, Point } from '../domain/types'
 import { partitionWaterAreas } from '../domain/water-partition'
 import type { PolygonRegion } from '../domain/geometry'
@@ -14,9 +14,7 @@ export function waterGeometry(areas: readonly Area[]): WaterGeometry {
   const water = areas.filter(area => area.kind === 'water' && area.polygon.length >= 3), previous = cache.get(areas)
   if (previous && water.length === previous.water.length && water.every((area, i) => area === previous.water[i] && area.polygon === previous.polygons[i] && area.holes === previous.holes[i] && area.waterLevel === previous.levels[i])) return previous.geometry
   const surfaces = partitionWaterAreas(water)
-  const polygon = (area: Area): polygonClipping.Polygon => [area.polygon, ...(area.holes ?? [])].map(ring => ring.map(p => [p.x, p.y]))
-  const [first, ...rest] = water.map(polygon)
-  const shorelines: PolygonRegion[] = first ? polygonClipping.union(first, ...rest).map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), holes: rings.slice(1).map(ring => ring.slice(0, -1).map(([x, y]) => ({ x, y }))) })) : []
+  const shorelines: PolygonRegion[] = unionWaterContours(water)
   const geometry = { surfaces, shorelines }
   cache.set(areas, { water, polygons: water.map(area => area.polygon), holes: water.map(area => area.holes), levels: water.map(area => area.waterLevel), geometry })
   return geometry

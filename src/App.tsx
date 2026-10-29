@@ -3,7 +3,7 @@ import { Download, Eye, EyeOff, FolderOpen, HelpCircle, Image, LoaderCircle, Map
 import type { CityConfig, CityMap, Point } from './domain/types'
 import type { MapFeature } from './map/inspect'
 import { DEFAULT_CONFIG } from './domain/generator'
-import { downloadProject, loadProjectArchive, MAX_PROJECT_FILE_BYTES, parseProject, persistProjectArchive } from './domain/project'
+import { downloadProject, loadProjectArchive, MAX_PROJECT_FILE_BYTES, parseProject, persistProjectArchive, persistRecoveryArchive } from './domain/project'
 import type { Project } from './domain/project'
 import { areaColor, DEFAULT_LAYERS, PALETTES } from './map/render'
 import type { Annotation, RenderOptions } from './map/render'
@@ -62,7 +62,8 @@ function App() {
   const [project, setProject] = useState<Project>(newProject)
   const [draft, setDraft] = useState<CityConfig>(() => sessionDraft(project.config))
   const [map, setMap] = useState<CityMap | null>(project.snapshot ?? null)
-  const [previewMap, setPreviewMap] = useState<CityMap | null>(null)
+  const [previewMap, setPreviewMap] = useState<CityMap | null>(project.snapshot?.previewPhase ? project.snapshot : null)
+  const latestPreview = useRef<CityMap | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('map')
   const [updateAvailable, setUpdateAvailable] = useState(false)
   const [generating, setGenerating] = useState(!project.snapshot)
@@ -118,7 +119,7 @@ function App() {
         const restored = saved.snapshot ? saved : { ...saved, config: normalizeConfig(saved.config) }
         requestedDisplayYear.current = restored.config.targetYear ?? restored.snapshot?.year ?? 2025
         setDisplayYear(requestedDisplayYear.current)
-        setProject(restored); setDraft(sessionDraft(restored.config)); setMap(restored.snapshot ?? null); setGenerating(!restored.snapshot)
+        setProject(restored); setDraft(sessionDraft(restored.config)); setMap(restored.snapshot ?? null); setPreviewMap(restored.snapshot?.previewPhase ? restored.snapshot : null); setGenerating(!restored.snapshot)
       }
       setRestoring(false)
     })
@@ -152,10 +153,12 @@ function App() {
     const handleMessage = (event: MessageEvent<{ id: number; map?: CityMap; preview?: CityMap; error?: string; progress?: string }>) => {
       if (id !== sequence.current || event.data.id !== id) return
       if (typeof event.data.progress === 'string') { setGenerationLabel(event.data.progress); return }
-      if (event.data.preview) { setPreviewMap(event.data.preview); return }
+      if (event.data.preview) { latestPreview.current=event.data.preview; setPreviewMap(event.data.preview); return }
       workerBusy.current = false
       if (event.data.error) {
-        setGenerating(false); setPreviewMap(null); setError(event.data.error)
+        if(latestPreview.current)setPreviewMap(latestPreview.current)
+        const reason=/SweepLine|Unable to find segment/.test(event.data.error)?'土地境界の計算を完了できませんでした。':event.data.error
+        setGenerating(false); setError(latestPreview.current ? `${reason} 途中の地図は残しています。「途中保存」で保存できます。` : reason)
         if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null); const year = completedProject.current.snapshot?.year ?? 2025; requestedDisplayYear.current = year; setDisplayYear(year) }
       }
       else if (event.data.map) {
@@ -173,7 +176,8 @@ function App() {
       if (id !== sequence.current) return
       workerBusy.current = false; instance.terminate()
       if (activeWorker.current === instance) activeWorker.current = null
-      setGenerating(false); setPreviewMap(null); setError('地図を生成できませんでした。ページを再読み込みしてください。')
+      if(latestPreview.current)setPreviewMap(latestPreview.current)
+      setGenerating(false); setError(latestPreview.current ? '処理が停止しました。途中の地図は残しています。「途中保存」で保存してから再試行できます。' : '処理が停止しました。再試行できます。')
       if (completedProject.current) { setProject(completedProject.current); setMap(completedProject.current.snapshot ?? null); const year = completedProject.current.snapshot?.year ?? 2025; requestedDisplayYear.current = year; setDisplayYear(year) }
     }
     instance.addEventListener('message', handleMessage)
@@ -187,10 +191,18 @@ function App() {
       }
     }
   }, [project.config, project.snapshot, restoring, generating])
-  useEffect(() => { if (project.snapshot) completedProject.current = project }, [project])
+  useEffect(() => { if (project.snapshot && !project.snapshot.previewPhase) completedProject.current = project }, [project])
+  useEffect(() => {
+    if (!previewMap || generating || restoring || livePreview) return
+    let cancelled=false
+    void persistRecoveryArchive({ ...project, config: previewMap.config, snapshot: previewMap, annotations: [], edits: [] }).then(saved => {
+      if(!cancelled)setToast(saved ? '途中の地図を退避保存しました。' : '途中の地図を自動保存できません。「途中保存」で保存してください。')
+    })
+    return ()=>{cancelled=true}
+  }, [previewMap, generating, restoring, project])
   useEffect(() => {
     // Keep the last completed map in storage if a new generation fails or is interrupted.
-    if (livePreview || restoring || !project.snapshot) return
+    if (livePreview || restoring || !project.snapshot || project.snapshot.previewPhase || previewMap) return
     let cancelled = false
     const timer = window.setTimeout(() => {
       void persistProjectArchive(project).then(saved => {
@@ -201,10 +213,11 @@ function App() {
       })
     }, 250)
     return () => { cancelled = true; clearTimeout(timer) }
-  }, [project, restoring])
+  }, [project, restoring, previewMap])
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(''), 3500); return () => clearTimeout(timer) }, [toast])
   function generate() {
     if (restoring || !draft.name.trim() || !draft.seed.trim()) return
+    latestPreview.current=previewMap ?? (map?.previewPhase ? map : null)
     const config = normalizeConfig({ ...draft, name: draft.name.trim(), seed: draft.seed.trim() })
     requestedDisplayYear.current = config.targetYear ?? ({ historic: 1800, railway: 1930, present: 2025 }[config.era ?? 'present'])
     setDisplayYear(requestedDisplayYear.current)
@@ -268,12 +281,12 @@ function App() {
     setToast('生成を中止しました。設定を変えて生成できます。')
   }
   function saveProject() {
-    if (!project.snapshot || generating) return
-    try { downloadProject(project); setToast(dirty ? '表示中の地図・設定・ピンを保存しました。未反映の設定は含まれません。' : '地図・設定・ピンを保存しました') }
+    if ((!project.snapshot && !previewMap) || generating) return
+    try { downloadProject(previewMap ? { ...project, config: previewMap.config, snapshot: previewMap, annotations: [], edits: [] } : project); setToast(previewMap ? '生成途中の地図を保存しました。' : dirty ? '表示中の地図・設定・ピンを保存しました。未反映の設定は含まれません。' : '地図・設定・ピンを保存しました') }
     catch (err) { setError(err instanceof Error ? err.message : '設定を保存できませんでした') }
   }
   function addPin(point: Point) {
-    if (generating || !project.snapshot) { setToast('地図の生成が完了してからピンを追加してください'); return }
+    if (generating || !project.snapshot || !!previewMap) { setToast('地図の生成が完了してからピンを追加してください'); return }
     if (project.annotations.length >= 200) { setToast('ピンは200個まで配置できます'); return }
     setViewMode('map')
     setSelected({ id: crypto.randomUUID(), point, name: '', note: '', secret: false }); setFeature(null)
@@ -282,7 +295,7 @@ function App() {
     setViewMode(mode); setPinMode(false); setFeature(null)
   }
   function pick(point: Point, item?: MapFeature) {
-    if (generating || !project.snapshot) return
+    if (generating || !project.snapshot || !!previewMap) return
     if (editing && displayedMap) {
       if (editorTool === 'select') {
         const selected = findEditorTarget(displayedMap, point, editorTargetKind)
@@ -377,7 +390,7 @@ function App() {
       setRestoring(false)
       setProject(next); setDraft(next.config); setSelected(null); setFeature(null); setPinMode(false); setError(''); cancelEdit(); setRedoEdits([])
       setGenerating(!next.snapshot)
-      setPreviewMap(null)
+      setPreviewMap(next.snapshot?.previewPhase ? next.snapshot : null)
       setGenerationLabel('地形と水系を計算中…')
       if (next.snapshot) setMap(next.snapshot)
       setToast(next.snapshot ? '保存済みの地図・設定・ピンを読み込みました' : '旧形式の設定を読み込みました。現在のエンジンで地図を生成します。')
@@ -385,7 +398,7 @@ function App() {
     if (request === importSequence.current && importRef.current) importRef.current.value = ''
   }
   async function exportImage() {
-    if (!displayedMap || !project.snapshot || generating) return
+    if (!displayedMap || generating) return
     setExporting(true)
     try {
       const exportOptions = { ...options, showSecrets: includeSecrets }
@@ -402,21 +415,21 @@ function App() {
       <div className="header-actions">
         <button className="icon-button help-button" title="使い方" aria-label="使い方" onClick={() => setDialog('help')}><HelpCircle size={19} /></button>
         <button className="secondary open-project" aria-label="地図ファイルを開く" onClick={() => importRef.current?.click()}><FolderOpen size={17} /><span>開く</span></button>
-        <button className="secondary save-project" aria-label="設定を保存" disabled={!project.snapshot || generating} onClick={saveProject}><Save size={17} /><span>保存</span></button>
-        <button className="primary" aria-label="画像を書き出す" disabled={!map || !project.snapshot || generating} onClick={() => setDialog('export')}><Image size={17} /><span>画像出力</span></button>
+        <button className="secondary save-project" aria-label="設定を保存" disabled={(!project.snapshot && !previewMap) || generating} onClick={saveProject}><Save size={17} /><span>{previewMap && !generating ? '途中保存' : '保存'}</span></button>
+        <button className="primary" aria-label="画像を書き出す" disabled={!displayedMap || generating} onClick={() => setDialog('export')}><Image size={17} /><span>画像出力</span></button>
       </div>
     </header>
     <div className="workspace">
       {sidebarOpen && <button className="sidebar-scrim" aria-label="設定パネルを閉じる" onClick={() => setSidebarOpen(false)} />}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label="街の設定"><nav className="panel-tabs" aria-label="編集パネル"><button className={tab === 'create' ? 'active' : ''} aria-current={tab === 'create' ? 'page' : undefined} onClick={() => setTab('create')}>生成</button><button className={tab === 'layers' ? 'active' : ''} aria-current={tab === 'layers' ? 'page' : undefined} onClick={() => setTab('layers')}>表示</button><button className={tab === 'edit' ? 'active' : ''} aria-current={tab === 'edit' ? 'page' : undefined} onClick={() => { setTab('edit'); setViewMode('map'); setPinMode(false); setFeature(null) }}>編集</button><button className={tab === 'pins' ? 'active' : ''} aria-current={tab === 'pins' ? 'page' : undefined} onClick={() => setTab('pins')}>ピン</button><button className="close-sidebar icon-button" aria-label="設定パネルを閉じる" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={18} /></button></nav>
         {tab === 'create' && <SettingsPanel config={draft} onChange={setDraft} generating={generating} dirty={dirty} onGenerate={generate} onCancel={cancelGeneration} unplacedCount={project.snapshot?.unplacedFacilities?.length} onReport={() => setDialog('report')} />}
-        {tab === 'edit' && <MapEditor year={displayYear} tool={editorTool} onTool={startEditorTool} targetKind={editorTargetKind} onTargetKind={kind => { setEditorTargetKind(kind); setEditorSelection(null) }} selection={editorSelection} points={editPoints} values={editorValues} onValues={setEditorValues} onFinish={finishEdit} onCancel={cancelEdit} onBack={() => setEditPoints(old => old.slice(0, -1))} onDelete={() => changeSelectedEdit('delete')} onRename={() => changeSelectedEdit('rename')} onRedraw={redrawSelectedEdit} onUndo={undoEdit} onRedo={redoEdit} canUndo={!!project.edits?.length} canRedo={!!redoEdits.length} disabled={generating || !project.snapshot} />}
+        {tab === 'edit' && <MapEditor year={displayYear} tool={editorTool} onTool={startEditorTool} targetKind={editorTargetKind} onTargetKind={kind => { setEditorTargetKind(kind); setEditorSelection(null) }} selection={editorSelection} points={editPoints} values={editorValues} onValues={setEditorValues} onFinish={finishEdit} onCancel={cancelEdit} onBack={() => setEditPoints(old => old.slice(0, -1))} onDelete={() => changeSelectedEdit('delete')} onRename={() => changeSelectedEdit('rename')} onRedraw={redrawSelectedEdit} onUndo={undoEdit} onRedo={redoEdit} canUndo={!!project.edits?.length} canRedo={!!redoEdits.length} disabled={generating || !project.snapshot || !!previewMap} />}
         {tab === 'layers' && <div className="panel-scroll">
           <section><h2>レイヤー</h2>{Object.entries(layerNames).map(([key, name]) => <Toggle key={key} label={name} value={project.layers[key as keyof typeof layerNames] ?? false} onChange={value => setProject(old => ({ ...old, layers: { ...old.layers, [key]: value } }))} />)}</section>
           <section><h2>配色</h2><div className="style-options">{([{ id: 'standard', name: '標準' }, { id: 'mono', name: 'モノクロ' }, { id: 'night', name: '夜間' }] as const).map(style => <button key={style.id} className={project.style === style.id ? 'selected' : ''} aria-pressed={project.style === style.id} onClick={() => setProject(old => ({ ...old, style: style.id }))}>{style.name}</button>)}</div></section>
           {map && <DistrictNaming key={JSON.stringify(map.config)} map={map} disabled={generating} onApply={applyDistrictNames} />}
         </div>}
-        {tab === 'pins' && <div className="panel-scroll"><section><h2>ピン</h2><p className="muted">地図に場所とメモを登録できます。</p><button className={`secondary full ${pinMode ? 'selected' : ''}`} disabled={generating || !project.snapshot} onClick={() => { setViewMode('map'); setPinMode(!pinMode); if (window.innerWidth < 850) setSidebarOpen(false) }}><MapPin size={17} />{pinMode ? '配置をキャンセル' : '地図をクリックして追加'}</button><button className="text-button full" disabled={generating || !project.snapshot} onClick={() => { const p = mapRef.current?.getCenter() || { x: (map?.width ?? 4000) / 2, y: (map?.height ?? 3000) / 2 }; addPin({ x: Math.max(0, Math.min(map?.width ?? 4000, p.x)), y: Math.max(0, Math.min(map?.height ?? 3000, p.y)) }) }}>画面の中央に追加</button><Toggle label="GM用ピンを表示" value={showSecrets} onChange={setShowSecrets} icon={showSecrets ? <Eye size={17} /> : <EyeOff size={17} />} /></section><div className="pin-list">{project.annotations.length ? project.annotations.map(pin => <button className="pin-row" key={pin.id} disabled={generating || !project.snapshot} onClick={() => { setViewMode('map'); setSelected(pin); mapRef.current?.center(pin.point) }}><MapPin size={19} /><span><b>{pin.name}</b><small>{pin.secret ? 'GMのみ' : '公開'}{pin.note ? ` · ${pin.note.slice(0, 22)}` : ''}</small></span></button>) : <div className="empty-pins"><MapPin size={30} strokeWidth={1} /><p>ピンは登録されていません。</p><span>地図上の建物からも追加できます。</span></div>}</div><p className="panel-footnote">街を生成し直すと、ピンはリセットされます。先に設定を保存しておくと復元できます。</p></div>}
+        {tab === 'pins' && <div className="panel-scroll"><section><h2>ピン</h2><p className="muted">地図に場所とメモを登録できます。</p><button className={`secondary full ${pinMode ? 'selected' : ''}`} disabled={generating || !project.snapshot || !!previewMap} onClick={() => { setViewMode('map'); setPinMode(!pinMode); if (window.innerWidth < 850) setSidebarOpen(false) }}><MapPin size={17} />{pinMode ? '配置をキャンセル' : '地図をクリックして追加'}</button><button className="text-button full" disabled={generating || !project.snapshot || !!previewMap} onClick={() => { const p = mapRef.current?.getCenter() || { x: (map?.width ?? 4000) / 2, y: (map?.height ?? 3000) / 2 }; addPin({ x: Math.max(0, Math.min(map?.width ?? 4000, p.x)), y: Math.max(0, Math.min(map?.height ?? 3000, p.y)) }) }}>画面の中央に追加</button><Toggle label="GM用ピンを表示" value={showSecrets} onChange={setShowSecrets} icon={showSecrets ? <Eye size={17} /> : <EyeOff size={17} />} /></section><div className="pin-list">{project.annotations.length ? project.annotations.map(pin => <button className="pin-row" key={pin.id} disabled={generating || !project.snapshot || !!previewMap} onClick={() => { setViewMode('map'); setSelected(pin); mapRef.current?.center(pin.point) }}><MapPin size={19} /><span><b>{pin.name}</b><small>{pin.secret ? 'GMのみ' : '公開'}{pin.note ? ` · ${pin.note.slice(0, 22)}` : ''}</small></span></button>) : <div className="empty-pins"><MapPin size={30} strokeWidth={1} /><p>ピンは登録されていません。</p><span>地図上の建物からも追加できます。</span></div>}</div><p className="panel-footnote">街を生成し直すと、ピンはリセットされます。先に設定を保存しておくと復元できます。</p></div>}
       </aside>
       <main id="city-map" className="map-workspace">
         {updateAvailable && <div className="saved-map-notice" role="status"><span>{generating ? '更新があります。生成完了後に反映できます。' : '更新があります。'}</span><button className="secondary" disabled={generating || restoring} onClick={applyUpdate}>更新を反映</button></div>}
@@ -429,14 +442,14 @@ function App() {
         {displayedMap && <RegionalContext map={displayedMap} />}
         {(map || generating) && <TimelineControl key={project.config.seed} year={displayYear} generating={generating} available={!!map?.timeline} onCommit={showYear} />}
         <div className="map-title"><button className="mobile-menu icon-button" aria-label="街の設定を開く" onClick={() => setSidebarOpen(true)}><Menu size={21} /></button><div><h2>{displayedMap?.config.name || project.config.name}</h2><span>{`${mapWidthKm} × ${mapHeightKm} km`}</span></div></div>
-        <div className="map-tools"><div className="map-view-switch" role="group" aria-label="地図の表示方法">{([{ id: 'map', name: '地図' }, { id: 'contour', name: '等高線' }, { id: '3d', name: '3D' }] as const).map(mode => <button key={mode.id} className={viewMode === mode.id ? 'active' : ''} aria-pressed={viewMode === mode.id} onClick={() => changeView(mode.id)}>{mode.name}</button>)}</div>{viewMode !== '3d' && <div className="drawing-tools"><button className={!pinMode && !editing ? 'active' : ''} aria-label="地図を移動・建物を選択" title="地図を移動・建物を選択" aria-pressed={!pinMode && !editing} onClick={() => { setPinMode(false); if (editing) setTab('create') }}><MousePointer2 size={20} /></button><button className={editing ? 'active' : ''} aria-label="地図を編集" title="地図を編集" disabled={generating || !project.snapshot} aria-pressed={editing} onClick={() => { setTab('edit'); setSidebarOpen(true); setPinMode(false); setFeature(null) }}><Pencil size={20} /></button><button className={pinMode ? 'active' : ''} aria-label="地図にピンを追加" title="地図にピンを追加" disabled={generating || !project.snapshot} aria-pressed={pinMode} onClick={() => { if (editing) setTab('pins'); setPinMode(!pinMode) }}><MapPin size={20} /></button></div>}</div>
+        <div className="map-tools"><div className="map-view-switch" role="group" aria-label="地図の表示方法">{([{ id: 'map', name: '地図' }, { id: 'contour', name: '等高線' }, { id: '3d', name: '3D' }] as const).map(mode => <button key={mode.id} className={viewMode === mode.id ? 'active' : ''} aria-pressed={viewMode === mode.id} onClick={() => changeView(mode.id)}>{mode.name}</button>)}</div>{viewMode !== '3d' && <div className="drawing-tools"><button className={!pinMode && !editing ? 'active' : ''} aria-label="地図を移動・建物を選択" title="地図を移動・建物を選択" aria-pressed={!pinMode && !editing} onClick={() => { setPinMode(false); if (editing) setTab('create') }}><MousePointer2 size={20} /></button><button className={editing ? 'active' : ''} aria-label="地図を編集" title="地図を編集" disabled={generating || !project.snapshot || !!previewMap} aria-pressed={editing} onClick={() => { setTab('edit'); setSidebarOpen(true); setPinMode(false); setFeature(null) }}><Pencil size={20} /></button><button className={pinMode ? 'active' : ''} aria-label="地図にピンを追加" title="地図にピンを追加" disabled={generating || !project.snapshot || !!previewMap} aria-pressed={pinMode} onClick={() => { if (editing) setTab('pins'); setPinMode(!pinMode) }}><MapPin size={20} /></button></div>}</div>
         {editing && editorTool !== 'select' && <div className="edit-map-actions"><span>{editorTool === 'road' ? '道路' : editorTool === 'building' ? '建物' : '土地利用'} {editPoints.length}点</span><button className="text-button" onClick={() => setEditPoints(old => old.slice(0, -1))} disabled={!editPoints.length}>戻す</button><button className="secondary" onClick={cancelEdit}>取消</button><button className="primary" onClick={finishEdit} disabled={editPoints.length < (editorTool === 'road' ? 2 : 3)}>確定</button></div>}
         {pinMode && <div className="mode-notice"><MapPin size={15} />ピンを置く場所をクリック<button aria-label="ピン配置をやめる" onClick={() => setPinMode(false)}><X size={15} /></button></div>}
         {viewMode !== '3d' && <details className="map-legend"><summary>凡例</summary><div>{[{ name: '住宅', color: palette.residential }, { name: '商業', color: palette.commercial }, { name: '公共施設', color: palette.public }, { name: '田', color: areaColor({ id: '', polygon: [], kind: 'field', landUse: 'paddy' }, project.style) }, { name: '畑', color: areaColor({ id: '', polygon: [], kind: 'field', landUse: 'dry-field' }, project.style) }, { name: '森林', color: palette.forest }, { name: '林', color: areaColor({ id: '', polygon: [], kind: 'field', landUse: 'woodland' }, project.style) }, { name: '草地', color: areaColor({ id: '', polygon: [], kind: 'field', landUse: 'meadow' }, project.style) }, { name: '公園', color: palette.park }, { name: '水域', color: palette.water }].map(item => <span key={item.name}><i style={{ background: item.color }} />{item.name}</span>)}</div></details>}
         {viewMode === 'contour' && displayedMap && !displayedMap.terrainSurface && <div className="mode-notice" role="note">この保存地図には標高データがありません。</div>}
         {(restoring || generating) && <div className={`generation-overlay ${displayedMap ? 'regenerating' : ''}`} role="status"><LoaderCircle className="spin" size={25} /><span>{restoring ? '保存済みの地図を読み込み中…' : generationLabel}</span>{generating && !restoring && <button className="text-button" onClick={cancelGeneration}>中止</button>}</div>}
         {feature && displayedMap && <FeatureDetails map={displayedMap} feature={feature.feature} point={feature.point} onClose={() => setFeature(null)} onPin={addPin} />}
-      </div><footer className="map-status"><span className="map-stock">{previewMap ? previewStockLabel(previewMap) : displayedMap ? `建物 ${displayedMap.buildings.length.toLocaleString()}棟` : '生成中'}</span>{project.snapshot && !generating && <button className="map-report-button" onClick={() => setDialog('report')}>生成結果</button>}<BuildIdentity mapVersion={displayedMap?.generatorVersion} preview={!!previewMap} engine={displayedMap?.config.cityEngine ?? project.config.cityEngine} /></footer></main>
+      </div><footer className="map-status"><span className="map-stock">{previewMap ? previewStockLabel(previewMap) : displayedMap ? `建物 ${displayedMap.buildings.length.toLocaleString()}棟` : '生成中'}</span>{project.snapshot && !generating && !previewMap && <button className="map-report-button" onClick={() => setDialog('report')}>生成結果</button>}<BuildIdentity mapVersion={displayedMap?.generatorVersion} preview={!!previewMap} engine={displayedMap?.config.cityEngine ?? project.config.cityEngine} /></footer></main>
     </div>
     <input ref={importRef} type="file" accept="application/json,.json" hidden onChange={event => void importFile(event.target.files?.[0])} />
     {toast && <div className="toast" role="status">{toast}</div>}

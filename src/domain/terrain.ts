@@ -7,6 +7,7 @@ import { channelHasCrossings } from './channel-topology'
 import { surveyChannelWidths } from './channel-hydraulic-geometry.ts'
 import { estuarineWidthPriors } from './estuary-hydraulics.ts'
 import { channelFootprint } from './channel-footprint.ts'
+import { channelCurve, fairChannelControls } from './channel-curve'
 import { reworkChannelBed } from './channel-sediment.ts'
 import type { ChannelBedSection, ChannelSedimentBudget } from './channel-sediment.ts'
 import type { AbandonedChannel } from './channel-cutoff.ts'
@@ -298,28 +299,6 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     const dx = b.x - a.x, dy = b.y - a.y, t = clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy || 1))
     return { t, distance: Math.hypot(p.x - a.x - dx * t, p.y - a.y - dy * t) }
   }
-  const smoothOpen = (path: Point[], tension = .9) => {
-    const tangents = path.map((p, i) => {
-      const a = path[Math.max(0, i - 1)]!, b = path[Math.min(path.length - 1, i + 1)]!
-      const length = Math.hypot(b.x - a.x, b.y - a.y) || 1
-      const left = i ? Math.hypot(p.x - a.x, p.y - a.y) : Math.hypot(b.x - p.x, b.y - p.y)
-      const right = i + 1 < path.length ? Math.hypot(b.x - p.x, b.y - p.y) : left
-      const scale = Math.min(left, right) * tension / length
-      return { x: (b.x - a.x) * scale, y: (b.y - a.y) * scale }
-    })
-    const result: Point[] = [path[0]!]
-    // Shared Hermite tangents keep the bank offset continuous at confluences.
-    for (let i = 1; i < path.length; i++) {
-      const a = path[i - 1]!, b = path[i]!, ta = tangents[i - 1]!, tb = tangents[i]!
-      const steps = Math.max(2, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 20))
-      for (let j = 1; j <= steps; j++) {
-        const t = j / steps, t2 = t * t, t3 = t2 * t
-        const f0 = 2 * t3 - 3 * t2 + 1, f1 = t3 - 2 * t2 + t, f2 = -2 * t3 + 3 * t2, f3 = t3 - t2
-        result.push({ x: a.x * f0 + ta.x * f1 + b.x * f2 + tb.x * f3, y: a.y * f0 + ta.y * f1 + b.y * f2 + tb.y * f3 })
-      }
-    }
-    return result
-  }
   const rivers: TerrainRiver[] = [], channelEvolution: TerrainModel['hydrology']['channelEvolution'] = []
   const initialSections: ChannelBedSection[] = [], abandoned: (AbandonedChannel & { id: string; sourceRiverId: string; level: number })[] = []
   const mobileSediment = (world as RegionalTerrain & { alluvium?: Float32Array }).alluvium
@@ -345,19 +324,26 @@ function buildTerrainModel(input: TerrainModelInput, allowCutoff: boolean): Terr
     const levelAt = (p: Point) => { const q = regional(p); return world.ocean[indexAt(q)] ? 0 : sampleRegional(world, world.hydroDEM, q.x, q.y) }
     for (const old of evolved.abandoned) abandoned.push({ ...old, id: `oxbow-${pathIndex}-${abandoned.length}`, sourceRiverId, level: Math.min(...old.points.map(levelAt)) })
     const geometry = (line: Point[], pinned: number[]) => {
-      const controls: Point[] = []
+      const controls: Point[] = [], fixed=new Set([0])
       for (let i = 1; i < pinned.length; i++) {
         // A 60m chord tolerance erased real valley bends. Keep the evolved course
         // to 2.5m accuracy; grid-turn removal happened before physical migration.
         const run = simplifyLine(line.slice(pinned[i - 1]!, pinned[i]! + 1), 2.5)
         controls.push(...(controls.length ? run.slice(1) : run))
+        fixed.add(controls.length-1)
       }
+      const bankReach=(p:Point)=>{
+        let best=Infinity,width=0
+        for(let i=1;i<original.length;i++){const hit=nearestOnLine(p,original[i-1]!,original[i]!);if(hit.distance<best){best=hit.distance;width=originalWidths[i-1]!*(1-hit.t)+originalWidths[i]!*hit.t}}
+        return Math.min(8,Math.max(.5,width/2))
+      }
+      const fair=fairChannelControls(controls,fixed,bankReach,(before,after)=>channelGround(after)<=channelGround(before)+1)
       // Hermite handles can overshoot a nearly contacting bend even when the
       // migrated centreline is simple. Reduce only that reconstruction's
       // tension; if simplifying a narrow neck made a crossed chord, retain the
       // surveyed, already smooth evolved line with all confluence pins intact.
       for (const tension of [.9, .45, .15, 0]) {
-        const rounded = smoothOpen(controls, tension)
+        const rounded = channelCurve(fair, tension)
         if (!channelHasCrossings(rounded)) return rounded
       }
       return line

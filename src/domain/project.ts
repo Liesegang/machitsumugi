@@ -288,6 +288,7 @@ function snapshotFrom(value: unknown, config: CityConfig): CityMap {
     districts: entities(input.districts, '地区', 2000, readDistrict),
   }
   if (input.generatorVersion !== undefined) map.generatorVersion = string(input.generatorVersion, '生成エンジンの版', 128)
+  if (input.previewPhase !== undefined) map.previewPhase = choice(input.previewPhase, ['landscape','erosion','hydrology','railway','roads','development'] as const, '生成途中の段階')
   if (input.unplacedFacilities !== undefined) map.unplacedFacilities = array(input.unplacedFacilities, '未成立の施設', 20).map(item => { const value = object(item, '未成立の施設'); return { kind: choice(value.kind, FACILITIES, '未成立施設の種類'), reason: string(value.reason, '未成立の理由', 2000) } })
   if (input.terrainSimulation !== undefined) {
     const s = object(input.terrainSimulation, '地形計算の体積収支')
@@ -469,26 +470,28 @@ function openArchive(): Promise<IDBDatabase> {
   })
 }
 
-async function readArchive(): Promise<unknown> {
+async function readArchive(): Promise<{ current?: unknown; recovery?: unknown }> {
   const db = await openArchive()
   return new Promise((resolve, reject) => {
     try {
-      const tx = db.transaction(ARCHIVE_STORE, 'readonly'), request = tx.objectStore(ARCHIVE_STORE).get('current')
-      let result: unknown
-      request.onsuccess = () => { result = request.result }
+      const tx = db.transaction(ARCHIVE_STORE, 'readonly'), store = tx.objectStore(ARCHIVE_STORE)
+      const current = store.get('current'), recovery = store.get('recovery'), result: { current?: unknown; recovery?: unknown } = {}
+      current.onsuccess = () => { result.current = current.result }
+      recovery.onsuccess = () => { result.recovery = recovery.result }
       tx.oncomplete = () => { db.close(); resolve(result) }
       tx.onabort = tx.onerror = () => { db.close(); reject(new Error('保存済み地図を読み込めませんでした。')) }
     } catch (error) { db.close(); reject(error) }
   })
 }
 
-async function writeArchive(project: Project): Promise<boolean> {
+async function writeArchive(project: Project, key = 'current'): Promise<boolean> {
   try {
     const db = await openArchive()
     return await new Promise<boolean>(resolve => {
       try {
         const tx = db.transaction(ARCHIVE_STORE, 'readwrite')
-        tx.objectStore(ARCHIVE_STORE).put(portableProject(project), 'current')
+        tx.objectStore(ARCHIVE_STORE).put(portableProject(project), key)
+        if (key === 'current') tx.objectStore(ARCHIVE_STORE).delete('recovery')
         // Only a committed transaction counts as saved. An abort retains the prior map.
         tx.oncomplete = () => { db.close(); resolve(true) }
         tx.onabort = tx.onerror = () => { db.close(); resolve(false) }
@@ -501,15 +504,25 @@ async function writeArchive(project: Project): Promise<boolean> {
 export async function loadProjectArchive(): Promise<Project | null> {
   try {
     const stored = await readArchive()
-    if (stored !== undefined) return validateProject(stored)
+    try { if (stored.recovery !== undefined) { const project=validateProject(stored.recovery); if(project.snapshot?.previewPhase)return project } } catch { /* The complete map remains usable. */ }
+    if (stored.current !== undefined) return validateProject(stored.current)
   } catch { /* A disabled, corrupt or unavailable archive can still have a local fallback. */ }
   return loadProject()
+}
+
+/** Incomplete stock has a separate slot; never overwrite the completed city. */
+export async function persistRecoveryArchive(project: Project): Promise<boolean> {
+  let validated: Project
+  try { validated=validateProject(portableProject(project)); if(!validated.snapshot?.previewPhase)return false } catch { return false }
+  const save=()=>writeArchive(validated,'recovery'),pending=archiveWrites.then(save,save)
+  archiveWrites=pending
+  return pending
 }
 
 /** Serialize archive transactions so an older async save cannot overtake a later map. */
 export async function persistProjectArchive(project: Project): Promise<boolean> {
   let validated: Project
-  try { validated = validateProject(portableProject(project)); if (!validated.snapshot) return false } catch { return false }
+  try { validated = validateProject(portableProject(project)); if (!validated.snapshot || validated.snapshot.previewPhase) return false } catch { return false }
   // IndexedDB already clones the value. Stringifying a large complete map merely
   // to discover that it cannot fit localStorage doubled autosave work and memory.
   // The legacy/small-map fallback is only needed if the primary archive fails.

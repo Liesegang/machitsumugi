@@ -8,6 +8,14 @@ const river: Area = { id: 'river', kind: 'water', polygon: rectangle(0, 130, 400
 const source = [lake, river]
 
 describe('one visible water body at lake inlets and outlets', () => {
+  it('does not draw retraced section cuts inside a saved river surface', () => {
+    const area: Area = {id:'legacy-river',kind:'water',polygon:[{x:0,y:0},{x:200,y:0},{x:200,y:50},{x:130,y:50},{x:130,y:25},{x:130,y:50},{x:0,y:50}]}
+    const before = structuredClone(area), result = waterGeometry([area])
+    expect(result.shorelines).toHaveLength(1)
+    expect(result.shorelines[0]!.polygon.every(p=>p.y===0||p.y===50)).toBe(true)
+    expect(regionArea(result.shorelines[0]!)).toBe(10000)
+    expect(area).toEqual(before)
+  })
   it('removes submerged river surfaces while preserving physical occupancy and an island', () => {
     const before = structuredClone(source), geometry = waterGeometry(source)
     const flowing = geometry.surfaces.filter(area => area.waterLevel === undefined)

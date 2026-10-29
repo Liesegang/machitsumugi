@@ -179,6 +179,16 @@ export class PlanarRoadGraph {
     this.remember(this.projectionResults, queryKey, selected, 2048)
     return copy(selected)
   }
+  /** All incident pavement at a shared endpoint, including floating near-contacts. */
+  contacts(point: Point): { point: Point; road: SimulatedRoad }[] {
+    const hits:{point:Point;road:SimulatedRoad}[]=[]
+    for(const segment of this.nearby(point,point,.05)){
+      if(controlledRoad(segment.road))continue
+      const projection=projectOnRoadSegment(point,segment.a,segment.b)
+      if(dist(point,projection.point)<=.05&&!hits.some(hit=>hit.road===segment.road&&dist(hit.point,projection.point)<.05))hits.push({point:projection.point,road:segment.road})
+    }
+    return hits
+  }
   /** Exact junction sites along a proposed survey line, in chainage order. */
   crossings(a: Point, b: Point): { point: Point; road: SimulatedRoad; t: number }[] {
     const hits: { point: Point; road: SimulatedRoad; t: number }[] = []

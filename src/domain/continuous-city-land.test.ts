@@ -38,6 +38,17 @@ const frontageAcquisition = (input: ContinuousCityLandInput, parcels: ReturnType
 }
 
 describe('continuous city whole-block cadastre', () => {
+  it('retains already acquired roofs and titles if a later physical survey fails', () => {
+    let calls=0
+    const terrain={areas:[],elevation:()=>10,slope:()=>0,waterAt:()=>{calls++;return false}}
+    const complete=run({terrain}).result,stop=Math.floor(calls*.8)
+    let replay=0,checkpoint: Parameters<NonNullable<ContinuousCityLandInput['onCheckpoint']>>[0]|undefined
+    expect(()=>run({terrain:{...terrain,waterAt:()=>{if(++replay===stop)throw Error('late physical survey failure');return false}},onCheckpoint:stock=>{checkpoint=structuredClone(stock)}})).toThrow('late physical survey failure')
+    expect(checkpoint?.buildings.length).toBeGreaterThan(0)
+    expect(checkpoint!.buildings.length).toBeLessThan(complete.buildings.length)
+    expect(checkpoint!.parcels.length).toBe(checkpoint!.buildings.length)
+    for(const building of checkpoint!.buildings)expect(complete.buildings).toContainEqual(building)
+  })
   it('partitions the whole ordinary block into varied urban titles with real frontage and contained rectangles', () => {
     const { input, result } = run()
     expect(result.parcels.length).toBeGreaterThan(12)

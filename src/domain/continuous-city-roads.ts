@@ -16,6 +16,7 @@ import { indexedPolygonOverlap } from './indexed-polygon-overlap'
 import { continuousRoadEndcapsClear } from './continuous-road-endcaps'
 import { continuousLocalAccessProbes, continuousLocalStreetForm } from './continuous-city-density'
 import { continuousCollectorJoinCandidates } from './continuous-collector-join'
+import { majorRoadJunctionsAllowed } from './major-road-junctions'
 import { planModernTransport } from './modern-transport'
 import { layoutMainCivilGuides, surveyLayoutMainCivilCrossings } from './layout-first-main-civil-bridges'
 import { datedExternalPublicRoadIds } from './continuous-city-access-repair'
@@ -194,6 +195,7 @@ class ContinuousRoadDesign {
     return points.length >= 2 ? points : null
   }
   private valid(route: PlannedRoute, width: number, role: RoadRole, regional = false) {
+    if(width>=8&&(role==='highway'||role==='collector')&&!majorRoadJunctionsAllowed(route.points,(a,b)=>this.graph.crossings(a,b),point=>this.graph.openEndHeading(point)!==undefined,point=>this.graph.contacts(point)))return false
     if (!Number.isFinite(route.cost) || !this.rowAllows(route.points, width) || !this.planner.railwayWidthAllows(route.points, .01, width, role)) return false
     if (route.bridgeLength > 0 && !route.surveyedBridgeSpans?.length) return false
     const minimum = role === 'expressway' ? 240 : role === 'ramp' ? 60 : role === 'highway' ? 85 : role === 'collector' ? 50 : role === 'lane' ? 15 : 0

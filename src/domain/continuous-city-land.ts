@@ -114,6 +114,9 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
     obstacleIndex.add(entry); obstacleOverlaps.set(entry, indexedPolygonOverlap(entry))
   }
   const parcels: Parcel[] = [], buildings: Building[] = [], accessRoads: Road[] = [], openSpaces: Area[] = [], unassignedGround: PolygonRegion[] = [], events: GrowthEvent[] = []
+  let checkpointAt = performance.now()
+  const checkpoint = () => input.onCheckpoint?.({ parcels, buildings, openSpaces })
+  try {
   const history = { parcels: [] as TimelineVersion<Parcel>[], buildings: [] as TimelineVersion<Building>[], buildingStates: [] as BuildingState[] }
   const metrics = { blocks: input.blocks.length, buildableArea: 0, parcelArea: 0, accessArea: 0, openSpaceArea: 0, unassignedArea: 0, partitionAreaError: 0, laneAttempts: 0, accessRoads: 0, privateReplacements: 0, lots: 0, courtyardLots: 0, wingedRoofs: 0, oversizedLots: 0, frontageFailures: 0, formationFailures: 0, stock: {} as Record<Stock, { count: number; parcelArea: number; roofArea: number; parking: number }>, openReasons: {} as Record<string, { count: number; area: number }> }
   const obstacles = (region: PolygonRegion) => obstacleIndex.query(boundsOf(region.polygon))
@@ -689,10 +692,16 @@ export function developContinuousCityLand(input: ContinuousCityLandInput) {
           if (version.to !== undefined && version.to <= endYear) events.push({ id: `cf-d-${cellSerial}-${version.to}`, year: version.to, kind: 'demolition', entityId: version.value.id, reason: '建て替えに伴い旧建物を解体' })
         }
         metrics.privateReplacements += visible.length - 1
+        if (parcels.length % 500 === 0 && performance.now() - checkpointAt > 5000) { checkpoint(); checkpointAt = performance.now() }
       }
     }
     metrics.partitionAreaError += Math.abs(initialArea - blockAccessArea - (metrics.parcelArea - beforeLots) - (metrics.openSpaceArea - beforeOpen) - (metrics.unassignedArea - beforeUnassigned))
   }
   events.sort((a, b) => a.year - b.year || a.id.localeCompare(b.id))
+  checkpoint()
   return { parcels, buildings, accessRoads: accessRoads.filter(road => (road.builtYear ?? 1650) <= endYear), openSpaces, unassignedGround, history, events, metrics }
+  } catch (error) {
+    checkpoint()
+    throw error
+  }
 }

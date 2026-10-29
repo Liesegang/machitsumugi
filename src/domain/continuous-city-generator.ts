@@ -174,7 +174,7 @@ export function generateContinuousCity(input:CityConfig,onProgress?:(label:strin
   const landDomains=buildContinuousCityLandDomains({demandRegions:demand.regions,streetBlocks})
   // Dry bank ground constrains private acquisitions, while public roads and
   // certified bridges retain their own physical engineering constraints.
-  const land=developContinuousCityLand({config,width,height,roads,blocks:landDomains.domains,demand,stations:rail.stations,centerAccess,reserves:[...reserves,...railMasks,...riverMargins.reserves],terrain})
+  const land=developContinuousCityLand({config,width,height,roads,blocks:landDomains.domains,demand,stations:rail.stations,centerAccess,reserves:[...reserves,...railMasks,...riverMargins.reserves],terrain,onCheckpoint:stock=>onPreview?.(frame({roads,railways:rail.railways,stations:rail.stations,areas:[...natural,...civic.areas,...rail.stationGrounds,...stock.openSpaces],buildings:[...civic.buildings,...stock.buildings],parcels:stock.parcels,facilities:civic.facilities},'development'))})
   roads=materializeRoadJunctions([...roads,...land.accessRoads])
   observer?.landComplete?.(land,roads)
   phase('まとまった農地・林・公園を割り当て中…')

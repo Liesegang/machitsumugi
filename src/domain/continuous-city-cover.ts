@@ -10,11 +10,11 @@ import { contourLand } from './land-use'
 import { PROJECT_GEOMETRY_LIMITS } from './project'
 import { subdivideContinuousFarmDistrict } from './continuous-city-farm-plots'
 
-const { difference, union } = polygonClipping
+const { union } = polygonClipping
 
 /** Working-union diagnostics, never source stock edits. The fixed survey
  * lattice can collapse floating sweep noise; its raw fill is recorded. */
-export const continuousCoverDiagnostics = { collapsedRings: 0, collapsedHoles: 0, collapsedRawFilledArea: 0, maximumGridSpacing: 0, exactAreaFallbacks: 0, zeroSignedPositiveRings: 0 }
+export const continuousCoverDiagnostics = { collapsedRings: 0, collapsedHoles: 0, collapsedRawFilledArea: 0, maximumGridSpacing: 0, exactAreaFallbacks: 0, zeroSignedPositiveRings: 0, canonicalizationFallbacks: 0 }
 const localArea = (ring: readonly Point[]) => {
   const origin = ring[0]
   return origin ? ring.reduce((sum, p, i) => { const q = ring[(i + 1) % ring.length]!; return sum + (p.x - origin.x) * (q.y - origin.y) - (q.x - origin.x) * (p.y - origin.y) }, 0) / 2 : 0
@@ -88,7 +88,7 @@ export interface ContinuousCityCoverInput {
 /** Integer Vatti union is independent of the floating sweep which can exceed
  * its event queue on thousands of almost-touching title verges. Source water
  * never passes through this operation; its exact objects remain unchanged. */
-function integerCoverBoolean(parts: readonly PolygonRegion[], boundaries: readonly PolygonRegion[] = [], operation: 'union' | 'intersection' | 'difference' = 'union'): PolygonRegion[] {
+function integerCoverBoolean(parts: readonly PolygonRegion[], boundaries: readonly PolygonRegion[] = [], operation: 'union' | 'intersection' | 'difference' = 'union', strictlySimple = false): PolygonRegion[] {
   if (!parts.length) return []
   // Clipper.js switches to Int128 above47,453,132, far below the C++ limit.
   // A local origin keeps ordinary blocks and4x3km crops in the fast range.
@@ -111,7 +111,7 @@ function integerCoverBoolean(parts: readonly PolygonRegion[], boundaries: readon
   // Clipper's optional DoSimplePolygons pass repeatedly splits the native
   // cadastre's touching hole vertices, exploding23k vertices into260k. The
   // default Vatti PolyTree already retains the same filled set and hole tree.
-  engine.StrictlySimple = false
+  engine.StrictlySimple = strictlySimple
   if (!engine.AddPaths(subjects, ClipperLib.PolyType.ptSubject, true)) throw new Error('被覆境界の整数入力がありません。')
   if (boundaries.length) engine.AddPaths(clips, ClipperLib.PolyType.ptClip, true)
   const type = operation === 'difference' ? ClipperLib.ClipType.ctDifference : operation === 'intersection' ? ClipperLib.ClipType.ctIntersection : ClipperLib.ClipType.ctUnion
@@ -171,8 +171,15 @@ export function subtractContinuousCover(subject: PolygonRegion, cuts: readonly P
   // This never restores the pathological whole-tile floating difference.
   const ring = (points: readonly Point[]) => [...points, points[0]!].map(p => [p.x, p.y] as [number, number])
   return integerCoverBoolean([subject], nearby, 'difference').flatMap(part => {
-    const geometry = difference([ring(part.polygon)], ...(part.holes ?? []).map(hole => [ring(hole)]))
-    return geometry.map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), ...(rings.length > 1 ? { holes: rings.slice(1).map(hole => hole.slice(0, -1).map(([x, y]) => ({ x, y }))) } : {}) }))
+    try {
+      const geometry = polygonClipping.difference([ring(part.polygon)], ...(part.holes ?? []).map(hole => [ring(hole)]))
+      return geometry.map(rings => ({ polygon: rings[0]!.slice(0, -1).map(([x, y]) => ({ x, y })), ...(rings.length > 1 ? { holes: rings.slice(1).map(hole => hole.slice(0, -1).map(([x, y]) => ({ x, y }))) } : {}) }))
+    } catch {
+      // A successful acquisition must not be discarded by the second sweep
+      // which merely canonicalizes its touching holes. Retry only this piece.
+      continuousCoverDiagnostics.canonicalizationFallbacks++
+      return integerCoverBoolean([part], [], 'union', true)
+    }
   })
 }
 /** Already-disjoint conversion pieces need no numeric reunion. Keep exact
